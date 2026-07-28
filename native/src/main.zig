@@ -230,6 +230,27 @@ fn sendFd(env: napi.Env, info: napi.CallbackInfo) callconv(.c) napi.Value {
     }
 }
 
+/// Close every descriptor the kernel installed at `start` and beyond.
+///
+/// Called on both the success and the truncated path, so it re-derives whether
+/// there is a `SCM_RIGHTS` message here at all rather than assuming its caller
+/// checked. `cmsg_len` is the kernel's, and it is clamped to the buffer rather
+/// than trusted: the release build has bounds checks compiled out, so an
+/// unclamped walk would hand `close(2)` whatever happened to follow on the
+/// stack. The clamp is not reachable today — `controllen` bounds `cmsg_len` —
+/// which is exactly why it should not depend on that staying true.
+fn closeReceived(control: *ControlBuffer, controllen: usize, start: usize) void {
+    if (controllen < cmsgLen(@sizeOf(i32))) return;
+    const header = control.header();
+    if (header.level != linux.SOL.SOCKET or header.type != linux.SCM.RIGHTS) return;
+    const end = @min(header.len, ONE_FD_SPACE);
+    var at = start;
+    while (at + @sizeOf(i32) <= end) : (at += @sizeOf(i32)) {
+        const spare: *align(1) const i32 = @ptrCast(&control.bytes[at]);
+        _ = linux.close(spare.*);
+    }
+}
+
 /// `recvFd(socket, timeoutMs)` → the descriptor, received `O_CLOEXEC`.
 ///
 /// A negative timeout waits forever. The wait is a `poll(2)`, so the only
@@ -290,10 +311,16 @@ fn recvFd(env: napi.Env, info: napi.CallbackInfo) callconv(.c) napi.Value {
     if (received == 0) {
         return throwMessage(env, "mountx-native: the peer closed without sending a descriptor");
     }
-    // Truncated ancillary data means the kernel dropped descriptors it had
-    // already installed for us — there is no way to name them and no way to
-    // close them, so the only honest answer is to say so.
+    // Truncation does *not* mean the descriptors are unreachable. The kernel's
+    // `scm_detach_fds` installs as many as the buffer holds — here
+    // `(ONE_FD_SPACE - CMSG_DATA_OFFSET) / 4`, so two — writes their numbers
+    // into the control buffer, sets `cmsg_len` to cover exactly those, and only
+    // then raises `MSG_CTRUNC` for the ones it dropped. The ones that arrived
+    // are therefore named, and returning without closing them would pin
+    // whatever they refer to for the life of the process — including, in the
+    // case this exists for, a `/dev/fuse` connection with nothing serving it.
     if (message.flags & linux.MSG.CTRUNC != 0) {
+        closeReceived(&control, message.controllen, CMSG_DATA_OFFSET);
         return throwMessage(env, "mountx-native: the descriptor was truncated in transit");
     }
     if (message.controllen < cmsgLen(@sizeOf(i32))) {
@@ -304,14 +331,10 @@ fn recvFd(env: napi.Env, info: napi.CallbackInfo) callconv(.c) napi.Value {
         return throwMessage(env, "mountx-native: the message carried something other than SCM_RIGHTS");
     }
     const fd = control.payload().*;
-    // One descriptor is all `fusermount3` ever sends and all the buffer has
-    // room for, but a peer that sent more would leave the extras installed in
-    // this process with nothing naming them. Close them.
-    var extra = CMSG_DATA_OFFSET + @sizeOf(i32);
-    while (extra + @sizeOf(i32) <= header.len) : (extra += @sizeOf(i32)) {
-        const spare: *align(1) const i32 = @ptrCast(&control.bytes[extra]);
-        _ = linux.close(spare.*);
-    }
+    // One descriptor is all `fusermount3` ever sends, but a peer that sent more
+    // would leave the extras installed in this process with nothing naming
+    // them. Close everything past the first.
+    closeReceived(&control, message.controllen, CMSG_DATA_OFFSET + @sizeOf(i32));
 
     var result: napi.Value = undefined;
     if (napi.napi_create_int32(env, fd, &result) != .ok) {
