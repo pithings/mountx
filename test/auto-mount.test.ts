@@ -18,7 +18,7 @@
  * with a `cwd` inside the mountpoint.
  */
 
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -50,7 +50,10 @@ describe.skipIf(here.chosen === undefined || !roomToRun)("mount() with no transp
   async function mountpoint(): Promise<string> {
     const path = await mkdtemp(join(tmpdir(), "mountx-auto-mnt-"));
     directories.push(path);
-    return path;
+    // Resolved, because a transport records the mountpoint the mount table
+    // does. It costs nothing on Linux and is load-bearing on macOS, where
+    // `tmpdir()` is under `/var` — a symlink to `/private/var`.
+    return realpath(path);
   }
 
   async function mounted(): Promise<{ at: string; mounted: AutoMount }> {

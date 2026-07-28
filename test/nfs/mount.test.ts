@@ -2,12 +2,15 @@
  * Tier 2: a real `mount -t nfs 127.0.0.1:/` of a JavaScript driver.
  *
  * ```sh
- * pnpm test:nfs:mount
+ * pnpm test:nfs:mount     # under sudo, the privileged column
+ * pnpm test:rootless      # macOS: the same column as an ordinary user
  * ```
  *
- * Skips itself unless the host can actually mount NFS — root, plus a kernel
- * NFS *client* and its mount helper (`/sbin/mount.nfs` from `nfs-utils` on
- * Linux, `/sbin/mount_nfs` on macOS). Neither of those is something this
+ * Skips itself unless the host can actually mount NFS: a kernel NFS *client*
+ * and its mount helper (`/sbin/mount.nfs` from `nfs-utils` on Linux,
+ * `/sbin/mount_nfs` on macOS), plus root **on Linux only** — macOS's helper is
+ * not setuid and an ordinary user may mount onto a directory they own, which
+ * `mkdtemp` gives us. Neither the client nor the helper is something this
  * project can provide, and the dev container it was written in has neither
  * (see `.agents/environment.md`), which is exactly why the Tier-1 column
  * exists: `test/nfs/conformance.test.ts` runs the same protocol end to end
@@ -45,6 +48,20 @@ import {
 
 const probe = nfsClientProbe();
 const platform = (probe.platform ?? "linux") satisfies NfsPlatform;
+const asUser = (process.getuid?.() ?? -1) !== 0;
+
+/**
+ * Has someone asked for this column, rather than merely run `pnpm test`?
+ *
+ * On macOS this suite no longer needs root — `mount_nfs` does not — so without
+ * a gate it would mount real filesystems in the middle of the Tier-0/1 run,
+ * which is not what anyone typing `pnpm test` is asking for. The signal is the
+ * one `test/fuse/mount-rootless.test.ts` already uses and both `test/root.sh`
+ * and `test/rootless.sh` already set: a raised threadpool. Root keeps its own
+ * gate, so nothing about the privileged column changes.
+ */
+const POOL = Number.parseInt(process.env.UV_THREADPOOL_SIZE ?? "", 10);
+const asked = !asUser || (Number.isFinite(POOL) && POOL >= 8);
 
 /**
  * Is anything mounted at `target`, according to the only source that knows?
@@ -105,7 +122,7 @@ function run(command: string, args: string[]): Promise<{ status: number | null; 
   });
 }
 
-describe.skipIf(!probe.usable)("a real NFS mount", () => {
+describe.skipIf(!probe.usable || !asked)("a real NFS mount", () => {
   const mounts: NfsMount[] = [];
   const directories: string[] = [];
 
