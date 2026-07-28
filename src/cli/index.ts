@@ -47,6 +47,7 @@ const CLI = {
     mountpoint: { type: "string", short: "m" },
     transport: { type: "string", short: "t", default: "auto" },
     quiet: { type: "boolean", short: "q", default: false },
+    verbose: { type: "boolean", short: "v", default: false },
     "read-only": { type: "boolean", short: "r", default: false },
     empty: { type: "boolean", default: false },
     "allow-other": { type: "boolean", default: false },
@@ -63,6 +64,7 @@ ${bold("Options:")}
   -m, --mountpoint ${dim("<path>")}  where to mount        ${dim("(default: ~/mountx, $MOUNTX_MOUNTPOINT)")}
   -t, --transport ${dim("<name>")}   auto | fuse | nfs     ${dim("(default: auto)")}
   -q, --quiet              do not log filesystem requests
+  -v, --verbose            log the metadata polls too ${dim("(lstat, stat, statfs)")}
   -r, --read-only          mount read-only
       --empty              start empty, without the README copied in
       --allow-other        let other users see the mount ${dim("(FUSE; implied under root)")}
@@ -125,9 +127,10 @@ async function main(): Promise<void> {
   }
 
   // What gets mounted is the driver wrapped in the watcher, so every request the
-  // kernel makes is narrated — all of them, reads and stats included. The
-  // seeding above went to the bare driver, so the log starts empty.
-  const served: FsDriver = values.quiet ? driver : watchDriver(driver);
+  // kernel makes is narrated — reads included, and the metadata polls too under
+  // `--verbose`. The seeding above went to the bare driver, so the log starts
+  // empty.
+  const served: FsDriver = values.quiet ? driver : watchDriver(driver, { verbose: values.verbose });
 
   // A previous run that was killed rather than unmounted leaves the mountpoint
   // in the mount table — answering ENOTCONN, and enough for `mount()` to refuse
@@ -164,7 +167,13 @@ ${dim("From another terminal:")}
 
 ${hints.map((hint) => bold(hint)).join("\n")}
 
-${values.quiet ? dim("Requests are not logged (--quiet).") : dim("Every request shows up below.")}
+${
+  values.quiet
+    ? dim("Requests are not logged (--quiet).")
+    : values.verbose
+      ? dim("Every request shows up below.")
+      : dim("Requests show up below; --verbose adds the metadata polls.")
+}
 ${dim("Ctrl-C to unmount; if this process ever dies without unmounting, clear it")}
 ${dim(`with ${bold(staleCommand(mountpoint, mounted.transport).join(" "))}`)}
 `);

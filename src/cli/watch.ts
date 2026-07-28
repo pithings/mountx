@@ -10,10 +10,13 @@
  * are followed too: `open` returns a wrapped {@link FileHandleLike} so writes
  * land under the path they belong to instead of a bare fd.
  *
- * **Everything is logged**, reads and stats included — a single `ls -l` is a
- * lookup and a getattr per entry, and seeing that volume is half the point of
- * watching. Colour carries the triage instead: mutations are bright, the
- * observers are dim, failures are red.
+ * **Almost everything is logged**, reads included. The exception is the metadata
+ * polls ({@link NOISY}), which `verbose` puts back: a single `ls -l` is a
+ * `lstat` per entry and a desktop session asks `statfs` on a timer, so leaving
+ * them on by default buries the request that was actually interesting. A failed
+ * one is still shown — an `ENOENT` from a `lstat` is usually the whole story of
+ * the command that caused it. Colour carries the rest of the triage: mutations
+ * are bright, the observers are dim, failures are red.
  *
  * The zero-copy contract still applies (`src/fuse/mount.ts`): the wrapper reads
  * `buffer.length` *before* awaiting and never keeps the buffer itself.
@@ -36,13 +39,22 @@ import { CYAN, DIM, GREEN, paint, RED, YELLOW } from "./color.ts";
 export interface WatchOptions {
   /** Where lines go. Default `console.log`. */
   log?: (line: string) => void;
+  /** Log the metadata polls ({@link NOISY}) too. Default `false`. */
+  verbose?: boolean;
 }
 
 /** Two paths, `from → to`, rather than one path and an argument. */
 const TWO_PATHS = new Set(["rename", "link", "symlink"]);
 
+/**
+ * The metadata polls: many per listed entry, or on a timer, and answering the
+ * question nobody asked. Logged only when they fail, or under `verbose`.
+ */
+const NOISY = new Set(["lstat", "stat", "statfs"]);
+
 export function watchDriver(driver: FsDriver, options: WatchOptions = {}): FsDriver {
   const log = options.log ?? ((line: string) => console.log(line));
+  const verbose = options.verbose ?? false;
 
   function emit(op: string, subject: string, note: string): void {
     const styled = paint(OP_STYLE[op] ?? DIM, op.padEnd(9));
@@ -58,7 +70,7 @@ export function watchDriver(driver: FsDriver, options: WatchOptions = {}): FsDri
   ): Promise<T> {
     try {
       const result = await call();
-      emit(op, subject, note && paint(DIM, note));
+      if (verbose || !NOISY.has(op)) emit(op, subject, note && paint(DIM, note));
       return result;
     } catch (error) {
       emit(op, subject, paint(RED, `→ ${errnoOf(error)}`));
