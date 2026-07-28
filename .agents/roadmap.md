@@ -41,6 +41,28 @@ results.
   `fuse: {…}`/`nfs: {…}` escape hatches, because the two transports'
   same-named options are genuinely different shapes.
 
+- **Unprivileged NFS mounting on macOS** (2026-07-28). It turned out to need no
+  new code at all: `/sbin/mount_nfs` is not setuid and holds no entitlement,
+  because macOS is a BSD and a BSD lets an ordinary user mount onto a directory
+  that user owns. The `mount(8)` spawn `mountNfs()` already makes works verbatim
+  as uid 501 — the kernel just forces `MNT_NOSUID|MNT_NODEV` and records
+  `mounted by <user>`. The only thing standing in the way was our own
+  `nfsClientProbe()`, which asked for root unconditionally.
+  So: the root requirement is now Linux's (where an unprivileged `mount(8)`
+  needs an `fstab` entry marked `user`, which a library cannot arrange), and the
+  macOS precondition — _the caller owns the mountpoint_ — is checked at mount
+  time by `ownershipRefusal()`, because it is a fact about a path rather than
+  about the host. `mountx/auto` therefore picks NFS on macOS for a non-root
+  process instead of refusing, and `pnpm test:rootless` runs the NFS mount
+  column plus `mountx/auto` there with no sudo.
+  The NetFS route was investigated and rejected: `open nfs://…` has no handler
+  at all on 26.6 (`kLSApplicationNotFoundErr`), and `NetFSMountURLSync` parses a
+  URL port into `kNetFSAlternatePortKey` and then never reads it — it goes to
+  port 111 and fails `ECONNREFUSED`, which for a server with no portmapper is
+  fatal. Options can only reach `mount_nfs` through a `?options=` query string.
+  It buys exactly one thing, `/Volumes` mountpoints, and costs FFI; see
+  "Future / deferred".
+
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
@@ -81,10 +103,14 @@ rather than by accident.
   failed 14 cases there, all of them the suite assuming Linux — host `O_*` handed
   to a session that reads the wire's (now `src/fuse/flags.ts`) and host `errno`
   numbers checked against the transcribed table (now a target's `errors: "host"`).
-  A `macos-latest` CI job is now worth doing for both layers, with one open
-  question first: a CI runner is launchd-attributed, which is the context that
-  gets an instant `EPERM` from the consent gate rather than a prompt, so the
-  Tier-2 column may need a PPPC profile to run there at all.
+  `.github/workflows/checks.yml` now runs both: Tier 0/1 on a `macos-latest`
+  matrix leg alongside ubuntu, and the unprivileged Tier-2 column as
+  `mount-macos`. That second job is **non-blocking on purpose** — a runner is
+  launchd-attributed, which is the context the consent gate refuses instantly
+  with `EPERM` rather than prompting, and the gate never fired locally for a
+  user-owned mountpoint but "never here" is not "never there". If it stays
+  green, drop `continue-on-error`; if it fails on the gate, a PPPC profile is
+  the answer.
   What the run _changed_:
   - **The `-f`-only escalation ladder is weaker than it claimed.** macOS gates
     network volumes behind a sandbox approval that is never prompted for a
@@ -100,15 +126,13 @@ rather than by accident.
     README's macOS section before anyone is surprised by it.
   - `unlink` of a directory answers `EPERM` there, the same host split
     `test/conformance.ts` already carries.
-- **Rootless NFS mounting on macOS** — the same shape as the rootless FUSE work
-  above, and the reason not to hard-code "NFS needs root" anywhere outside
-  `nfsClientProbe()`. `mount_nfs(8)` needs root, but Finder mounts `nfs://`
-  URLs as an ordinary user, which means something unprivileged can already ask
-  for the mount: `NetFS.framework`'s `NetFSMountURLSync`, and possibly the
-  `open nfs://127.0.0.1:<port>/` URL handler that sits on top of it. Neither is
-  verified — in particular whether a non-standard port survives the URL, and
-  where the volume lands (`/Volumes/…`, not a path we chose). Investigate
-  before promising anything.
+- **Mounting into `/Volumes` on macOS** — the only part of the NetFS
+  investigation that is still open, and the only thing the unprivileged path
+  cannot do. See "Shipped since v1" for what that investigation settled.
+  `NetFSMountURLSync` can mount anywhere Finder can, but reaching it means FFI
+  (against the zero-runtime-deps invariant) or `osascript` (which gives up
+  mountpoint control and has no timeout). Worth it only if someone actually
+  needs the volume to appear where Finder puts one.
 - **WebDAV and Windows support.** Not designed against; WebDAV is the
   unprivileged, zero-native-code path for macOS/Windows per `IDEA.md`.
   Windows also has no `mount(8)`, so it stays out of the NFS transport's

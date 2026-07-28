@@ -120,6 +120,26 @@ the host the NFS transport's Tier-2 column was witnessed on.
 - **`unlink` of a directory is `EPERM`**, not Linux's `EISDIR` — the BSD answer,
   and the client kernel's to give. Same split `test/conformance.ts` already
   handles with `errors: "host"`.
+- **Mounting needs no root here.** `/sbin/mount_nfs` is `-rwxr-xr-x`, not setuid,
+  and has no entitlements; a BSD lets an ordinary user mount onto a directory
+  that user owns. Verified as uid 501, no sudo anywhere: `mount -t nfs -o
+vers=3,proto=tcp,port=…,mountport=…,nolocks,soft,nobrowse 127.0.0.1:/ ./mnt`
+  → exit 0, read and write through it, `umount ./mnt` → exit 0. The kernel
+  forces `MNT_NOSUID|MNT_NODEV` and records `mounted by <user>`; a mountpoint
+  owned by root refuses with `Operation not permitted`. There is no
+  `vfs.usermount` sysctl on Darwin — the behaviour is unconditional.
+- **The NetFS route is a dead end, and the port is the trap.** `open nfs://…`
+  has no handler on 26.6 at all (`kLSApplicationNotFoundErr`; `smb://`, `afp://`
+  and `ftp://` all resolve to Finder). `NetFSMountURLSync` parses `:20490` into
+  `kNetFSAlternatePortKey` and then never reads that key — tcpdump shows it
+  going to **port 111**, twice, failing `61 Connection refused`, which is fatal
+  for a server with no portmapper. Its `mount_options` dictionary can express
+  only `kNetFSMountFlagsKey`/`SoftMount`/`AllowSubMounts`/`MountAtMountDir`;
+  `mountport`, `nolocks`, `vers`, `proto`, `timeo`, `retrans` have to go through
+  a `?options=` query string, which the plugin passes verbatim to `mount_nfs -o`.
+  `osascript -e 'mount volume "nfs://…?options=…"'` does work unprivileged, but
+  lands in `/Volumes/<name>` with no say in the path and hangs forever when the
+  server is absent.
 - **Wedge recovery:** a mount whose server has gone is unresponsive to `stat`
   (`ETIMEDOUT` after `timeo`), and every route down is behind the gate above. In
   order: kill whatever is parked on the mountpoint (that frees the pending
