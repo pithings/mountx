@@ -22,7 +22,7 @@ Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
 
 ## Milestones (in order; each ends with tests green + a commit)
 
-1. **Driver interface & drivers.** `FsDriver` = subset of `node:fs/promises`
+1. ✅ **DONE** (commit 8609d65, 2026-07-27) **Driver interface & drivers.** `FsDriver` = subset of `node:fs/promises`
    (stat/lstat/statfs, readdir withFileTypes, open→FileHandle, mkdir/rmdir/
    unlink/rename/link/symlink/readlink, chmod/chown/truncate/utimes/…),
    capability declaration (`{ handles, hardlinks, symlinks, xattr, … }`),

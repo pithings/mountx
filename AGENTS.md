@@ -30,3 +30,33 @@ v1). Single package with subpath exports. Small conventional commits to
   passthrough resolves every path component itself so nothing escapes its root.
 - `test/conformance.ts` — the one Tier-0 suite, run against both drivers and
   raw `node:fs/promises` from `test/drivers.test.ts`.
+
+## Layout (milestone 2 — FUSE protocol layer, `unimount/fuse`)
+
+Pure data transformation: no I/O, no `/dev/fuse`, no mount, runs on any OS.
+
+- `src/fuse/constants.ts` — opcodes, `FUSE_*` / `FOPEN_*` / `FATTR_*` / `DT_*`
+  and the compat struct sizes. **Transcribed from the Linux kernel's
+  `include/uapi/linux/fuse.h` at tag v6.12 (protocol 7.41)**, which is what
+  this host's kernel speaks. Nothing is guessed; each codec repeats the C
+  declaration with byte offsets.
+- `src/fuse/protocol.ts` — every struct encoded **and** decoded (the symmetry
+  is what makes a synthetic kernel and record/replay possible), the opcode
+  dispatch table (`OPCODES`), whole-message framing, errno-on-the-wire helpers,
+  and dirent packing (`DirentPacker`).
+- `src/fuse/init.ts` — `negotiateInit(kernelInit, preferences)`, pure.
+
+Conventions inside the protocol layer:
+
+- **Every 64-bit wire field is a `bigint`**, every smaller one a `number`;
+  `padding` / `dummy` fields are not modelled, so `decode(encode(x))` is `x`.
+- **Only `ProtocolError` escapes a decoder** — that invariant is fuzzed, and it
+  is what keeps a malformed message from hanging a mountpoint.
+- Version-dependent layouts go through `ProtocolContext { minor, setxattrExt }`;
+  `FUSE_INIT` alone is decoded from its own length (nothing is negotiated yet).
+- Negotiation defaults: `max_write` 1 MiB via 256 `max_pages`, readdirplus on,
+  writeback cache **off**, `max_background` 64.
+
+Tests live in `test/fuse/`: `random.ts` (seeded PRNG + per-opcode generators),
+`protocol.test.ts` (round-trips, framing, compat layouts), `golden.test.ts`
+(hand-verified hex fixtures), `dirent.test.ts`, `init.test.ts`, `fuzz.test.ts`.

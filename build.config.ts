@@ -4,7 +4,12 @@ export default defineBuildConfig({
   entries: [
     {
       type: "bundle",
-      input: ["./src/index.ts", "./src/drivers/memory.ts", "./src/drivers/node-fs.ts"],
+      input: [
+        "./src/index.ts",
+        "./src/fuse/index.ts",
+        "./src/drivers/memory.ts",
+        "./src/drivers/node-fs.ts",
+      ],
     },
   ],
 });
