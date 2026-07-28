@@ -61,6 +61,36 @@ async function isMounted(target: string): Promise<boolean> {
   return parseMountTable(platform, table).some((entry) => entry.target === target);
 }
 
+/**
+ * Is this the AppleDouble sidecar macOS leaves next to a file it creates?
+ *
+ * Not an artifact of this transport, and not something it can prevent: macOS
+ * tags every new file with a `com.apple.provenance` extended attribute, NFSv3
+ * has no procedure for extended attributes at all, and the client's fallback
+ * for a volume that cannot store one is to write it to a `._name` companion
+ * file. So a `writeFile` through an NFS mount on macOS really does create two
+ * entries in the driver, and a directory of 120 files really does list 240.
+ *
+ * The suite accommodates it the way the conformance suite accommodates host
+ * errno numbers — hold the behaviour exact, allow the host its own baggage —
+ * and asserts below that every sidecar belongs to a file this test wrote, and
+ * that Linux produces none.
+ */
+function isSidecar(name: string): boolean {
+  return name.startsWith("._");
+}
+
+/**
+ * `unlink` of a directory. POSIX permits either answer and the two families
+ * differ: Linux says `EISDIR`, the BSDs (darwin included) say `EPERM`.
+ *
+ * Through a real mount the answer is the *client kernel's*, whatever the driver
+ * behind it would have said — so this column is held to the host's family, the
+ * same way `test/conformance.ts` holds a target that forwards host errors. The
+ * drivers themselves are still pinned to `EISDIR` there.
+ */
+const unlinkDirCode = platform === "darwin" ? "EPERM" : "EISDIR";
+
 /** Run a command with no `cwd` inside the mountpoint — see the module docs. */
 function run(command: string, args: string[]): Promise<{ status: number | null; out: string }> {
   return new Promise((resolve, reject) => {
@@ -164,30 +194,56 @@ describe.skipIf(!probe.usable)("a real NFS mount", () => {
       await fs.writeFile(path(`many/f${String(index).padStart(3, "0")}`), "x");
     }
     const entries = await fs.readdir(path("many"), { withFileTypes: true });
-    expect(entries).toHaveLength(120);
-    expect(entries.every((entry) => entry.isFile())).toBe(true);
+    const written = entries.filter((entry) => !isSidecar(entry.name));
+    const sidecars = entries.filter((entry) => isSidecar(entry.name));
+    expect(written).toHaveLength(120);
+    expect(written.every((entry) => entry.isFile())).toBe(true);
+    // Every sidecar belongs to a file this test wrote, and on Linux there are
+    // none — the accommodation must not paper over a directory listing that
+    // grew entries nobody asked for.
+    const names = new Set(written.map((entry) => entry.name));
+    expect(sidecars.every((entry) => names.has(entry.name.slice(2)))).toBe(true);
+    if (platform !== "darwin") {
+      expect(sidecars).toHaveLength(0);
+    }
     // And through a separate process, which is what a real client looks like.
+    // macOS `ls` does not hide these the way it hides a dotfile on a local
+    // filesystem, so the same filter applies to its output.
     const listed = await run("ls", ["-1", path("many")]);
     expect(listed.status).toBe(0);
-    expect(listed.out.trim().split("\n")).toHaveLength(120);
+    expect(
+      listed.out
+        .trim()
+        .split("\n")
+        .filter((name) => !isSidecar(name)),
+    ).toHaveLength(120);
 
     // --- errno cases ---
     await expect(fs.stat(path("nope"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.readdir(path("dir/data"))).rejects.toMatchObject({ code: "ENOTDIR" });
     await expect(fs.rmdir(path("dir"))).rejects.toMatchObject({ code: "ENOTEMPTY" });
-    await expect(fs.unlink(path("dir"))).rejects.toMatchObject({ code: "EISDIR" });
+    await expect(fs.unlink(path("dir"))).rejects.toMatchObject({ code: unlinkDirCode });
     await expect(fs.mkdir(path("dir"))).rejects.toMatchObject({ code: "EEXIST" });
 
     // --- removal, sequentially: `fs.rm` recursive fans out. ---
-    for (const entry of entries) {
-      await fs.unlink(path(`many/${entry.name}`));
+    // Driven by the listing rather than by a list of names, because on macOS
+    // every file written above has a sidecar beside it and `rmdir` refuses a
+    // directory that still holds one.
+    async function empty(directory: string): Promise<void> {
+      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        const child = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await empty(child);
+          await fs.rmdir(child);
+        } else {
+          await fs.unlink(child);
+        }
+      }
     }
-    await fs.rmdir(path("many"));
-    for (const name of ["renamed.txt", "alias.txt", "link.txt", "data"]) {
-      await fs.unlink(path(`dir/${name}`));
+    for (const directory of [path("many"), path("dir")]) {
+      await empty(directory);
+      await fs.rmdir(directory);
     }
-    await fs.rmdir(path("dir/nested"));
-    await fs.rmdir(path("dir"));
     expect(await fs.readdir(at)).toEqual([]);
   }, 120_000);
 
