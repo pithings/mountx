@@ -29,7 +29,7 @@ commit and say why.
   `mountx/auto` (auto's contract is a mountpoint; S3 never produces one).
 - **Bucket model:** `createS3Server(driver, opts?)` serves one bucket
   (`bucket` option, default `"mountx"`); `createS3Server({ buckets: { name:
-  driver, ... } }, opts?)` serves several. Path-style URLs only.
+driver, ... } }, opts?)` serves several. Path-style URLs only.
   `CreateBucket`/`DeleteBucket` → `NotImplemented` (501, S3 XML error).
 - **Auth:** credentials optional. Without them: bind loopback only (refuse a
   non-loopback `host` option outright, named error), signatures parsed but not
@@ -53,7 +53,7 @@ commit and say why.
   without inflating listings).
 - **ListObjectsV2:** `delimiter=/` → one `readdir` level (CommonPrefixes).
   No delimiter → sorted DFS walk. Full-key lexicographic order requires
-  comparing by *effective key* (`name` for files, `name + "/"` for dirs) at
+  comparing by _effective key_ (`name` for files, `name + "/"` for dirs) at
   each level — plain name sort interleaves wrong (`a.txt` < `a/b` < `a0`).
   Continuation token = opaque base64 of the last emitted key (stateless
   start-after cursor), bounded by `max-keys` (default/cap 1000).
@@ -95,73 +95,76 @@ commit and say why.
 Each step lists deliverables and what its verifier must confirm beyond
 `pnpm test` green.
 
-- [ ] **1. `src/s3/constants.ts` + `src/s3/sigv4.ts`** — errno→S3-error table,
-  limits, op names; SigV4 canonical request, signing key derivation, header
-  and presigned-query verification, clock-skew window. Tests:
-  `test/s3/sigv4.test.ts` against AWS's published SigV4 test vectors as
-  goldens. Verify: vectors are transcribed (named source), not invented;
-  `node:crypto` only.
+- [x] **1. `src/s3/constants.ts` + `src/s3/sigv4.ts`** — errno→S3-error table,
+      limits (op names moved to step 4: the discrimination table belongs with the
+      router, decided during step-1 verification); SigV4 canonical request,
+      signing key derivation, header
+      and presigned-query verification, clock-skew window. Tests:
+      `test/s3/sigv4.test.ts` against AWS's published SigV4 test vectors as
+      goldens. Verify: vectors are transcribed (named source), not invented;
+      `node:crypto` only.
 - [ ] **2. `src/s3/xml.ts`** — bounded XML encoder for list/error/multipart
-  responses and parser for the two request bodies (DeleteObjects,
-  CompleteMultipartUpload); escaping both ways. Tests: round-trips + golden
-  fixtures. Verify: fixtures give every field a distinct value; parser is
-  bounds-checked against hostile input (no entity expansion, depth-capped).
+      responses and parser for the two request bodies (DeleteObjects,
+      CompleteMultipartUpload); escaping both ways. Tests: round-trips + golden
+      fixtures. Verify: fixtures give every field a distinct value; parser is
+      bounds-checked against hostile input (no entity expansion, depth-capped).
 - [ ] **3. `src/s3/chunked.ts`** — `aws-chunked` /
-  `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` streaming decoder with per-chunk
-  signature verification (and unsigned-chunked passthrough), trailer
-  handling. Tests: golden frames, split-across-read-boundary cases. Verify:
-  decoder copies retained bytes; malformed framing → clean error, not hang.
+      `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` streaming decoder with per-chunk
+      signature verification (and unsigned-chunked passthrough), trailer
+      handling. Tests: golden frames, split-across-read-boundary cases. Verify:
+      decoder copies retained bytes; malformed framing → clean error, not hang.
 - [ ] **4. `src/s3/protocol.ts`** — pure request parsing/routing: path-style
-  URL → (bucket, key), op discrimination from method + query
-  (`list-type=2`, `uploads`, `uploadId`, `delete`, ...), Range/conditional/
-  `x-amz-meta-mtime` header parsing, response header building, S3 XML error
-  responses. Tests: `test/s3/protocol.test.ts` routing table + goldens.
-  Verify: unknown ops route to `NotImplemented`, never fall through.
+      URL → (bucket, key), the op-name table and op discrimination from
+      method + query
+      (`list-type=2`, `uploads`, `uploadId`, `delete`, ...), Range/conditional/
+      `x-amz-meta-mtime` header parsing, response header building, S3 XML error
+      responses. Tests: `test/s3/protocol.test.ts` routing table + goldens.
+      Verify: unknown ops route to `NotImplemented`, never fall through.
 - [ ] **5. `src/s3/session.ts` (core ops)** — `S3Session` with the streaming
-  interface; GET/HEAD (ETag, conditionals, Range), PUT (incl. mtime meta,
-  chunked bodies), DELETE, DeleteObjects, CopyObject, HeadBucket,
-  ListBuckets, ListObjectsV2 (both delimiter modes, effective-key ordering,
-  continuation tokens, empty-dir markers), key validation, errno mapping,
-  single-reply assertion. Tests: `test/s3/session.test.ts` against the
-  memory driver (in-process, no sockets). Verify: ordering cases
-  (`a.txt`/`a/b`/`a0`), pagination resume mid-directory, zero-copy contract
-  at every await.
+      interface; GET/HEAD (ETag, conditionals, Range), PUT (incl. mtime meta,
+      chunked bodies), DELETE, DeleteObjects, CopyObject, HeadBucket,
+      ListBuckets, ListObjectsV2 (both delimiter modes, effective-key ordering,
+      continuation tokens, empty-dir markers), key validation, errno mapping,
+      single-reply assertion. Tests: `test/s3/session.test.ts` against the
+      memory driver (in-process, no sockets). Verify: ordering cases
+      (`a.txt`/`a/b`/`a0`), pagination resume mid-directory, zero-copy contract
+      at every await.
 - [ ] **6. Multipart in `session.ts`** — the five ops, staging prefix
-  invisibility, out-of-order parts, streamed assembly, abort + close
-  cleanup, part-list validation (ETag echo, part numbering). Tests extend
-  `session.test.ts`. Verify: staging never leaks into any listing or
-  GET/PUT/DELETE; interrupted upload leaves no debris after close.
+      invisibility, out-of-order parts, streamed assembly, abort + close
+      cleanup, part-list validation (ETag echo, part numbering). Tests extend
+      `session.test.ts`. Verify: staging never leaks into any listing or
+      GET/PUT/DELETE; interrupted upload leaves no debris after close.
 - [ ] **7. `src/s3/server.ts` + `src/s3/index.ts` + wiring** — `node:http`
-  binding, loopback/credential gate, both `createS3Server` call shapes,
-  `close()` (drains, cleans staging), subpath export `mountx/s3` in
-  `package.json` + obuild config; `index.ts` re-exports by name (NFS
-  pattern). Tests: `test/s3/server.test.ts` over real sockets with `fetch`.
-  Verify: non-loopback bind without credentials refuses with the named
-  error; built `dist/s3/*` imports no runtime dep; export map resolves.
+      binding, loopback/credential gate, both `createS3Server` call shapes,
+      `close()` (drains, cleans staging), subpath export `mountx/s3` in
+      `package.json` + obuild config; `index.ts` re-exports by name (NFS
+      pattern). Tests: `test/s3/server.test.ts` over real sockets with `fetch`.
+      Verify: non-loopback bind without credentials refuses with the named
+      error; built `dist/s3/*` imports no runtime dep; export map resolves.
 - [ ] **8. Tier-1 conformance column** — `test/s3/client.ts`: a signing JS
-  client speaking to the session directly (no sockets, `test/nfs/client.ts`
-  pattern) plus an `FsDriver`-shaped adapter over it;
-  `test/s3/conformance.test.ts` runs `test/conformance.ts` as a column with
-  honestly declared capabilities (no symlinks/hardlinks/permissions,
-  rename absent → copy+delete semantics, `times` via mtime meta). Update
-  `test/matrix.ts` so `pnpm matrix` grows the column; regenerate
-  `.agents/conformance-matrix.md`. Verify: declared capabilities match what
-  the session actually answers, none faked.
+      client speaking to the session directly (no sockets, `test/nfs/client.ts`
+      pattern) plus an `FsDriver`-shaped adapter over it;
+      `test/s3/conformance.test.ts` runs `test/conformance.ts` as a column with
+      honestly declared capabilities (no symlinks/hardlinks/permissions,
+      rename absent → copy+delete semantics, `times` via mtime meta). Update
+      `test/matrix.ts` so `pnpm matrix` grows the column; regenerate
+      `.agents/conformance-matrix.md`. Verify: declared capabilities match what
+      the session actually answers, none faked.
 - [ ] **9. rclone oracle** — install the static rclone binary user-level
-  (document where in `.agents/environment.md`); `test/s3/oracle.test.ts`
-  gated on a `command -v rclone` probe (skips clean when absent, the
-  `nfsClientProbe` pattern): copy/ls/sync round-trips, mtime preservation
-  via the meta header, `sync` against a tree with an empty directory; plus
-  a curl presigned-URL GET/PUT case. Verify: runs green here, skips clean
-  when the binary is hidden from PATH.
+      (document where in `.agents/environment.md`); `test/s3/oracle.test.ts`
+      gated on a `command -v rclone` probe (skips clean when absent, the
+      `nfsClientProbe` pattern): copy/ls/sync round-trips, mtime preservation
+      via the meta header, `sync` against a tree with an empty directory; plus
+      a curl presigned-URL GET/PUT case. Verify: runs green here, skips clean
+      when the binary is hidden from PATH.
 - [ ] **10. Docs + bookkeeping (sonnet)** — `docs/2.transports/` page for S3
-  (guide prose first, full export surface below, same as FUSE/NFS pages;
-  explicitly: gateway not mount, why it's outside `mountx/auto`, auth
-  posture, ETag/mtime/empty-dir semantics, the `NotImplemented` boundary);
-  transports overview + reference index updated; README link list mention;
-  `AGENTS.md` code map + `.agents/roadmap.md` "shipped" entry. Verify
-  (sonnet): docs claim nothing unimplemented, no perf numbers, code map
-  matches the tree.
+      (guide prose first, full export surface below, same as FUSE/NFS pages;
+      explicitly: gateway not mount, why it's outside `mountx/auto`, auth
+      posture, ETag/mtime/empty-dir semantics, the `NotImplemented` boundary);
+      transports overview + reference index updated; README link list mention;
+      `AGENTS.md` code map + `.agents/roadmap.md` "shipped" entry. Verify
+      (sonnet): docs claim nothing unimplemented, no perf numbers, code map
+      matches the tree.
 
 ## Loop protocol
 
