@@ -37,12 +37,15 @@ is done when its checkbox is checked **and** its commit exists.
   the same namespace as FUSE's wire. Reuse `src/fuse/flags.ts`'s
   `driverOpenFlags()` (import it; hoist only if an import from `src/9p/`
   into `src/fuse/` proves unacceptable — decide in step 5, don't duplicate).
-- **Tier-2 witnessing:** this container cannot mount 9p (no modules, no
-  modprobe, Debian host kernel under a Fedora userland) and has no KVM.
-  Step 10 attempts QEMU **TCG (pure software emulation)** — only if
-  feasible; it is time-boxed and its failure is recorded, not fought.
-  Either way `test/9p/mount.test.ts` is probe-gated and skips itself here,
-  exactly like NFS Tier-2.
+- **Tier-2 witnessing (updated 2026-07-28, mid-run):** the host has loaded
+  the 9p kernel modules — `/proc/filesystems` lists `9p`, `/sys/module` has
+  `9p`, `9pnet`, `9pnet_virtio`. Step 10 is therefore a REAL local mount
+  witnessing under sudo, not QEMU. Caveat: `9pnet_fd` (the module providing
+  `trans=fd`, `trans=tcp` and `trans=unix`) was not loaded at check time —
+  only the virtio transport was. `mount(2)` may autoload it through the
+  host's modprobe; if it does not, the host needs `modprobe 9pnet_fd`.
+  `test/9p/mount.test.ts` stays probe-gated regardless (other hosts still
+  lack the module), exactly like NFS Tier-2.
 - **Wire authority:** message types, bit masks and struct layouts are
   transcribed from the Linux kernel's `include/net/9p/9p.h` (tag v6.12,
   matching the FUSE constants' tag), with diod's `protocol.md` as the prose
@@ -81,7 +84,7 @@ above that the step touches, and the commands to run.
 
 ## Steps
 
-- [ ] **1. Wire primitives + constants** — `src/9p/wire.ts`: `P9Reader`/
+- [x] **1. Wire primitives + constants** — `src/9p/wire.ts`: `P9Reader`/
       `P9Writer`, little-endian, unaligned, bounds-checked; u8/u16/u32,
       u64 as `bigint`, `string` as u16-length-prefixed UTF-8 (no padding),
       qid (type u8, version u32, path u64), byte blobs. Reader **copies**
@@ -169,21 +172,21 @@ rfdno=N,wfdno=N,version=9p2000.L,msize=…` with stdio-padded fd; no mount
       abandoned-child rule; mount-table tri-state (`/proc/self/mounts`);
       unmount detection = EOF on the socketpair. `src/9p/index.ts` re-exports.
       `package.json` exports + obuild config for `mountx/9p`. Tier-2
-      `test/9p/mount.test.ts`, probe-gated (skips on this host), run under
-      `test/root.sh` in `pnpm test:root`'s file list only when the probe can
-      ever pass — wire it in but keep the skip self-contained. Commit.
-- [ ] **10. QEMU-TCG witnessing (time-boxed, best-effort)** — attempt:
-      `dnf install qemu-system-x86` (network works); a TCG microVM (`-accel
-tcg`, no `/dev/kvm` needed) with a kernel that has 9p (a distro cloud
-      kernel + initramfs, or `Fedora-Cloud` qcow2), user-mode netdev so the
-      guest reaches the host's TCP server at `10.0.2.2:<port>`; in-guest
-      `mount -t 9p -o trans=tcp,port=…,version=9p2000.L 10.0.2.2 /mnt` and a
-      small read/write/readdir/rename workload against `createP9Server`.
-      **Budget: two loop iterations max.** Success → record the witnessed facts
-      in `.agents/environment.md` + Log, keep the harness as a script under
-      `test/9p/` (gated, not in CI). Failure/blocked → record exactly why in
-      the Log + roadmap ("unwitnessed — needs CONFIG_9P_FS host") and move on.
-      Either outcome commits.
+      `test/9p/mount.test.ts`, probe-gated (expected to RUN on this host now —
+      see step 10), added to `pnpm test:root`'s file list with the skip
+      self-contained. Commit.
+- [ ] **10. Real-mount witnessing (local, under sudo)** — the host loaded the
+      9p modules mid-run (see the Tier-2 decision above). Run the Tier-2 suite
+      for real: `sh test/root.sh test/9p/mount.test.ts`. If the mount fails
+      because `9pnet_fd` did not autoload (EPROTONOSUPPORT-shaped failure on
+      `trans=fd`), STOP the loop and ask the user to `modprobe 9pnet_fd` on
+      the host — do not fight it and do not fall back to QEMU. Success →
+      record the witnessed facts (protocol accepted, msize honored, full
+      workload, clean teardown, no leaks in `/proc/self/mounts`) in
+      `.agents/environment.md` + the Log, and fix whatever the real kernel
+      disagrees with (likely suspects: Tflush ordering, iounit, readdir
+      offsets). Note in the Log that QEMU-TCG became unnecessary. Either
+      outcome commits.
 - [ ] **11. `mountx/auto` + CLI** — `src/auto.ts`: `Transport` gains
       `"9p"`, Linux preference `["fuse", "9p", "nfs"]`, `probe9p()` via
       `p9ClientProbe()` (import-light), `"9p"` options key, tagging;
@@ -206,10 +209,24 @@ tcg`, no `/dev/kvm` needed) with a kernel that has 9p (a distro cloud
 - [ ] **13. Final sweep** — `pnpm matrix` (9p conformance column present, or
       Log why not), `pnpm fmt`, full `pnpm test`, then one independent opus
       review subagent over `git diff main...feat/9p` for invariant violations
-      and drift between docs and code. Fix, commit, stop the loop, summarize
-      for the user (including what remains unwitnessed and how to witness it).
+      and drift between docs and code. Fix, commit. Then open a PR from
+      `feat/9p` to `main` with `gh pr create` (conventional title, body
+      summarizing the transport + witnessing status, ending with the
+      Claude Code PR trailer per repo conventions), stop the loop, and
+      summarize for the user with the PR URL.
 
 ## Log
 
 (append one dated line per step: what was learned, what surprised, what was
 deferred)
+
+- 2026-07-28 step 1: `wire.ts` + `constants.ts` + 33 tests. Verifier PASS,
+  zero defects — scripted diff matched all 118 constants against the kernel
+  sources. Learned: the setattr bits live in `fs/9p/vfs_inode_dotl.c`, not
+  `9p.h` (both cited in the file header). Fixed pre-commit: a backwards doc
+  comment about 9P2000.L's numbering gaps. Deferred nits: the fuzz-suite doc
+  reference becomes true in step 2; NaN-count/writer-growth edge cases mirror
+  `xdr.ts` convention deliberately.
+- 2026-07-28: host loaded the 9p modules mid-run (`9p`/`9pnet`/`9pnet_virtio`,
+  no `9pnet_fd` yet) — Tier-2 decision and step 10 rewritten from QEMU-TCG to
+  local real-mount witnessing; step 13 now also opens the PR (user request).
