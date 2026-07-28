@@ -54,8 +54,9 @@ export function nativeAvailable(): boolean {
  * The Zig side reports a raw positive `errno` and the syscall's name, because
  * the errno table is transcribed once and having a second copy of it in
  * another language is how the two drift. Here it becomes a negative `errno`
- * and a POSIX `code`, so these errors are indistinguishable from any other
- * error in the library and `errnoOf()` understands them.
+ * and — when `ERRNO_CODES` names it — a POSIX `code`, so these errors are
+ * indistinguishable from any other error in the library and `errnoOf()`
+ * understands them either way, since it falls back to the `errno`.
  */
 function wrap(binding: NativeBinding): NativeBinding {
   return {
@@ -82,7 +83,17 @@ function annotate(error: unknown): unknown {
     return error;
   }
   const annotated = error as NodeJS.ErrnoException;
-  annotated.code = CODE_BY_ERRNO.get(errno);
+  // Only when the table names it. `ERRNO_CODES` is the filesystem set, and
+  // these three syscalls can raise socket errnos that are not in it (`EPIPE`,
+  // `ENOTSOCK`, `EMSGSIZE`, `ECONNRESET`, ...). Assigning the lookup
+  // unconditionally would leave `code` present-but-`undefined`, which reads as
+  // "this error has no code" to `in` and as a failed match to every comparison
+  // — a shape no `node:fs` error ever has. Leaving the property off is the
+  // truthful version of the same fact, and `errno` still carries the detail.
+  const code = CODE_BY_ERRNO.get(errno);
+  if (code !== undefined) {
+    annotated.code = code;
+  }
   annotated.errno = -errno;
   return annotated;
 }
