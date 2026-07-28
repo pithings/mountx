@@ -4,6 +4,9 @@
   "description": "",
   "license": "MIT",
   "repository": "pithings/mountx",
+  "bin": {
+    "mountx": "./dist/cli/index.mjs"
+  },
   "files": [
     "dist",
     "native/index.mjs",
@@ -51,6 +54,7 @@
     "fmt": "automd && oxlint . --fix && oxfmt .",
     "lint": "oxlint . && oxfmt --check .",
     "matrix": "node test/matrix.ts && oxfmt .agents/conformance-matrix.md",
+    "mountx": "node src/cli/index.ts",
     "prepack": "pnpm build",
     "record:fixtures": "sudo env UV_THREADPOOL_SIZE=32 \"$(command -v node)\" test/fuse/record-fixtures.ts",
     "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",

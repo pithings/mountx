@@ -1,5 +1,5 @@
 /**
- * ANSI colour for the playground's output, and nothing more.
+ * ANSI colour for the CLI's output, and nothing more.
  *
  * Off when `NO_COLOR` is set (https://no-color.org). Escapes are spelled
  * `\u001B` rather than written as literal control bytes, so the source stays

@@ -6,7 +6,7 @@
  * ```
  *
  * It is a `Proxy` around an `FsDriver`, so it works with any driver and adds
- * nothing to the library — playground scaffolding, not a public API. Open files
+ * nothing to the library — CLI scaffolding, not a public API. Open files
  * are followed too: `open` returns a wrapped {@link FileHandleLike} so writes
  * land under the path they belong to instead of a bare fd.
  *
@@ -29,8 +29,8 @@ import {
   O_RDONLY,
   O_TRUNC,
   O_WRONLY,
-} from "../src/fuse/constants.ts";
-import type { FileHandleLike, FsDriver } from "../src/types.ts";
+} from "../fuse/constants.ts";
+import type { FileHandleLike, FsDriver } from "../types.ts";
 import { CYAN, DIM, GREEN, paint, RED, YELLOW } from "./color.ts";
 
 export interface WatchOptions {

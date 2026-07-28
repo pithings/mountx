@@ -46,6 +46,11 @@ NFS (`src/nfs/`, exported as `mountx/nfs`):
 - `server.ts` — `createNfsServer(driver, options)`, the only file here that opens a socket. `mount.ts` — `mountNfs()`/`nfsMountOptions()`, and the only platform-aware transport in the project: it mounts on **Linux and macOS** — on macOS **without root**, since `mount_nfs` is not setuid and a BSD lets an ordinary user mount onto a directory they own (`ownershipRefusal()` checks that at mount time, because it is a fact about the path rather than the host) — and keeps the difference in pure, tested pieces (`nfsMountOptions()`, `parseMountTable()`, `ownershipRefusal()`, `isConsentDenial()`/`consentAdvice()`, the probe's helper paths) plus a `-f`-only escalation ladder on macOS that the consent gate can refuse outright. macOS is NFS-only by necessity — macFUSE is a third-party kext with its own protocol dialect, so `src/fuse/` cannot serve it.
 - `index.ts` — re-exports `protocol.ts` by name, minus the sub-struct helpers (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, ...).
 
+CLI (`src/cli/`, the `mountx` bin, `pnpm play` from source):
+
+- `index.ts` — `node:util`'s `parseArgs`, then a memory driver holding one file — this package's own `README.md`, read through `new URL("../../README.md", import.meta.url)`, which is the package root from `src/cli/` and from `dist/cli/` alike, and npm publishes a README whatever the `files` list says — wrapped in `watch.ts` and mounted through `mountx/auto` at `~/mountx` (`[mountpoint]`/`-m`/`$MOUNTX_MOUNTPOINT`; `-t`, `-q`, `-r`, `--empty`, `--allow-other`). It is a demo and a test bench, not a mount tool — what it serves is always a tree that dies with the process. `process.exit` appears only in paths that run _before_ the mount (with one up it wedges), and the stale-mount cleanup detaches only a `fuse*`/`nfs*` mount at that exact path, printing the `sudo` line rather than spawning one when the route needs root.
+- `watch.ts` — the `FsDriver` `Proxy` that narrates every request, open file handles included. `color.ts` — ANSI, off under `NO_COLOR`.
+
 Tests (`test/`):
 
 - `conformance.ts` — the one Tier-0 suite, written against the driver interface; `drivers.test.ts` runs it against memory, node-fs and raw `node:fs/promises` (loopback column). A target declares `errors: "host"` when it forwards the host kernel's errors rather than carrying `src/errors.ts`'s table: on Linux that changes nothing, and on darwin it is what lets the suite hold the _code_ exact while allowing either number (`ENOTEMPTY` is 66 there, not 39) and expect BSD's `EPERM` for `unlink` of a directory.
@@ -102,6 +107,7 @@ Native (`native/`), the only non-JS in the repository:
 - `pnpm test:root` — the four Tier-2 real-mount suites under sudo (`sh test/root.sh test/fuse/mount.test.ts test/fuse/differential.test.ts test/fuse/conformance-mount.test.ts test/nfs/mount.test.ts`).
 - `pnpm test:mount` — just the FUSE mount smoke test under sudo.
 - `pnpm test:nfs:mount` — the NFS mount test under sudo; skips itself via `nfsClientProbe()` when the host has no NFS client.
+- `pnpm mountx` — the CLI from source (`node src/cli/index.ts`), no root; `--help` for the flags.
 - `pnpm matrix` — regenerates `.agents/conformance-matrix.md`.
 - `pnpm bench` — the loopback + NFS benchmark columns, no root.
 - `pnpm bench:root` — the FUSE benchmark column, under sudo.

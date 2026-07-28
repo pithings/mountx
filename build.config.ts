@@ -7,6 +7,7 @@ export default defineBuildConfig({
       input: [
         "./src/index.ts",
         "./src/auto.ts",
+        "./src/cli/index.ts",
         "./src/fuse/index.ts",
         "./src/nfs/index.ts",
         "./src/drivers/memory.ts",
