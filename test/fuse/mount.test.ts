@@ -476,6 +476,12 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
     await expect(mount(createMemoryDriver(), dir, { subtype: "a=b" })).rejects.toThrow(
       /`subtype` may not contain a comma/,
     );
+    // One argument to the left, the same mistake: `fsname` is also the source
+    // argument, and `mount(8)` permutes, so a leading dash would reach a
+    // root-privileged program as an option rather than as the source.
+    await expect(mount(createMemoryDriver(), dir, { fsname: "--fake" })).rejects.toThrow(
+      /`fsname` may not begin with a dash/,
+    );
     expect(liveMounts()).toEqual([]);
   });
 

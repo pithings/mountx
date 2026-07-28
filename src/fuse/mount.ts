@@ -442,16 +442,33 @@ function isMounted(target: string): boolean {
 /**
  * Reject anything that would not survive being joined into a `-o` list.
  *
- * `fsname` and `subtype` are the two options that carry user strings, and a
- * comma in either of them is not a quoting bug but an *injection*: it would
- * silently add mount options to the string handed to `mount(8)`.
+ * `fsname` and `subtype` are the two *scalar* options that carry user strings,
+ * and a comma in either of them is not a quoting bug but an *injection*: it
+ * would silently add mount options to the string handed to `mount(8)`. A
+ * leading dash is the same mistake one argument to the left — `fsname` is also
+ * passed positionally, where a dash makes it an option instead.
+ *
+ * `mountOptions` is a third carrier and deliberately unchecked: adding options
+ * is the whole point of it, it goes in as one argv element so it cannot reach
+ * past the `-o` list, and what is *acceptable* there is `fusermount3`'s call to
+ * make on the rootless path — it has the allowlist, and it forces
+ * `MS_NOSUID|MS_NODEV` whatever it is given.
  */
 function checkMountToken(name: string, value: string | undefined): string | undefined {
-  if (value !== undefined && /[,=\s]/.test(value)) {
+  if (value === undefined) {
+    return value;
+  }
+  if (/[,=\s]/.test(value)) {
     throw new Error(
       `mountx: \`${name}\` may not contain a comma, an equals sign or whitespace — ` +
         `it is joined into the mount option list, where those separate options ` +
         `(got ${JSON.stringify(value)})`,
+    );
+  }
+  if (value.startsWith("-")) {
+    throw new Error(
+      `mountx: \`${name}\` may not begin with a dash — it is also passed to mount(8) as ` +
+        `an argument, where that would make it an option (got ${JSON.stringify(value)})`,
     );
   }
   return value;
@@ -556,7 +573,10 @@ class MountImpl implements Mount {
     const type = "fuse";
     // `-i` matters: without it `mount(8)` hands off to `/sbin/mount.fuse`,
     // which reinterprets the source argument as a program to execute.
-    const args = ["-i", "-t", type, "-o", options, this.source, this.mountpoint];
+    // `--` for the same reason the `fusermount3` argv has one: `mount(8)`
+    // permutes, so without it a source that begins with a dash is read as an
+    // option to a program running as root rather than as the source.
+    const args = ["-i", "-t", type, "-o", options, "--", this.source, this.mountpoint];
     let result: SpawnResult;
     try {
       // The fd has to land in the child at *its own number*, because that is
