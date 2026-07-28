@@ -2,7 +2,7 @@ Keep important information about project in AGENTS.md. For more detailed info, p
 
 # mountx
 
-Mount a JavaScript filesystem: one driver interface (a subset of `node:fs/promises`), multiple transports (FUSE first, then NFSv3). user-facing docs: `README.md`.
+Mount a JavaScript filesystem: one driver interface (a subset of `node:fs/promises`), multiple transports (FUSE first, then NFSv3). User-facing docs live in `docs/` (<https://mountx.vercel.app>); `README.md` is the landing page for npm and GitHub and links there.
 
 Conventions: pure JS/TS, zero runtime deps, pure-JS-first. Single package with subpath exports. Small conventional commits to `main`, tests green (`pnpm test`) before each commit.
 
@@ -72,6 +72,8 @@ Native (`native/`), the only non-JS in the repository:
 
 `bench/` — `harness.ts` (warmup, adaptive loop, percentiles), `scenarios.ts` (written once against the driver interface), `index.ts` (loopback + NFS columns), `fuse.ts`+`fuse-client.ts` (the FUSE column, client in a child process); generates `.agents/benchmarks.md`.
 
+Docs (`docs/`) — the [undocs](https://undocs.dev) site at <https://mountx.vercel.app>. A **standalone pnpm project**, deliberately outside the root workspace (its own `package.json`, lockfile and `pnpm-workspace.yaml`), so the site's dependency tree never reaches the package's: `pnpm install && pnpm dev` inside `docs/`. Three sections, numbered-prefix routing (`1.guide/` → `/guide`): `1.guide/` (introduction, quick start, writing a driver, mounting, tuning, troubleshooting), `2.transports/` (how `auto` chooses, then FUSE and NFSv3 in detail), `3.reference/` (one page per entry point, plus the CLI). `.config/docs.yaml` is the landing page and the site config; `.docs/public/` holds the icons. **This is where user-facing prose goes now.** `README.md` was cut back to the intro, its snippet, install and a link list when the site landed — a second full copy is one that goes stale, and the CLI mounts the README, so it stays short on purpose. Anything longer than a paragraph belongs on a page here.
+
 ## Invariants (do not break)
 
 - **Zero runtime deps.**
@@ -97,7 +99,7 @@ Native (`native/`), the only non-JS in the repository:
 - **`process.exit()` does not work with a mount up.** Node's exit path joins the threadpool the reads are parked in. `await unmount()` and set `process.exitCode`; this is also why the signal handlers re-raise the signal instead of exiting directly.
 - **Source stays NUL-free and grep-able.** E.g. the NFS cookie verifier delimiter is the two-character string `"\0"`, never a literal NUL byte.
 - **Golden fixtures must give every field a distinct value.** A fixture built from repeated/mirrored values (`uid: 0, gid: 0, size == used`) passes even with transposed encoder/decoder fields; only an all-distinct fixture catches a symmetric encode/decode bug.
-- **README perf claims may come only from `.agents/benchmarks.md`**, and must carry that file's host line with them.
+- **Published perf claims may come only from `.agents/benchmarks.md`**, and must carry that file's host line with them. That covers `README.md` and `docs/` alike; the README now links to the docs rather than repeating the numbers, so `docs/1.guide/4.tuning.md` is where they live.
 
 ## Commands
 
@@ -114,6 +116,7 @@ Native (`native/`), the only non-JS in the repository:
 - `pnpm fmt` — `automd && oxlint . --fix && oxfmt .`.
 - `pnpm lint` — `oxlint . && oxfmt --check .`.
 - `pnpm build` — `obuild`.
+- `docs/`: `pnpm install` then `pnpm dev` / `pnpm build`, **from inside `docs/`** — it is its own project, not a workspace member.
 
 Tier-2 (`*:root`/`*:mount`) commands need sudo; root's `PATH` lacks `node` (fnm), so they invoke `sudo "$(command -v node)" ...` rather than plain `sudo node ...` — see `test/root.sh`.
 

@@ -8,10 +8,11 @@
  * npx mountx --help
  * ```
  *
- * An in-memory filesystem, seeded with a few files, wrapped in the request
- * logger (`watch.ts`) and mounted for real through `mountx/auto` — so it picks
- * FUSE on Linux and NFS on macOS, and needs no root on either (unprivileged
- * FUSE wants `fusermount3`; macOS NFS wants a mountpoint you own).
+ * An in-memory filesystem holding one file — this package's own `README.md`,
+ * copied in — wrapped in the request logger (`watch.ts`) and mounted for real
+ * through `mountx/auto`, which picks FUSE on Linux and NFS on macOS and needs
+ * no root on either (unprivileged FUSE wants `fusermount3`; macOS NFS wants a
+ * mountpoint you own).
  *
  * It is a demonstration and a test bench, not a mount tool: what it serves is
  * always {@link createMemoryDriver}'s tree, which exists for as long as the
@@ -63,7 +64,7 @@ ${bold("Options:")}
   -t, --transport ${dim("<name>")}   auto | fuse | nfs     ${dim("(default: auto)")}
   -q, --quiet              do not log filesystem requests
   -r, --read-only          mount read-only
-      --empty              start with an empty tree instead of the seeded one
+      --empty              start empty, without the README copied in
       --allow-other        let other users see the mount ${dim("(FUSE; implied under root)")}
   -h, --help               this
 
@@ -148,7 +149,7 @@ async function main(): Promise<void> {
   // empty tree, nothing to write in a read-only one.
   const hints = [
     `ls -l ${mountpoint}`,
-    ...(values.empty ? [] : [`cat ${mountpoint}/hello.txt`]),
+    ...(values.empty ? [] : [`head ${mountpoint}/README.md`]),
     ...(values["read-only"]
       ? []
       : [`echo 'written from outside' > ${mountpoint}/note.txt`, `cat ${mountpoint}/note.txt`]),
@@ -209,16 +210,21 @@ function expand(path: string): string {
   return isAbsolute(path) ? path : resolve(path);
 }
 
-/** A few files and a directory, so there is something to look at. */
+/**
+ * One file, so there is something real to read: this package's own README,
+ * copied into memory.
+ *
+ * Resolved relative to this module rather than to the working directory, and
+ * two levels up in both forms — `src/cli/index.ts` and `dist/cli/index.mjs`
+ * are the same distance from the package root, and npm publishes `README.md`
+ * regardless of the `files` list. Unreadable is not fatal: the point of the
+ * mount is the mount.
+ */
 async function seed(fs: ReturnType<typeof createLoopback>): Promise<void> {
-  await fs.writeFile("/hello.txt", "hello from mountx\n");
-  await fs.mkdir("/docs");
-  await fs.writeFile("/docs/readme.md", "# mountx\n\nThis whole tree lives in RAM.\n");
-  await fs.writeFile("/docs/numbers.txt", Array.from({ length: 10 }, (_, i) => i).join("\n"));
-  // Relative on purpose: an absolute target is resolved by the *client's* root,
-  // so "/hello.txt" would point at the host's, outside the mount.
-  await fs.symlink("hello.txt", "/hello.link");
-  await fs.mkdir("/scratch");
+  const readme = await readFile(new URL("../../README.md", import.meta.url), "utf8").catch(
+    (error: Error) => `# mountx\n\nThe package README could not be read: ${error.message}\n`,
+  );
+  await fs.writeFile("/README.md", readme);
 }
 
 /**

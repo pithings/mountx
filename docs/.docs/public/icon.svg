@@ -1,0 +1,39 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#d97706"/>
+    </linearGradient>
+    <linearGradient id="ridge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fef3c7"/>
+      <stop offset="1" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="peak" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffbeb"/>
+      <stop offset="1" stop-color="#fcd34d"/>
+    </linearGradient>
+    <clipPath id="frame">
+      <rect x="0" y="0" width="512" height="512" rx="112"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <!-- sky -->
+    <rect x="0" y="0" width="512" height="512" fill="url(#sky)"/>
+
+    <!-- sun -->
+    <circle cx="386" cy="148" r="42" fill="#ffffff" opacity="0.35"/>
+
+    <!-- back ridge -->
+    <path d="M140 210 L320 512 L-40 512 Z" fill="url(#ridge)" opacity="0.75"/>
+
+    <!-- main peak -->
+    <path d="M300 120 L520 512 L80 512 Z" fill="url(#peak)"/>
+
+    <!-- snow cap: apex down the right slope, zigzag back along the left -->
+    <path
+      d="M300 120 L351 211 L328 197 L306 221 L284 197 L262 213 L249 211 Z"
+      fill="#ffffff"
+    />
+  </g>
+</svg>

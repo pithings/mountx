@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=https://unpkg.com/undocs/schema/config.json
+name: mountx
+url: https://mountx.vercel.app
+shortDescription: Write a filesystem in JavaScript, mount it as a real folder.
+description: Mount a JavaScript filesystem — one driver interface shaped like node:fs/promises, served to the kernel over FUSE or NFSv3, with zero runtime dependencies.
+
+themeColor: amber
+automd: true
+
+github: pithings/mountx
+
+landing:
+  heroDescription: >-
+    Write an object with the same methods as `node:fs/promises` and mountx
+    turns it into a real folder on the machine — so `ls`, `cat`, your editor
+    and every other program can use it. There is no special API to learn:
+    `node:fs/promises` already is the interface.
+  heroCode:
+    title: serve.ts
+    lang: ts
+    content: |
+      import { mount } from "mountx/auto";
+      import { createMemoryDriver } from "mountx/drivers/memory";
+
+      // A driver is any object with stat(), readdir() and open().
+      const driver = createMemoryDriver();
+
+      // FUSE on Linux (no root needed), NFSv3 on macOS.
+      await using mounted = await mount(driver, "/mnt/point");
+
+      mounted.transport; // "fuse" | "nfs"
+
+      // $ echo hi > /mnt/point/hello.txt
+      // $ cat /mnt/point/hello.txt
+  features:
+    - title: No API to learn
+      icon: lucide:folder-tree
+      description: A driver is a subset of `node:fs/promises` — `stat`, `readdir`, `open`. Node's own `fs/promises` is a valid driver, unchanged.
+    - title: A real folder
+      icon: lucide:hard-drive
+      description: Every program on the machine sees an ordinary path. Shell tools, editors, build systems and agents need to know nothing about it.
+    - title: One API, two transports
+      icon: lucide:git-fork
+      description: FUSE where FUSE works, NFSv3 everywhere else. `mountx/auto` probes the host, picks one, and hands back that transport's own mount object.
+    - title: No root on Linux
+      icon: lucide:user-check
+      description: Unprivileged mounting through `fusermount3`, the setuid helper FUSE already ships. Serving never needs privileges on either transport.
+    - title: Pure JavaScript
+      icon: lucide:feather
+      description: Zero runtime dependencies, both protocols implemented from the specs. The one native piece is a ~7 KB helper that only unprivileged FUSE mounts load.
+    - title: Develop without mounting
+      icon: lucide:flask-conical
+      description: "`createLoopback(driver)` runs your driver like `fs/promises` in-process — no kernel, no privileges, every platform. Where drivers get written and tested."
+    - title: Errors pass through
+      icon: lucide:circle-alert
+      description: Throw what `node:fs` throws. `fsError("ENOENT")` builds an error byte-identical to Node's, and it reaches the kernel untranslated.
+    - title: Capabilities, never faked
+      icon: lucide:list-checks
+      description: What your driver supports is declared or inferred from its shape. Anything unsupported answers `ENOSYS`/`ENOTSUP` instead of pretending.
+    - title: Kernel caching you control
+      icon: lucide:gauge
+      description: Attribute and entry timeouts are worth 8–15× on a real workload, and `notifyInvalInode()` drops a cache the moment your storage changes.
+
+# No blog section — redirect the built-in /blog route so it is not
+# prerendered into a 404.
+redirects:
+  "/blog": "/guide"
