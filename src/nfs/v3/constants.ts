@@ -1,69 +1,54 @@
 /**
- * ONC RPC and NFSv3 wire constants.
+ * NFSv3 wire constants.
  *
- * Transcribed from the two RFCs, which are frozen and were frozen before this
- * project started:
- *
- * - **RFC 5531** — RPC: Remote Procedure Call Protocol Specification Version 2
- *   (the ONC RPC v2 message format, auth flavors and reply statuses).
- * - **RFC 1813** — NFS Version 3 Protocol Specification, including its
- *   appendix I, the MOUNT version 3 protocol.
+ * Transcribed from **RFC 1813** — NFS Version 3 Protocol Specification,
+ * including its appendix I, the MOUNT version 3 protocol — which is frozen and
+ * was frozen before this project started.
  *
  * Nothing here is guessed; each group repeats the XDR declaration it comes
- * from, and every codec in `protocol.ts` / `rpc.ts` names the section it
- * implements. Everything on the wire is **big-endian** (XDR), which is the one
- * respect in which this transport is the opposite of the FUSE one.
+ * from, and every codec in `protocol.ts` names the section it implements.
+ * Everything on the wire is **big-endian** (XDR), which is the one respect in
+ * which this transport is the opposite of the FUSE one.
+ *
+ * The ONC RPC v2 constants (**RFC 5531**) used to live here as well. They
+ * belong to no NFS version, so they moved to `../rpc.ts` beside the codec that
+ * speaks them; the re-export below keeps every name that was ever importable
+ * from this module importable from it still.
  */
 
 // ---------------------------------------------------------------------------
-// ONC RPC v2 (RFC 5531 §9)
+// ONC RPC v2 (RFC 5531 §9) — re-exported from the shared layer
 // ---------------------------------------------------------------------------
 
-/** The only RPC version that exists. */
-export const RPC_VERSION = 2;
-
-/** `enum msg_type`. */
-export const RPC_CALL = 0;
-export const RPC_REPLY = 1;
-
-/** `enum reply_stat`. */
-export const MSG_ACCEPTED = 0;
-export const MSG_DENIED = 1;
-
-/** `enum accept_stat`. */
-export const RPC_SUCCESS = 0;
-export const RPC_PROG_UNAVAIL = 1;
-export const RPC_PROG_MISMATCH = 2;
-export const RPC_PROC_UNAVAIL = 3;
-export const RPC_GARBAGE_ARGS = 4;
-export const RPC_SYSTEM_ERR = 5;
-
-/** `enum reject_stat`. */
-export const RPC_MISMATCH = 0;
-export const RPC_AUTH_ERROR = 1;
-
-/** `enum auth_stat`. */
-export const AUTH_OK = 0;
-export const AUTH_BADCRED = 1;
-export const AUTH_REJECTEDCRED = 2;
-export const AUTH_BADVERF = 3;
-export const AUTH_REJECTEDVERF = 4;
-export const AUTH_TOOWEAK = 5;
-export const AUTH_INVALIDRESP = 6;
-export const AUTH_FAILED = 7;
-
-/** `enum auth_flavor`. `AUTH_SYS` is `AUTH_UNIX`'s modern name. */
-export const AUTH_NONE = 0;
-export const AUTH_SYS = 1;
-export const AUTH_SHORT = 2;
-
-/** Longest `opaque_auth` body (RFC 5531: `opaque body<400>`). */
-export const RPC_MAX_AUTH_BYTES = 400;
-
-/** Record-marking fragment header: high bit is "last fragment". */
-export const RM_LAST_FRAGMENT = 0x80_00_00_00;
-/** Low 31 bits of a record-marking header are the fragment length. */
-export const RM_LENGTH_MASK = 0x7f_ff_ff_ff;
+export {
+  AUTH_BADCRED,
+  AUTH_BADVERF,
+  AUTH_FAILED,
+  AUTH_INVALIDRESP,
+  AUTH_NONE,
+  AUTH_OK,
+  AUTH_REJECTEDCRED,
+  AUTH_REJECTEDVERF,
+  AUTH_SHORT,
+  AUTH_SYS,
+  AUTH_TOOWEAK,
+  MSG_ACCEPTED,
+  MSG_DENIED,
+  RM_LAST_FRAGMENT,
+  RM_LENGTH_MASK,
+  RPC_AUTH_ERROR,
+  RPC_CALL,
+  RPC_GARBAGE_ARGS,
+  RPC_MAX_AUTH_BYTES,
+  RPC_MISMATCH,
+  RPC_PROC_UNAVAIL,
+  RPC_PROG_MISMATCH,
+  RPC_PROG_UNAVAIL,
+  RPC_REPLY,
+  RPC_SUCCESS,
+  RPC_SYSTEM_ERR,
+  RPC_VERSION,
+} from "../rpc.ts";
 
 // ---------------------------------------------------------------------------
 // programs

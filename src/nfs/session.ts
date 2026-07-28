@@ -32,23 +32,19 @@ import type { Loopback } from "../harness.ts";
 import type { FsDriver } from "../types.ts";
 import type { FileHandleTable } from "./handles.ts";
 import {
+  AUTH_NONE,
+  AUTH_SYS,
+  AUTH_TOOWEAK,
   decodeCall,
   encodeAcceptError,
   encodeAuthError,
   encodeRpcMismatch,
-  type RpcCall,
-} from "./rpc.ts";
-import {
-  AUTH_NONE,
-  AUTH_SYS,
-  AUTH_TOOWEAK,
-  MOUNT_PROGRAM,
-  NFS_PROGRAM,
-  NFS_V3,
   RPC_PROG_MISMATCH,
   RPC_PROG_UNAVAIL,
   RPC_VERSION,
-} from "./v3/constants.ts";
+  type RpcCall,
+} from "./rpc.ts";
+import { MOUNT_PROGRAM, NFS_PROGRAM, NFS_V3 } from "./v3/constants.ts";
 import {
   Nfs3Session,
   type NfsRequestContext,
