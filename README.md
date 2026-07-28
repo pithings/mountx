@@ -1,56 +1,258 @@
-# mountx
-
-<!-- automd:badges color=yellow -->
-
-[![npm version](https://img.shields.io/npm/v/mountx?color=yellow)](https://npmjs.com/package/mountx)
-[![npm downloads](https://img.shields.io/npm/dm/mountx?color=yellow)](https://npm.chart.dev/mountx)
-
-<!-- /automd -->
+# ⛰️mountx
 
 **Write a filesystem in JavaScript, mount it as a real kernel filesystem.**
 
-A driver is an object with the `node:fs/promises` methods (`stat`, `readdir`, `open`, `mkdir`, `rename`).
+You can write a driver with the same methods as `node:fs/promises` (`stat`,
+`readdir`, `open`, `mkdir`, `rename`). Mountx takes your driver and turns it into a real folder on the machine, so `ls`, `cat`, AI Agents, VSCode and any other program can use it.
 
-Mountx takes that object and mounts it, either as a [FUSE mount](https://en.wikipedia.org/wiki/Filesystem_in_Userspace) on Linux or as an NFSv3 share. The driver never learns which. There is nothing to adapt: `node:fs/promises` already _is_ the interface, and its errors already _are_ the error contract.
+There is no special API to learn: `node:fs/promises` already _is_ the
+interface, and the errors it throws already _are_ the error format.
 
-So anything you can describe as a filesystem gets a real mountpoint — an in-memory store, a zip file, an S3 bucket, a content-addressed blob store, a `node:fs` directory served back out.
+So anything that behaves a bit like a filesystem can get a real path: an
+in-memory store, a zip file, an S3 bucket, a database, or a plain folder served back out with your own rules on top.
 
-## Installation
+## Install
 
 ```sh
-npx nypm install mountx
+npx nypm i mountx
 ```
 
-Subpath exports: `mountx` (driver interface, loopback harness), `mountx/fuse`,
-`mountx/nfs`, `mountx/drivers/memory`, `mountx/drivers/node-fs`.
+The package has five entry points:
 
-## Quickstart
+| import from              | what you get                               |
+| ------------------------ | ------------------------------------------ |
+| `mountx`                 | the driver types, errors, loopback harness |
+| `mountx/fuse`            | `mount()` — a real Linux mount             |
+| `mountx/nfs`             | `mountNfs()` / `createNfsServer()`         |
+| `mountx/drivers/memory`  | a ready-made in-memory filesystem          |
+| `mountx/drivers/node-fs` | a ready-made passthrough to a real folder  |
 
-### FUSE (Linux, needs root)
+## Step 1 — try it with no mounting at all
+
+The easiest way to start is without touching the operating system. Wrap a
+driver in `createLoopback()` and use it like `fs/promises` right inside your
+program:
 
 ```ts
+import { createLoopback } from "mountx";
+import { createMemoryDriver } from "mountx/drivers/memory";
+
+const fs = createLoopback(createMemoryDriver());
+
+await fs.mkdir("/notes");
+await fs.writeFile("/notes/hello.txt", "hi");
+
+const entries = await fs.readdir("/notes", { withFileTypes: true });
+console.log(entries.map((entry) => entry.name)); // [ "hello.txt" ]
+
+const bytes = await fs.readFile("/notes/hello.txt"); // Uint8Array
+console.log(new TextDecoder().decode(bytes)); // "hi"
+```
+
+`createLoopback` does the same tidying-up a real mount does: it cleans up
+paths, answers `ENOSYS` for methods your driver does not have, and works out
+what your driver supports. Nothing is mounted, no root needed, works on every
+platform. This is the best place to develop and test a driver.
+
+## Step 2 — mount it for real (FUSE, Linux)
+
+Now the same driver, but as a folder anyone on the machine can open:
+
+```ts
+// serve.ts
 import { mount } from "mountx/fuse";
 import { createMemoryDriver } from "mountx/drivers/memory";
 
 await using mounted = await mount(createMemoryDriver(), "/mnt/point");
-// /mnt/point is a real mountpoint until unmount() or the process exits.
+
+// /mnt/point is a real folder now. Keep the process alive.
+await new Promise(() => {});
 ```
 
-Mounting needs root — `mount(2)` is not a syscall Node can issue, and v1 has
-no unprivileged path yet (see Roadmap). Run it with `sudo`:
+Run it with `sudo` (see below for why):
 
 ```sh
-sudo node --experimental-strip-types your-script.ts
+sudo node serve.ts
 ```
 
-If a process dies without unmounting, the mountpoint is left stale rather than
-hung (`ls` answers `ENOTCONN`, it does not block). Clear it with:
+Then, **from another terminal**:
+
+```sh
+echo hi > /mnt/point/hello.txt
+cat /mnt/point/hello.txt
+ls -l /mnt/point
+```
+
+Press Ctrl-C in the first terminal and the folder disappears. `await using`
+unmounts when the block ends; you can also call `await mounted.unmount()`
+yourself.
+
+**Why sudo?** Mounting is a syscall Node cannot make on its own, so mountx asks
+`mount(8)` to do it, and that needs root. mountx has no unprivileged option yet.
+
+**If a process dies without unmounting**, the folder is left stale rather than
+frozen — `ls` says `ENOTCONN` instead of hanging. Clean it up with:
 
 ```sh
 sudo umount -l /mnt/point
 ```
 
-### NFSv3 (no root to serve, root to mount)
+## Step 3 — serve a real folder
+
+The second bundled driver hands requests to a real directory, and makes sure
+nothing outside it can be reached:
+
+```ts
+import { mount } from "mountx/fuse";
+import { createNodeFsDriver } from "mountx/drivers/node-fs";
+
+await using mounted = await mount(createNodeFsDriver("/home/me/data"), "/mnt/point");
+```
+
+This is useful on its own, and it is also the easiest thing to build on: wrap
+it, and you can add caching, logging, filtering or transformation to a normal
+directory.
+
+## Step 4 — write your own driver
+
+A driver only has to answer three things: `stat`, `readdir` and `open`.
+Everything else is optional, and a missing method simply means "not supported" —
+the mount answers `ENOSYS`/`ENOTSUP` rather than pretending.
+
+Here is a complete read-only filesystem with one file in it:
+
+```ts
+import { createLoopback, fsError } from "mountx";
+import type { DirentLike, FsDriver, StatsLike } from "mountx";
+
+const S_IFMT = 0o170000;
+const S_IFREG = 0o100000;
+const S_IFDIR = 0o040000;
+
+const content = new TextEncoder().encode("hello from JavaScript\n");
+
+// `stat` returns the same fields as `fs.Stats`, so a helper keeps it short.
+function stats(mode: number, size: number, ino: number): StatsLike {
+  const now = Date.now();
+  const is = (type: number) => () => (mode & S_IFMT) === type;
+  return {
+    dev: 1,
+    ino,
+    mode,
+    nlink: 1,
+    uid: 0,
+    gid: 0,
+    rdev: 0,
+    size,
+    blksize: 4096,
+    blocks: Math.ceil(size / 512),
+    atimeMs: now,
+    mtimeMs: now,
+    ctimeMs: now,
+    birthtimeMs: now,
+    isFile: is(S_IFREG),
+    isDirectory: is(S_IFDIR),
+    isSymbolicLink: () => false,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+  };
+}
+
+// A directory entry needs a name plus the same set of type questions.
+const dirent = (name: string, mode: number): DirentLike => ({ name, ...stats(mode, 0, 0) });
+
+const driver: FsDriver = {
+  capabilities: { readOnly: true },
+
+  async stat(path) {
+    if (path === "/") return stats(S_IFDIR | 0o555, 0, 1);
+    if (path === "/hello.txt") return stats(S_IFREG | 0o444, content.length, 2);
+    throw fsError("ENOENT", { syscall: "stat", path });
+  },
+
+  async readdir(path) {
+    if (path !== "/") throw fsError("ENOTDIR", { syscall: "scandir", path });
+    return [dirent("hello.txt", S_IFREG | 0o444)];
+  },
+
+  async open(path) {
+    if (path !== "/hello.txt") throw fsError("ENOENT", { syscall: "open", path });
+    return {
+      async read(buffer, offset, length, position) {
+        const start = position ?? 0;
+        const slice = content.subarray(start, start + (length ?? buffer.length));
+        buffer.set(slice, offset ?? 0);
+        return { bytesRead: slice.length, buffer };
+      },
+      async stat() {
+        return stats(S_IFREG | 0o444, content.length, 2);
+      },
+      // Read-only, so the two writing methods just say so.
+      async write(): Promise<never> {
+        throw fsError("EROFS", { syscall: "write", path });
+      },
+      async truncate(): Promise<never> {
+        throw fsError("EROFS", { syscall: "ftruncate", path });
+      },
+      async close() {},
+    };
+  },
+};
+
+const fs = createLoopback(driver);
+console.log(new TextDecoder().decode(await fs.readFile("/hello.txt")));
+// "hello from JavaScript"
+```
+
+Swap `createLoopback(driver)` for `mount(driver, "/mnt/point")` and the same
+code becomes a folder you can `cat`.
+
+### Errors
+
+Throw errors the way `node:fs` does: an error with a POSIX `code` (like
+`"ENOENT"`) and a negative `errno`. `fsError()` builds one that is byte-for-byte
+identical to Node's, and it travels to the kernel untranslated:
+
+```ts
+throw fsError("EACCES", { syscall: "open", path });
+```
+
+If you are forwarding an error from a real `fs` call, just let it through — it
+is already the right shape.
+
+### Capabilities
+
+Mountx works out what your driver supports from which methods exist. Two things
+cannot be guessed from shape, so declare them if they are true:
+
+```ts
+const driver = {
+  capabilities: {
+    handles: true, // open() returns real state that survives unlink
+    atomicRename: true, // rename() replaces the target in one step
+  },
+  // ...
+};
+```
+
+Other flags you may want to set: `symlinks`, `hardlinks`, `caseSensitive`,
+`statfs`, `readOnly`. The full list and the inference rules are in
+`resolveCapabilities` (`src/harness.ts`). Nothing is ever faked: an unsupported
+capability reports itself as unsupported.
+
+### Testing your driver
+
+`test/conformance.ts` in this repo is one suite written against the driver
+interface, and it runs against the loopback harness with no mount needed. Point
+it at your driver, or write your own checks the same way — anything that works
+through `createLoopback()` works through a mount.
+
+## Step 5 — NFSv3 transport
+
+FUSE needs Linux and `/dev/fuse`. If you do not have that, mountx can serve the
+same driver as an NFSv3 share over a TCP socket instead:
 
 ```ts
 import { mountNfs } from "mountx/nfs";
@@ -59,228 +261,172 @@ import { createMemoryDriver } from "mountx/drivers/memory";
 await using mounted = await mountNfs(createMemoryDriver(), "/mnt/point");
 ```
 
-`mountNfs` still needs root and a host with an NFS client (`nfsClientProbe()`
-tells you before it tries). To drive the server from anywhere with an NFSv3
-client and no root at all, mount it yourself:
+`mountNfs()` also needs root, and needs the host to have an NFS client.
+`nfsClientProbe()` tells you before it tries.
+
+Serving does **not** need root, though. You can start just the server, then
+mount it yourself with whatever NFSv3 client you have:
+
+```ts
+import { createNfsServer } from "mountx/nfs";
+
+await using server = createNfsServer(createMemoryDriver());
+await server.listen();
+console.log(server.port); // an ephemeral port unless you set one
+```
 
 ```sh
 sudo mount -t nfs -o vers=3,tcp,port=<p>,mountport=<p>,nolock 127.0.0.1:/ /mnt
 ```
 
-`<p>` is `mounted.port` if you used `mountNfs()` (shown above), or
-`server.port` if you called `createNfsServer` directly — either picks an
-ephemeral port unless you set one.
+`<p>` is `server.port` above, or `mounted.port` if you used `mountNfs()`.
 
-## The driver interface
+By default the server binds to `127.0.0.1` and refuses non-loopback
+connections. To reach it from another machine you must set both `host` and
+`allowRemote: true` — and be aware that NFSv3 has no authentication worth the
+name, so that exports your driver to anything that can reach the port.
 
-`FsDriver` is a subset of `node:fs/promises`, not a bespoke shape — the acid
-test is that the real thing satisfies it with no wrapper:
+### Which one should I use?
 
-```ts
-import type { FsDriver } from "mountx";
+| transport | runs on                       | native code | root to mount | what you lose         |
+| --------- | ----------------------------- | ----------- | ------------- | --------------------- |
+| **FUSE**  | Linux                         | none        | yes           | nothing               |
+| **NFSv3** | anywhere with an NFSv3 client | none        | yes           | `handles` (see below) |
 
-const driver: FsDriver = await import("node:fs/promises"); // compiles as-is
-```
+Neither needs native code — that is a design rule of this project.
 
-Only `stat`, `readdir` and `open` are required; everything else (`mkdir`,
-`rename`, `link`, `symlink`, `chmod`, `chown`, `truncate`, `utimes`, ...) is
-optional, and a missing method means the capability is genuinely absent — the
-transport answers `ENOSYS`/`ENOTSUP` rather than pretending. A driver declares
-what it supports:
+**Use FUSE** when you are on Linux and have root: you get real `open`/`release`
+state, control over kernel caching, and every errno passes through untouched.
 
-```ts
-const capabilities = {
-  handles: true, // open() returns real per-open state that survives unlink
-  hardlinks: false,
-  symlinks: true,
-  // ...
-};
-```
+**Use NFSv3** when you need a mount from something that is not
+Linux-with-`/dev/fuse`, or when FUSE is unavailable. The trade-off is that
+NFSv3 is stateless: there is no `open`/`release`, so every request carries a
+handle built from the driver's `(dev, ino)` identity. In practice this costs one
+behaviour — a file that is deleted while still open stays readable over FUSE,
+but gives `ESTALE` over NFS.
 
-Unclaimed capabilities are inferred from which methods exist (see
-`resolveCapabilities` in `src/harness.ts`), but two — `handles` and
-`atomicRename` — can't be inferred from shape alone and default to `false`
-until declared.
+## Tuning
 
-Errors follow `node:fs` convention exactly: throw (or forward) an error with a
-POSIX `code` and a libuv-style negative `errno`, and it maps onto the wire with
-no translation. `src/errors.ts`'s `fsError()` produces one identical to
-Node's own.
+Sensible defaults are already set; these are the knobs worth knowing.
 
-Test a driver with **no mount at all** using the loopback harness:
+### Caching (this is where the speed is)
 
 ```ts
-import { createLoopback } from "mountx";
-import { createMemoryDriver } from "mountx/drivers/memory";
-
-const fs = createLoopback(createMemoryDriver());
-await fs.writeFile("/hello.txt", "hi");
-await fs.readFile("/hello.txt"); // Uint8Array
+await mount(driver, "/mnt/point", {
+  attrTimeout: 10, // seconds the kernel may cache file attributes (default: 10)
+  entryTimeout: 10, // seconds it may cache name → file lookups (default: 10)
+  keepCache: true, // keep page cache between opens (default: true)
+  negativeTimeout: 0, // also cache "this file does not exist" (default: 0, off)
+});
 ```
 
-It normalizes paths, fills in missing methods with `ENOSYS`, and resolves
-capabilities — the same treatment a transport gives a driver, without
-`/dev/fuse` or a socket anywhere. `test/conformance.ts` is the suite this
-project runs against it; write your own scripts against the same harness.
+These two timeouts are worth far more than anything you can optimise in
+JavaScript — see [Performance](#performance). Lower them if something other
+than your driver changes the storage; raise them if nothing does. Turning on
+`negativeTimeout` has the same caveat, but sharper: a file created behind
+mountx's back stays invisible for the whole timeout.
 
-## Transports
+### Concurrency
 
-| transport | platforms                     | native code                                 | privilege to mount | semantics                   |
-| --------- | ----------------------------- | ------------------------------------------- | ------------------ | --------------------------- |
-| **FUSE**  | Linux                         | none (root mode); unprivileged stub planned | root               | full — no capability loss   |
-| **NFSv3** | anywhere with an NFSv3 client | none                                        | root               | stateless — loses `handles` |
+```ts
+await mount(driver, "/mnt/point", { readers: 2 });
+```
 
-**FUSE** gets real `open`/`release` state, kernel-side caching under your
-control, and full POSIX errno propagation. v1 is root-mode only: `mount(8)` is
-spawned with an already-open `/dev/fuse` fd handed down through the child's
-stdio (`src/fuse/mount.ts`). Unprivileged mounting needs a small setuid-helper
-stub that hasn't been built yet — see Roadmap.
+`readers` is how many reads are kept waiting on `/dev/fuse` at once. Each one
+occupies a libuv threadpool thread, and so does any file I/O your driver does.
+The default pool has four threads, so the default of `2` leaves two for the
+driver. To go higher, raise both — and `UV_THREADPOOL_SIZE` must be set before
+the process starts:
 
-**NFSv3** needs no native code and no `/dev/fuse`, just a TCP socket
-(`src/nfs/server.ts`), which is what makes it reachable from any OS with an
-NFSv3 client. The cost is statelessness: NFSv3 has no `open`/`release`, so
-every operation carries a file handle synthesized from the driver's `(dev,
-ino)` identity rather than real per-open state. The one capability this loses
-in practice — keeping an unlinked-but-open file readable — is the one the
-conformance matrix names below.
+```sh
+UV_THREADPOOL_SIZE=32 node serve.ts   # then readers: 8 is reasonable
+```
 
-Use FUSE when you have root on Linux and want the driver interface with
-nothing lost. Use NFSv3 when you need a mount from something that isn't
-Linux-with-`/dev/fuse`, or when root is available but a FUSE mount isn't
-(there's no native-code dependency either way).
+### Other mount options
 
-## Conformance
+```ts
+await mount(driver, "/mnt/point", {
+  fsname: "mydata", // what /proc/mounts shows as the device
+  subtype: "myfs", // makes the type read `fuse.myfs`
+  readOnly: true, // mount -o ro; the driver never sees writes
+  allowOther: false, // let other users in (default: false)
+  unmountTimeout: 10_000, // ms before unmount stops asking nicely
+  signals: true, // unmount on SIGINT/SIGTERM (default: true)
+});
+```
 
-One suite (`test/conformance.ts`), written once against the driver interface,
-run three ways — loopback, over a real FUSE mount, over a real NFSv3 socket —
-so any test that passes in one column and fails in another is, by
-construction, a transport bug rather than a driver bug. Full tables:
+`mountNfs()` has its own set: `exportPath`, `readOnly`, `hard`, `timeo`,
+`retrans`, `mountOptions`.
+
+### Telling the kernel something changed
+
+If your storage changes behind mountx's back, drop the kernel's cached copy:
+
+```ts
+mounted.notifyInvalInode(42n); // forget this file's cached data and attributes
+mounted.notifyInvalEntry(1n, "hello.txt"); // forget this name → file mapping
+```
+
+Both take inode numbers as `bigint`. They are FUSE-only.
+
+## Things that will bite you
+
+Each of these is documented in full where the code lives.
+
+- **Root is required currently.** Both `mount()` and `mountNfs()` must run as root.
+  There is no unprivileged path yet.
+- **Do not use your own mount from the process serving it.** A synchronous `fs`
+  call against your own mountpoint deadlocks. Enough concurrent _async_ calls
+  (for example `fs.rm(dir, { recursive: true })` over a few hundred entries) use
+  up the threadpool that the mount's read loop also needs, and the process
+  wedges. Put the client in another process, or keep the concurrency well below
+  the pool size. Full explanation at the top of `src/fuse/mount.ts`.
+- **Do not call `process.exit()` while mounted.** Node's exit path waits for the
+  threadpool, and a live mount always has reads parked there — it will hang.
+  Instead `await mounted.unmount()` and set `process.exitCode`. (This is also
+  why the built-in signal handlers unmount and then re-raise the signal.)
+- **A crashed process leaves a stale mount entry**, not a frozen one. `ls`
+  answers `ENOTCONN`. Recover with `sudo umount -l <mountpoint>`.
+
+## How well does it work?
+
+One test suite (`test/conformance.ts`), written once against the driver
+interface, is run three ways: through the loopback harness, through a real FUSE
+mount, and through a real NFSv3 socket. So a test that passes in one column and
+fails in another is a transport bug by construction, not a driver bug. Full
+tables:
 [`.agents/conformance-matrix.md`](https://github.com/pithings/mountx/blob/main/.agents/conformance-matrix.md).
 
-The honest summary: **FUSE loses nothing** either bundled driver has (126/126
-passing, no skips). **NFSv3 loses exactly one capability**, `handles` — an
-unlinked-but-open file is `ESTALE` over NFS instead of staying readable,
-because NFSv3 is stateless and has no `FORGET`. That's the whole capability
-loss; it's declared once and derived from the test run, not guessed at.
-
-Beyond the driver-interface suite, the FUSE transport was measured against
+The FUSE transport was also run against
 [**pjdfstest**](https://github.com/pjd/pjdfstest), the POSIX filesystem test
-suite, over a real mount: **59.1% passing** (5179/8770 assertions), and **every
-one of the 45 remaining failing files** exercises `mkfifo`/`mknod`/UNIX-socket
-creation — a driver-interface gap (`node:fs/promises` has no way to create a
-special file either), not a session bug. Full breakdown and bug list:
+suite, over a real mount: **59.1% passing** (5179/8770 assertions). Every one of
+the 45 remaining failing files tests `mkfifo`/`mknod`/UNIX-socket creation —
+which the driver interface simply has no way to express, since
+`node:fs/promises` cannot create special files either. Breakdown:
 [`.agents/pjdfstest-results.md`](https://github.com/pithings/mountx/blob/main/.agents/pjdfstest-results.md).
-
-The validation arsenal behind both reports:
-
-- **Differential testing** — the same operation sequence run against a real
-  FUSE mount and against plain `node:fs`, diffing every result and the two
-  trees.
-- **Record/replay** — real `/dev/fuse` traffic from `ls -laR`, `find`,
-  `tar -xp` and more, captured once and replayed with no kernel and no root.
-- **`libnfs` cross-validation** — a real NFSv3 client sharing none of this
-  code, driving a 30-assertion workload and a 3000-entry `readdir` against the
-  server, with `tshark` confirming the wire format.
-- **Real-kernel tests** (Tier 2) — `pjdfstest` and the mount smoke tests run
-  against an actual mountpoint, gated on root/`sudo`.
 
 ## Performance
 
-All numbers below are from
-[`.agents/benchmarks.md`](https://github.com/pithings/mountx/blob/main/.agents/benchmarks.md),
-taken on one host, one day (Linux 6.12, Node v24.18.0, in-memory driver) —
-they are not portable, and the file has the full tables and caveats.
+All numbers below come from
+[`.agents/benchmarks.md`](https://github.com/pithings/mountx/blob/main/.agents/benchmarks.md)
+and were taken on **one host, on one day**: Linux 6.12.96+deb13-amd64, 16 ×
+Intel i7-10700K @ 3.80 GHz, Node v24.18.0, in-memory driver. They are not
+portable, and that file has the full tables and caveats.
 
-- **FUSE sustains 41,500–50,300 requests/sec at zero timeouts with requests
-  in flight** (readers 1/2/4: 41,539 / 48,549 / 50,349), and 13,600/sec for a
-  strictly sequential client — confirming IDEA.md's "low tens of thousands of
-  ops/sec" prediction, at the upper end. The shipped-default configuration
-  (10 s timeouts, a cache-heavy scenario mix) peaks much lower on its own, around
-  20,468 requests/sec, because most of that traffic never reaches the daemon —
-  the request-level ceiling is a property of the zero-timeout, in-flight
-  workload, not of the defaults. A single-threaded client sees 2,000–4,000
-  syscalls/sec on uncached metadata, because each syscall is several FUSE
-  requests.
-- **Negotiation defaults dominate, not JS-side tuning.** `attr_timeout`/
-  `entry_timeout` are worth **8–15×**; `FOPEN_KEEP_CACHE` is worth **~4.9×** on
-  re-read. Nothing hand-optimized in this codebase has been worth anything
-  comparable.
-- **Open question: `FUSE_READDIRPLUS_AUTO`.** On by default, it limits
-  readdirplus to a listing's first page, so a cold 1000-entry `ls -l` gets
-  10,345 entries/s instead of the ~2.4× win IDEA.md predicts; disabling `AUTO`
-  reaches 25,047 entries/s (the predicted win) but costs ~20% on a names-only
-  `readdir`. Not changed in v1 — benchmarks.md calls it the best-supported
-  open question in the repo.
-- **Throughput:** sequential read at 7,537 MiB/s (page-cache-backed) /
-  1,526 MiB/s (transport floor with the cache off); sequential write at
-  796 MiB/s over FUSE, 308 MiB/s over NFS. `max_write` at 1 MiB over 128 KiB is
-  worth ~20% here (1.21×) against this driver — read it as 15–40%, not a
-  sharper number, and expect more against a driver that does real per-request
-  I/O. Throughput is the one place the NFS numbers are not held back by the
-  test client (see below) — read these as real, not as a floor.
-- **NFS's metadata numbers are a floor, not a ceiling.** A 500-file `stat`
-  walk runs at 3,571 stats/s over NFS against FUSE's 33,813, and `ls -l` at
-  4,980 entries/s against 27,246 — not the protocol being slow, but the JS
-  test client having no dentry cache and re-walking every path component on
-  every call. A real kernel NFS client would do markedly better.
-
-This is fine for a content-addressed store, an S3 mount, a git filesystem, a
-config filesystem. **It is not a hot build directory.** The faster paths IDEA.md
-describes — a sync driver running in worker threads, and a relay mode that
-takes `/dev/fuse` off the libuv threadpool entirely — don't exist yet. v1 ships
-async main-thread mode only, and no claim is made about the other two beyond
-"expected to be faster."
-
-## Hazards
-
-The must-knows; each is documented in full where the code lives.
-
-- **Root, in v1.** Both `mount()` (`mountx/fuse`) and `mountNfs()`
-  (`mountx/nfs`) need to run as root. Neither has an unprivileged path yet.
-- **Don't be your own client.** Serving a mount and using it from the same
-  process is the sharp edge: any synchronous `fs` call against your own
-  mountpoint deadlocks outright, and enough concurrent _async_ calls against it
-  (e.g. `fs.rm(dir, { recursive: true })` on a couple hundred entries) exhausts
-  `UV_THREADPOOL_SIZE` and wedges the process — the read loop needs one of
-  those same threads to keep the mount alive. Put the client in another
-  process, or keep self-directed concurrency well under the pool size. Full
-  explanation at the top of `src/fuse/mount.ts`.
-- **Don't `process.exit()` with a mount up.** Node's exit path joins the
-  threadpool, which a live mount always has reads parked in — it will hang,
-  not exit. `await mount.unmount()` first and set `process.exitCode`; that's
-  also why the built-in `SIGINT`/`SIGTERM` handlers unmount and then re-raise
-  the signal instead of calling `process.exit()` themselves.
-- **A crashed process leaves a stale mount table entry**, not a hung one — the
-  kernel drops the connection with the last reference to the fd, so `ls`
-  answers `ENOTCONN` rather than blocking. Recover with
-  `sudo umount -l <mountpoint>`.
-
-## Status / roadmap
-
-**Shipped in v1:** the driver interface (`mountx`), the FUSE protocol,
-session and root-mode transport (`mountx/fuse`), NFSv3 loopback
-(`mountx/nfs`), the in-memory and `node:fs` passthrough drivers, the
-loopback test harness, and the conformance + benchmark suites this README is
-drawn from.
-
-**Deferred, not designed against:**
-
-- Unprivileged FUSE mounting (a small native stub — see IDEA.md).
-- Sync-driver-in-worker-threads and relay concurrency modes (would remove the
-  threadpool hazard above and, per IDEA.md, should scale with worker count —
-  unmeasured, not built).
-- `mknod` / FIFOs / device nodes / UNIX sockets — the entire remaining
-  pjdfstest gap traces back to this one interface gap.
-- xattr, byte-range locks, WebDAV, Windows support.
-
-**Reasoned, not observed:** the NFSv3 transport has never been exercised
-against a real kernel NFS client — the development host has no `nfs` kernel
-module and no `mount.nfs` at all (`nfsClientProbe()` will tell you if yours
-does). Its correctness case rests on the Tier-1 JS client (built from the same
-XDR codecs as the server, so not an independent check) and on `libnfs`
-cross-validation (independent, but narrower than a full conformance run). If
-you mount it against a real client, a bug report is worth more than the
-benchmarks in this file.
+- **Throughput:** sequential read **7,537 MiB/s** (served from page cache) or
+  **1,526 MiB/s** with the cache off; sequential write 796 MiB/s over FUSE and
+  308 MiB/s over NFS. Raising `max_write` from 128 KiB to 1 MiB is worth ~20%
+  here — read that as "15–40%", and expect more from a driver doing real I/O.
+- **FUSE handles 41,500–50,300 requests/sec** with requests in flight and
+  timeouts off (1/2/4 readers: 41,539 / 48,549 / 50,349), and 13,600/sec for a
+  strictly one-at-a-time client. With the shipped defaults (10 s timeouts, a
+  cache-friendly mix) the measured peak is lower, around 20,468 requests/sec —
+  because most of that traffic never reaches your driver at all. A
+  single-threaded client sees 2,000–4,000 syscalls/sec on uncached metadata,
+  since one syscall is several FUSE requests.
+- **Cache settings matter far more than JavaScript tuning.**
+  `attrTimeout`/`entryTimeout` are worth **8–15×**. `keepCache` is worth
+  **~4.9×** on re-read. Nothing hand-optimised in this codebase comes close.
 
 ## Development
 
@@ -289,13 +435,12 @@ benchmarks in this file.
 <summary>local development</summary>
 
 - Clone this repository
-- Install latest LTS version of [Node.js](https://nodejs.org/en/)
-- Enable [Corepack](https://github.com/nodejs/corepack) using `corepack enable`
-- Install dependencies using `pnpm install`
-- Run interactive tests using `pnpm dev`
-- `pnpm test` runs lint, typecheck and the Tier-0/Tier-1 suites (no root
-  needed); `pnpm test:root` additionally runs the Tier-2 real-mount suites
-  under `sudo`.
+- Install the latest LTS version of [Node.js](https://nodejs.org/en/)
+- Enable [Corepack](https://github.com/nodejs/corepack) with `corepack enable`
+- Install dependencies with `pnpm install`
+- Run tests in watch mode with `pnpm dev`
+- `pnpm test` runs lint, typecheck and the suites that need no root;
+  `pnpm test:root` adds the real-mount suites under `sudo`.
 - `pnpm matrix` and `pnpm bench` / `pnpm bench:root` regenerate the two
   committed reports this README draws from
   (`.agents/conformance-matrix.md`, `.agents/benchmarks.md`).

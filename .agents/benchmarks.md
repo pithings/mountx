@@ -1,7 +1,6 @@
 # Benchmarks
 
-Numbers, and what they do and do not say. IDEA.md makes two performance claims
-and forbids the README from repeating either until it has been measured:
+Numbers, and what they do and do not say.
 
 1. **"Async main-thread mode should land in the low tens of thousands of
    ops/sec."**

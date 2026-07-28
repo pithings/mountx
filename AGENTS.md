@@ -2,7 +2,7 @@ Keep important information about project in AGENTS.md. For more detailed info, p
 
 # mountx
 
-Mount a JavaScript filesystem: one driver interface (a subset of `node:fs/promises`), multiple transports (FUSE first, then NFSv3). Design source of truth: `IDEA.md`; user-facing docs: `README.md`.
+Mount a JavaScript filesystem: one driver interface (a subset of `node:fs/promises`), multiple transports (FUSE first, then NFSv3). user-facing docs: `README.md`.
 
 Conventions: pure JS/TS, zero runtime deps, pure-JS-first (no native code in v1). Single package with subpath exports. Small conventional commits to `main`, tests green (`pnpm test`) before each commit.
 
