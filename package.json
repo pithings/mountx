@@ -62,11 +62,10 @@
     "test:pjdfstest": "sh test/pjdfstest/run.sh",
     "test:rootless": "sh test/rootless.sh test/fuse/mount-rootless.test.ts test/auto-mount.test.ts",
     "test:root": "sh test/root.sh test/fuse/mount.test.ts test/fuse/differential.test.ts test/fuse/conformance-mount.test.ts test/nfs/mount.test.ts",
-    "typecheck": "tsgo --noEmit --skipLibCheck"
+    "typecheck": "tsc --noEmit --skipLibCheck"
   },
   "devDependencies": {
     "@types/node": "latest",
-    "@typescript/native-preview": "latest",
     "@vitest/coverage-v8": "latest",
     "automd": "latest",
     "changelogen": "latest",
