@@ -25,11 +25,11 @@
  * never touches the mountpoint.
  */
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { parseArgs, promisify } from "node:util";
+import { parseArgs } from "node:util";
 import { mount, probeTransports, type Transport } from "../auto.ts";
 import { createMemoryDriver } from "../drivers/memory.ts";
 import { createLoopback } from "../harness.ts";
@@ -37,9 +37,17 @@ import type { FsDriver } from "../types.ts";
 import { bold, cyan, dim, green, red, yellow } from "./color.ts";
 import { watchDriver } from "./watch.ts";
 
-const run = promisify(execFile);
-
 const TRANSPORTS = new Set<string>(["auto", "fuse", "nfs"]);
+
+/**
+ * How long the stale-mount cleanup gets before it gives up on `umount(8)`.
+ *
+ * Not a formality on macOS: the network-volume consent gate turns an unapproved
+ * `umount` into a call that never returns and does not die on `SIGKILL`
+ * (`src/nfs/mount.ts`), and this runs *before* anything is mounted — a wait
+ * with no ceiling here is a CLI that hangs with nothing on screen.
+ */
+const STALE_TIMEOUT = 5000;
 
 const CLI = {
   allowPositionals: true,
@@ -240,14 +248,16 @@ async function seed(fs: ReturnType<typeof createLoopback>): Promise<void> {
  * What detaches a mount left behind by a killed run, for this user on this host.
  *
  * `kind` is a mount-table type (`fuse.mountx`, `nfs`, ...) or the transport name
- * that produced it, because only one of the two has an unprivileged route:
- * `fusermount3 -u` is setuid and `umount(8)` is not, so a stale NFS mount on
- * Linux is root's to clear either way.
+ * that produced it, because that is what decides whether there is an
+ * unprivileged route at all — see {@link staleNeedsRoot}.
  */
 function staleCommand(target: string, kind: string): string[] {
   if (kind.startsWith("fuse") && (process.getuid?.() ?? -1) !== 0) {
     return ["fusermount3", "-u", "-z", target];
   }
+  // macOS has no lazy unmount, and `-f` is what an NFS mount whose server is
+  // gone needs anyway: the client would otherwise wait for a flush nobody is
+  // going to answer.
   if (process.platform === "darwin") return ["umount", "-f", target];
   // Lazy, because the thing being cleaned up is usually a dead connection: the
   // kernel tears a FUSE session down when the last `/dev/fuse` reference goes,
@@ -257,15 +267,41 @@ function staleCommand(target: string, kind: string): string[] {
 }
 
 /**
- * Detach whatever an earlier run left at `target`.
+ * Would {@link staleCommand}'s answer need privileges this process lacks?
  *
- * **Only mounts this CLI could have made.** Anything else at that path belongs
- * to someone else, and a demo has no business unmounting it — `mount()` will
- * say so. Linux only: the check reads `/proc/self/mounts`, which macOS does not
- * have, and there the NFS transport's own teardown is the story.
+ * Two unprivileged routes, one per host, and they are unprivileged for
+ * unrelated reasons: `fusermount3 -u` is setuid, and macOS is a BSD, where the
+ * user who mounted a filesystem may unmount it — the same rule that lets the
+ * NFS transport mount there without root in the first place
+ * (`src/nfs/mount.ts`). Linux's `umount(8)` is neither, so a stale NFS mount
+ * there is root's to clear.
+ *
+ * A macOS mount made by somebody *else* still refuses, and that shows up as the
+ * spawn failing rather than as a guess made here.
  */
-async function unmountStale(target: string): Promise<void> {
-  if (process.platform !== "linux") return;
+function staleNeedsRoot(command: string): boolean {
+  if ((process.getuid?.() ?? -1) === 0) return false;
+  return command !== "fusermount3" && process.platform !== "darwin";
+}
+
+/**
+ * The mount-table type at `target`, or `undefined` if nothing is mounted there
+ * and if the table would not say.
+ *
+ * Linux reads `/proc/self/mounts` directly; macOS has no such file, so the
+ * table means spawning `mount(8)` — which `src/nfs/mount.ts` already does,
+ * tri-state and all. It is imported dynamically so a Linux run, where FUSE is
+ * the answer, never loads the NFS codec sitting behind it.
+ *
+ * "Could not read the table" collapses to `undefined` here, which is right for
+ * this caller and not for that one: the worst this does on a bad guess is skip
+ * a cleanup, and then `mount()` refuses to stack and says so.
+ */
+async function staleType(target: string): Promise<string | undefined> {
+  if (process.platform === "darwin") {
+    const { mountEntryAt } = await import("../nfs/mount.ts");
+    return (await mountEntryAt(target, "darwin"))?.type;
+  }
   const table = await readFile("/proc/self/mounts", "utf8").catch(() => "");
   let type: string | undefined;
   for (const line of table.split("\n")) {
@@ -277,10 +313,22 @@ async function unmountStale(target: string): Promise<void> {
     );
     if (unescaped === target) type = kind;
   }
+  return type;
+}
+
+/**
+ * Detach whatever an earlier run left at `target`.
+ *
+ * **Only mounts this CLI could have made.** Anything else at that path belongs
+ * to someone else, and a demo has no business unmounting it — `mount()` will
+ * say so.
+ */
+async function unmountStale(target: string): Promise<void> {
+  const type = await staleType(target);
   if (type === undefined || !(type.startsWith("fuse") || type.startsWith("nfs"))) return;
 
   const [command, ...args] = staleCommand(target, type);
-  if (command !== "fusermount3" && (process.getuid?.() ?? -1) !== 0) {
+  if (staleNeedsRoot(command!)) {
     // Escalating from here would mean a `sudo` reading a password off a pipe.
     console.error(
       `${yellow("!")} ${cyan(target)} is still mounted ${dim(`(${type})`)}\n` +
@@ -290,10 +338,68 @@ async function unmountStale(target: string): Promise<void> {
   }
 
   console.log(`${yellow("!")} ${bold("unmounting stale")} ${cyan(target)} ${dim(`(${type})`)}`);
-  try {
-    await run(command!, args);
-  } catch (error) {
-    // Not fatal here: `mount()` refuses to stack and its message says the rest.
-    console.error(red(`could not unmount ${target}: ${(error as Error).message}`));
+  // Not fatal, whatever happens: `mount()` refuses to stack and its message
+  // says the rest, so this reports and gets out of the way.
+  const result = await run(command!, args, STALE_TIMEOUT).catch((error: unknown) => {
+    console.error(red(`could not run ${command}: ${(error as Error).message}`));
+    return undefined;
+  });
+  if (result === undefined || result.status === 0) {
+    return;
   }
+  const how = result.timedOut
+    ? `no answer within ${STALE_TIMEOUT}ms`
+    : result.stderr === ""
+      ? `${command} exited ${result.status}`
+      : result.stderr;
+  console.error(red(`could not unmount ${target}: ${how}`));
+  if (result.timedOut && process.platform === "darwin") {
+    // The one failure whose cause is not the mountpoint. Named rather than
+    // guessed at, by the transport that had to work it out.
+    const { consentAdvice } = await import("../nfs/mount.ts");
+    console.error(dim(consentAdvice(target)));
+  }
+}
+
+interface RunResult {
+  status: number | null;
+  stderr: string;
+  /** The deadline passed with the child still running. */
+  timedOut: boolean;
+}
+
+/**
+ * Run a command, bounded by `timeout`.
+ *
+ * The timeout **settles** rather than rejecting or waiting, and the child is
+ * let go of completely — same reasoning as `src/nfs/mount.ts`'s `run`, which is
+ * where it is written out in full: a `umount(8)` blocked inside the kernel
+ * survives `SIGKILL`, so waiting for `close` would never return and holding on
+ * to the child would keep this process's event loop alive after it has been
+ * given up on.
+ */
+function run(command: string, args: readonly string[], timeout: number): Promise<RunResult> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, [...args], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      child.stderr?.destroy();
+      child.unref();
+      resolvePromise({ status: null, stderr: stderr.trim(), timedOut: true });
+    }, timeout);
+    timer.unref();
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      rejectPromise(error);
+    });
+    child.once("close", (status) => {
+      clearTimeout(timer);
+      resolvePromise({ status, stderr: stderr.trim(), timedOut: false });
+    });
+  });
 }

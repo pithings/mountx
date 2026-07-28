@@ -24,10 +24,11 @@
 
 export * from "./constants.ts";
 export * from "./handles.ts";
-// Everything from `mount.ts` **except** `parseMountTable`/`MountEntry`, which
-// are the platform's mount-table format rather than anything a consumer of
-// this package composes with. Same treatment, and same reason, as the
-// sub-struct helpers below: still exported from `mount.ts` for the tests.
+// Everything from `mount.ts` **except** `parseMountTable`/`mountEntryAt`/
+// `MountEntry`, which are the platform's mount-table format rather than
+// anything a consumer of this package composes with. Same treatment, and same
+// reason, as the sub-struct helpers below: still exported from `mount.ts` for
+// the tests and for the CLI.
 export {
   liveNfsMounts,
   mountNfs,

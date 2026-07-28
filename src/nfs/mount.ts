@@ -349,8 +349,14 @@ async function mountTable(platform: NfsPlatform): Promise<MountEntry[] | undefin
  * What is mounted at `target`, `undefined` if nothing is, and `null` if the
  * table could not be read at all. The last matching entry wins — that is the
  * one on top, and the one `umount` would take down.
+ *
+ * Exported for the CLI's stale-mount cleanup, which asks the same question
+ * about a path nothing in this process mounted: macOS has no mount table to
+ * read, only a `mount(8)` to spawn, and the tri-state that comes with it is
+ * exactly the distinction that caller needs too. Kept off `mountx/nfs`'s
+ * surface for the same reason {@link parseMountTable} is.
  */
-async function mountEntryAt(
+export async function mountEntryAt(
   target: string,
   platform: NfsPlatform,
 ): Promise<MountEntry | undefined | null> {
