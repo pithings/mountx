@@ -22,7 +22,7 @@ import { createLoopback } from "mountx";
 import { createMemoryDriver } from "mountx/drivers/memory";
 
 // A driver is any object with stat(), readdir(), open(), [mkdir()] and [rename()] methods.
-// Mountx has built-in memory and fs drivers
+// Mountx has built-in memory, fs and unstorage drivers
 const driver = createMemoryDriver();
 
 // Work with FS in-process without mounting

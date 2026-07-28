@@ -12,6 +12,7 @@ export default defineBuildConfig({
         "./src/nfs/index.ts",
         "./src/drivers/memory.ts",
         "./src/drivers/node-fs.ts",
+        "./src/drivers/unstorage.ts",
       ],
     },
   ],

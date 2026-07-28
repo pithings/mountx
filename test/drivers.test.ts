@@ -2,9 +2,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createStorage } from "unstorage";
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
 import { createNodeFsDriver } from "../src/drivers/node-fs.ts";
+import { createUnstorageDriver } from "../src/drivers/unstorage.ts";
 import { createLoopback, resolveCapabilities } from "../src/harness.ts";
 import type { FsDriver, FullFsDriver } from "../src/types.ts";
 import { conformance } from "./conformance.ts";
@@ -49,6 +51,12 @@ conformance({
     const { root, cleanup } = await temporaryRoot();
     return { fs: createLoopback(createNodeFsDriver(root)), cleanup };
   },
+});
+
+conformance({
+  name: "unstorage",
+  capabilities: resolveCapabilities(createUnstorageDriver(createStorage())),
+  setup: async () => ({ fs: createLoopback(createUnstorageDriver(createStorage())) }),
 });
 
 conformance({

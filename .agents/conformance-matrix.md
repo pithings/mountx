@@ -8,7 +8,7 @@ Generated 2026-07-28 with `pnpm matrix`.
 
 | Column       | What it runs                                                                                      | Result                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| **loopback** | `test/drivers.test.ts` — the driver behind `createLoopback`, no transport                         | 186 passed, 3 skipped (3 targets: memory; node-fs; node:fs/promises (raw))                                   |
+| **loopback** | `test/drivers.test.ts` — the driver behind `createLoopback`, no transport                         | 235 passed, 17 skipped (4 targets: memory; node-fs; unstorage; node:fs/promises (raw))                       |
 | **FUSE**     | `test/fuse/conformance-mount.test.ts` — a real kernel mount, `node:fs` as the client              | 126 passed, 0 skipped (2 targets: memory driver, through a FUSE mount; node-fs driver, through a FUSE mount) |
 | **NFS**      | `test/nfs/conformance.test.ts` — NFSv3 over a TCP socket, the JS client from `test/nfs/client.ts` | 122 passed, 4 skipped (2 targets: memory driver, over NFS; node-fs driver, over NFS)                         |
 
@@ -28,34 +28,34 @@ Derived from the run, not declared here: a requirement counts as unmet in a colu
 
 ### files
 
-| Case                                                                 | Needs      | loopback | FUSE | NFS  |
-| -------------------------------------------------------------------- | ---------- | -------- | ---- | ---- |
-| creates, writes, reads back and closes                               |            | pass     | pass | pass |
-| reads and writes at explicit positions                               |            | pass     | pass | pass |
-| advances the implicit position across reads                          |            | pass     | pass | pass |
-| appends at the end in append mode                                    |            | pass     | pass | pass |
-| reads past the end as zero bytes                                     |            | pass     | pass | pass |
-| truncates on open with 'w'                                           |            | pass     | pass | pass |
-| accepts numeric open flags                                           |            | pass     | pass | pass |
-| flushes without complaint                                            |            | pass     | pass | pass |
-| rejects a write to a read-only handle with EBADF                     |            | pass     | pass | pass |
-| rejects opening a missing file with ENOENT                           |            | pass     | pass | pass |
-| rejects an exclusive open of an existing file with EEXIST            |            | pass     | pass | pass |
-| rejects an exclusive open of a symlink, dangling or not, with EEXIST | `symlinks` | pass     | pass | pass |
-| reports only the bytes it actually copied                            |            | pass     | pass | pass |
-| rejects out-of-range read and write arguments                        |            | pass     | pass | pass |
-| rejects a path that traverses a file with ENOTDIR                    |            | pass     | pass | pass |
-| rejects opening a directory for writing with EISDIR                  |            | pass     | pass | pass |
-| rejects reading a directory handle with EISDIR                       |            | pass     | pass | pass |
+| Case                                                                 | Needs      | loopback                                                                       | FUSE | NFS  |
+| -------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ---- | ---- |
+| creates, writes, reads back and closes                               |            | pass                                                                           | pass | pass |
+| reads and writes at explicit positions                               |            | pass                                                                           | pass | pass |
+| advances the implicit position across reads                          |            | pass                                                                           | pass | pass |
+| appends at the end in append mode                                    |            | pass                                                                           | pass | pass |
+| reads past the end as zero bytes                                     |            | pass                                                                           | pass | pass |
+| truncates on open with 'w'                                           |            | pass                                                                           | pass | pass |
+| accepts numeric open flags                                           |            | pass                                                                           | pass | pass |
+| flushes without complaint                                            |            | pass                                                                           | pass | pass |
+| rejects a write to a read-only handle with EBADF                     |            | pass                                                                           | pass | pass |
+| rejects opening a missing file with ENOENT                           |            | pass                                                                           | pass | pass |
+| rejects an exclusive open of an existing file with EEXIST            |            | pass                                                                           | pass | pass |
+| rejects an exclusive open of a symlink, dangling or not, with EEXIST | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| reports only the bytes it actually copied                            |            | pass                                                                           | pass | pass |
+| rejects out-of-range read and write arguments                        |            | pass                                                                           | pass | pass |
+| rejects a path that traverses a file with ENOTDIR                    |            | pass                                                                           | pass | pass |
+| rejects opening a directory for writing with EISDIR                  |            | pass                                                                           | pass | pass |
+| rejects reading a directory handle with EISDIR                       |            | pass                                                                           | pass | pass |
 
 ### stat
 
-| Case                                     | Needs    | loopback | FUSE | NFS  |
-| ---------------------------------------- | -------- | -------- | ---- | ---- |
-| agrees across stat, lstat and the handle |          | pass     | pass | pass |
-| reports directories                      |          | pass     | pass | pass |
-| rejects a missing path with ENOENT       |          | pass     | pass | pass |
-| reports filesystem statistics            | `statfs` | pass     | pass | pass |
+| Case                                     | Needs    | loopback                                                                       | FUSE | NFS  |
+| ---------------------------------------- | -------- | ------------------------------------------------------------------------------ | ---- | ---- |
+| agrees across stat, lstat and the handle |          | pass                                                                           | pass | pass |
+| reports directories                      |          | pass                                                                           | pass | pass |
+| rejects a missing path with ENOENT       |          | pass                                                                           | pass | pass |
+| reports filesystem statistics            | `statfs` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
 
 ### readdir
 
@@ -103,33 +103,33 @@ Derived from the run, not declared here: a requirement counts as unmet in a colu
 
 ### hard links
 
-| Case                                                                    | Needs       | loopback | FUSE | NFS  |
-| ----------------------------------------------------------------------- | ----------- | -------- | ---- | ---- |
-| shares an inode and counts nlink                                        | `hardlinks` | pass     | pass | pass |
-| rejects an existing destination with EEXIST                             | `hardlinks` | pass     | pass | pass |
-| rejects linking a directory with EPERM and a missing source with ENOENT | `hardlinks` | pass     | pass | pass |
+| Case                                                                    | Needs       | loopback                                                                       | FUSE | NFS  |
+| ----------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------ | ---- | ---- |
+| shares an inode and counts nlink                                        | `hardlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| rejects an existing destination with EEXIST                             | `hardlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| rejects linking a directory with EPERM and a missing source with ENOENT | `hardlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
 
 ### symlinks
 
-| Case                                                           | Needs      | loopback | FUSE | NFS  |
-| -------------------------------------------------------------- | ---------- | -------- | ---- | ---- |
-| round-trips through readlink and distinguishes lstat from stat | `symlinks` | pass     | pass | pass |
-| resolves symlinked directories as path components              | `symlinks` | pass     | pass | pass |
-| keeps dangling symlinks visible to lstat only                  | `symlinks` | pass     | pass | pass |
-| rejects symlink loops with ELOOP                               | `symlinks` | pass     | pass | pass |
-| rejects readlink of a regular file with EINVAL                 | `symlinks` | pass     | pass | pass |
-| sizes a symlink by its target in bytes                         | `symlinks` | pass     | pass | pass |
-| rejects creating a symlink over an existing name with EEXIST   | `symlinks` | pass     | pass | pass |
+| Case                                                           | Needs      | loopback                                                                       | FUSE | NFS  |
+| -------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ---- | ---- |
+| round-trips through readlink and distinguishes lstat from stat | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| resolves symlinked directories as path components              | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| keeps dangling symlinks visible to lstat only                  | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| rejects symlink loops with ELOOP                               | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| rejects readlink of a regular file with EINVAL                 | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| sizes a symlink by its target in bytes                         | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
+| rejects creating a symlink over an existing name with EEXIST   | `symlinks` | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass |
 
 ### metadata
 
-| Case                                                                   | Needs                               | loopback   | FUSE | NFS        |
-| ---------------------------------------------------------------------- | ----------------------------------- | ---------- | ---- | ---------- |
-| changes permission bits                                                | `permissions`                       | pass       | pass | pass       |
-| keeps ownership when set to the current owner                          | `permissions`                       | pass       | pass | pass       |
-| sets access and modification times                                     | `times`                             | pass       | pass | pass       |
-| sets times on the symlink itself with lutimes                          | `times` + `symlinks`                | pass       | pass | pass       |
-| changes ownership of the symlink itself with lchown, not of its target | `permissions` + `symlinks` + `root` | skip: root | pass | skip: root |
+| Case                                                                   | Needs                               | loopback                                                                       | FUSE | NFS        |
+| ---------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------ | ---- | ---------- |
+| changes permission bits                                                | `permissions`                       | pass                                                                           | pass | pass       |
+| keeps ownership when set to the current owner                          | `permissions`                       | pass                                                                           | pass | pass       |
+| sets access and modification times                                     | `times`                             | pass                                                                           | pass | pass       |
+| sets times on the symlink itself with lutimes                          | `times` + `symlinks`                | pass (memory), pass (node-fs), skip (unstorage), pass (node:fs/promises (raw)) | pass | pass       |
+| changes ownership of the symlink itself with lchown, not of its target | `permissions` + `symlinks` + `root` | skip: root                                                                     | pass | skip: root |
 
 ### truncate
 
