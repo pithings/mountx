@@ -35,10 +35,31 @@
  *
  * `allow_other` needs `user_allow_other` in `/etc/fuse.conf` and fails with a
  * message saying so; unprivileged mounting has no other way to grant it.
+ *
+ * ## Where the privilege comes from
+ *
+ * The setuid bit on the helper, and nothing else. `/dev/fuse` is mode 0666 on a
+ * host with udev, but opening it is the easy half — `mount(2)` needs
+ * `CAP_SYS_ADMIN`, which an ordinary process does not have and cannot acquire.
+ * So a helper that did not become root is not a helper at all, and it reports
+ * that as `failed to open /dev/fuse: Permission denied` — a message about the
+ * device, for a problem that is never the device's. `mount_fuse()` opens it
+ * *first*, before its `drop_privs()`, and `drop_privs()` is `setfsuid`-based
+ * with `main()` having already restored the fsuid, so a real setuid-root helper
+ * opens even a 0600 root-owned device without trouble. A devtmpfs with no udev
+ * rule gives exactly that device, and it is a red herring every time.
+ *
+ * Containers and sandboxes are where the elevation actually goes missing, four
+ * ways: the image lost the setuid bit (`COPY` does not preserve it), `nosuid` on
+ * the filesystem holding the helper disarms the bit that is there,
+ * `no_new_privs` on the process tree makes the bit inert for this process and
+ * every descendant, or an LSM/device cgroup denies the device to everyone, root
+ * included. {@link rootlessProbe} checks the two that are visible in advance —
+ * the bit and `no_new_privs` — and {@link deviceRefusalAdvice} names the rest
+ * after the fact, because by then they are one errno.
  */
 
-import { existsSync } from "node:fs";
-import { closeSync } from "node:fs";
+import { closeSync, existsSync, readFileSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { describe, errorMessage, run, stdioWith } from "./exec.ts";
 import { loadNative } from "./native.ts";
@@ -86,12 +107,107 @@ export interface RootlessProbe {
   reason: string;
 }
 
+/** The setuid bit, `S_ISUID`. */
+const SETUID = 0o4000;
+
+/** `CAP_SYS_ADMIN`'s bit in a capability mask, from `include/uapi/linux/capability.h`. */
+const CAP_SYS_ADMIN = 21n;
+
+/** What an `execve` from this process would and would not carry across. */
+export interface ExecPrivileges {
+  /**
+   * `CAP_SYS_ADMIN` in the *ambient* set.
+   *
+   * The ambient set is the only one that survives an `execve` of a file with no
+   * capabilities of its own, so it is the only thing that could let a helper
+   * that is *not* setuid mount anyway. Exotic — it takes a deliberate `capsh
+   * --addamb` or a container runtime configured for it — but it is the one
+   * arrangement in which {@link elevationRefusal} would otherwise be wrong.
+   */
+  ambient: boolean;
+  /**
+   * `PR_SET_NO_NEW_PRIVS`, which makes the setuid bit inert.
+   *
+   * Under it the kernel runs a setuid binary as the *calling* user and says
+   * nothing: no error at `execve`, no clue in the file's mode. A seccomp
+   * sandbox has to set it (installing a filter without `CAP_SYS_ADMIN`
+   * requires it), it is inherited by every descendant, and it cannot be
+   * cleared — so it is the one prerequisite here that no amount of fixing the
+   * host will recover, and it deserves to be named rather than discovered.
+   */
+  noNewPrivs: boolean;
+}
+
+/**
+ * Read the two facts about elevation out of `/proc/self/status`.
+ *
+ * Both are one line of the same file, so they are one read. A kernel too old to
+ * report a field reads as the answer it had before the field existed.
+ */
+export function execPrivileges(status: string): ExecPrivileges {
+  const ambient = /^CapAmb:\s*([\dA-Fa-f]+)$/m.exec(status);
+  return {
+    ambient:
+      ambient?.[1] !== undefined && ((BigInt(`0x${ambient[1]}`) >> CAP_SYS_ADMIN) & 1n) === 1n,
+    noNewPrivs: /^NoNewPrivs:\s*1$/m.test(status),
+  };
+}
+
+/**
+ * Why this helper cannot elevate, or `undefined` if it can.
+ *
+ * Split out of {@link rootlessProbe} because the interesting part is a decision
+ * about three numbers and belongs in a test, not on a host that happens to have
+ * a working `fuse3` install. `stats` is the helper's, `undefined` when it could
+ * not be stat'd — which is not evidence of anything, so it reads as "fine" and
+ * lets the mount produce the real error.
+ */
+export function elevationRefusal(
+  helper: string,
+  stats: { mode: number; uid: number } | undefined,
+  privileges: ExecPrivileges,
+): string | undefined {
+  if (privileges.ambient) {
+    return undefined;
+  }
+  // Before the mode checks, because it is the one that also explains why every
+  // suggestion they produce (`chmod u+s`, `sudo`) would not work either.
+  if (privileges.noNewPrivs) {
+    return (
+      `this process runs with no_new_privs set, which makes the setuid bit inert — ` +
+      `${helper} would run as you rather than as root, and fail to open /dev/fuse. It ` +
+      `is inherited from whatever started this process (a seccomp sandbox has to set ` +
+      `it) and cannot be cleared, so sudo is equally dead and there is nothing to fix ` +
+      `from in here: mounting needs a process tree that was not started under it`
+    );
+  }
+  if (stats === undefined) {
+    return undefined;
+  }
+  if ((stats.mode & SETUID) === 0) {
+    return (
+      `${helper} is not setuid (ls -l shows no \`s\` in its mode) — it is the bit that ` +
+      `lets the helper open /dev/fuse and call mount(2) on your behalf, and without it ` +
+      `an unprivileged mount cannot get off the ground. Container images and sandboxes ` +
+      `lose it routinely. Restore it with \`sudo chmod u+s ${helper}\`, or mount as root`
+    );
+  }
+  if (stats.uid !== 0) {
+    return (
+      `${helper} is setuid to uid ${stats.uid} rather than to root, so it gains no ` +
+      `privilege that this process does not already have`
+    );
+  }
+  return undefined;
+}
+
 /**
  * Everything unprivileged mounting needs, checked before anything is opened.
  *
- * Both halves are host facts that a process cannot fix at runtime, so this is
- * a probe rather than a repair: a suite can skip on it, and `mount()` can turn
- * it into one error that names both prerequisites instead of failing twice.
+ * All three parts are host facts that a process cannot fix at runtime, so this
+ * is a probe rather than a repair: a suite can skip on it, and `mount()` can
+ * turn it into one error that names the prerequisite it is missing instead of
+ * failing later and less clearly.
  */
 export function rootlessProbe(): RootlessProbe {
   const helper = fusermountPath();
@@ -104,12 +220,75 @@ export function rootlessProbe(): RootlessProbe {
         `dnf install fuse3)`,
     };
   }
+  const refusal = elevationRefusal(helper, statQuietly(helper), execPrivileges(procStatus()));
+  if (refusal !== undefined) {
+    return { usable: false, reason: refusal };
+  }
   try {
     loadNative();
   } catch (error) {
     return { usable: false, reason: errorMessage(error) };
   }
   return { usable: true, reason: "" };
+}
+
+function statQuietly(path: string): { mode: number; uid: number } | undefined {
+  try {
+    return statSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+function procStatus(): string {
+  try {
+    return readFileSync("/proc/self/status", "utf8");
+    /* v8 ignore next 3 -- no procfs, which on the only platform that mounts
+       means something stranger than a missing capability is going on. */
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Name the cause when the helper could not open `/dev/fuse`.
+ *
+ * The helper's own message is `failed to open /dev/fuse: Permission denied`,
+ * which reads as a problem with the device's mode and is not one. libfuse opens
+ * the device as the *first* thing `mount_fuse()` does, before its `drop_privs()`
+ * — and `drop_privs()` is `setfsuid`, so the fsuid at that open is still root
+ * (`util/fusermount.c`, unchanged from 3.10 through 3.18). A 0600 root-owned
+ * `/dev/fuse`, which is what a devtmpfs with no udev rule gives you, therefore
+ * opens fine for a helper that really did become root. The message means it did
+ * not, and by the time it is printed the reasons are indistinguishable — so this
+ * names them all rather than guessing, in the same spirit as the NFS transport's
+ * `consentAdvice`.
+ *
+ * {@link rootlessProbe} has already ruled out the two that are visible in
+ * advance, so what is left here is the mount-time half.
+ *
+ * Returns `undefined` for every other failure, which keeps the ordinary
+ * "`fusermount3` did not like your options" error as short as it is.
+ */
+export function deviceRefusalAdvice(helper: string, stderr: string): string | undefined {
+  if (!stderr.includes("/dev/fuse")) {
+    return undefined;
+  }
+  if (!/Permission denied|Operation not permitted/.test(stderr)) {
+    return undefined;
+  }
+  return (
+    `${helper} is setuid root precisely so it can open /dev/fuse, and it opens the device ` +
+    `before dropping anything — so a permission error from it means it never became root, ` +
+    `whatever the device's mode says. Three things left do that: the filesystem holding ` +
+    `the helper is mounted nosuid (\`findmnt -no OPTIONS -T ${helper}\`), an LSM denies ` +
+    `the device to this domain (SELinux gives the same EACCES — \`sudo dmesg | grep ` +
+    `'avc.*fuse'\`), or a device cgroup denies it outright. Test which side you are on ` +
+    `with \`sudo -n id\`: if that gives uid 0, setuid works and the device is being denied ` +
+    `by policy; if it fails the same way, nothing here elevates. Mounting as root is the ` +
+    `escape from the first — it opens /dev/fuse itself and runs no helper: ` +
+    `sudo "$(command -v node)" your-script.mjs`
+  );
 }
 
 export interface FusermountOptions {
@@ -164,9 +343,11 @@ export async function mountViaFusermount(
     closeQuietly(theirs);
     sender = -1;
     if (result.status !== 0) {
+      const advice = deviceRefusalAdvice(helper, result.stderr);
       throw new Error(
         `mountx: mounting ${mountpoint} failed — ` +
-          describe(`${helper} -o ${options.options}`, result),
+          describe(`${helper} -o ${options.options}`, result) +
+          (advice === undefined ? "" : `. ${advice}`),
       );
     }
     // The helper has exited, so the descriptor is sitting in the socket buffer
