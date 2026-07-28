@@ -76,3 +76,26 @@ export function driverOpenFlags(
 ): number {
   return platform === "linux" ? wire : translateOpenFlags(wire, host);
 }
+
+/**
+ * The flags to **re-open** with, for a driver that keeps no per-open state.
+ *
+ * `O_CREAT`, `O_EXCL` and `O_TRUNC` are one-shot: `open(2)` acts on them once,
+ * when the description is created. A re-open is not another `open(2)` as far as
+ * the application is concerned — it stands in for the description the kernel
+ * already holds an `fh` for — so repeating them is wrong three ways, and all
+ * three are reachable from a plain `handles: false` driver:
+ *
+ * - `O_EXCL` fails every operation on the file it just created (`EEXIST` on the
+ *   first `WRITE` after a `CREATE`);
+ * - `O_TRUNC` empties the file before *each* operation, so every write but the
+ *   last is thrown away;
+ * - `O_CREAT` would resurrect a file unlinked while open.
+ *
+ * Host-space in, host-space out: this runs on what `driverOpenFlags()`
+ * returned. `O_APPEND` deliberately stays — the kernel has already resolved an
+ * appending write's offset to EOF, and an appending re-open lands there too.
+ */
+export function reopenFlags(driverFlags: number): number {
+  return driverFlags & ~(constants.O_CREAT | constants.O_EXCL | constants.O_TRUNC);
+}

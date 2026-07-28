@@ -9,7 +9,7 @@
 import { constants } from "node:fs";
 import { describe, expect, it } from "vitest";
 import * as wire from "../../src/fuse/constants.ts";
-import { driverOpenFlags, translateOpenFlags } from "../../src/fuse/flags.ts";
+import { driverOpenFlags, reopenFlags, translateOpenFlags } from "../../src/fuse/flags.ts";
 
 /** `sys/fcntl.h`, macOS 15. The whole reason this module exists. */
 const DARWIN = {
@@ -92,6 +92,25 @@ describe("driverOpenFlags", () => {
     // on Linux by passing through, elsewhere by translating.
     expect(driverOpenFlags(wire.O_WRONLY | wire.O_CREAT | wire.O_TRUNC)).toBe(
       constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+    );
+  });
+});
+
+describe("reopenFlags", () => {
+  it("drops the flags open(2) acts on once", () => {
+    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_TRUNC;
+    expect(reopenFlags(flags)).toBe(constants.O_WRONLY);
+  });
+
+  it("keeps the access mode and O_APPEND", () => {
+    const flags = constants.O_RDWR | constants.O_APPEND | constants.O_TRUNC;
+    expect(reopenFlags(flags)).toBe(constants.O_RDWR | constants.O_APPEND);
+  });
+
+  it("leaves flags with nothing one-shot in them alone", () => {
+    expect(reopenFlags(constants.O_RDONLY)).toBe(constants.O_RDONLY);
+    expect(reopenFlags(constants.O_WRONLY | constants.O_NOFOLLOW)).toBe(
+      constants.O_WRONLY | constants.O_NOFOLLOW,
     );
   });
 });

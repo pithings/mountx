@@ -26,6 +26,7 @@ import {
   FUSE_NOTIFY_INVAL_INODE,
   FUSE_ROOT_ID,
   O_CREAT,
+  O_EXCL,
   O_RDWR,
   O_TRUNC,
   O_WRONLY,
@@ -1452,6 +1453,56 @@ describe("O_TRUNC", () => {
     await kernel.release(created.entry.nodeid, created.open.fh);
 
     const opened = await kernel.open(created.entry.nodeid, O_RDWR | O_TRUNC);
+    expect((await kernel.getattr(created.entry.nodeid)).attr.size).toBe(0n);
+    await kernel.release(created.entry.nodeid, opened.fh);
+    expectHealthy(session);
+  });
+});
+
+/**
+ * A driver with no per-open state re-opens from the path for every operation,
+ * so what it re-opens *with* is data. The creation flags acted once, at the
+ * open the kernel holds the `fh` for; carrying them into a re-open makes every
+ * subsequent operation redo them.
+ */
+describe("re-open, for a driver with no per-open state", () => {
+  const pathOnly = (): FsDriver => {
+    const base = createMemoryDriver();
+    return { ...base, capabilities: { ...base.capabilities, handles: false } };
+  };
+
+  it("does not repeat O_EXCL, which would fail every write to a new file", async () => {
+    const { session, kernel } = await mount(pathOnly());
+    const created = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT | O_EXCL | O_RDWR, 0o644);
+    expect(await kernel.write(created.entry.nodeid, created.open.fh, 0, "hello")).toBe(5);
+    await kernel.release(created.entry.nodeid, created.open.fh);
+    expectHealthy(session);
+  });
+
+  it("does not repeat O_TRUNC, which would empty the file before every write", async () => {
+    const { session, kernel } = await mount(pathOnly());
+    const created = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    await kernel.release(created.entry.nodeid, created.open.fh);
+
+    const opened = await kernel.open(created.entry.nodeid, O_WRONLY | O_TRUNC);
+    await kernel.write(created.entry.nodeid, opened.fh, 0, "aaaa");
+    await kernel.write(created.entry.nodeid, opened.fh, 4, "bbbb");
+    await kernel.release(created.entry.nodeid, opened.fh);
+
+    const reader = await kernel.open(created.entry.nodeid, O_RDWR);
+    const bytes = await kernel.read(created.entry.nodeid, reader.fh, 0, 16);
+    expect(decoder.decode(bytes)).toBe("aaaabbbb");
+    await kernel.release(created.entry.nodeid, reader.fh);
+    expectHealthy(session);
+  });
+
+  it("still truncates once, at the open that asked for it", async () => {
+    const { session, kernel } = await mount(pathOnly());
+    const created = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    await kernel.write(created.entry.nodeid, created.open.fh, 0, "old contents");
+    await kernel.release(created.entry.nodeid, created.open.fh);
+
+    const opened = await kernel.open(created.entry.nodeid, O_WRONLY | O_TRUNC);
     expect((await kernel.getattr(created.entry.nodeid)).attr.size).toBe(0n);
     await kernel.release(created.entry.nodeid, opened.fh);
     expectHealthy(session);

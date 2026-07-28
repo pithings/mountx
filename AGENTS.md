@@ -25,7 +25,7 @@ FUSE (`src/fuse/`, exported as `mountx/fuse`):
 - `constants.ts` — opcodes and `FUSE_*`/`FOPEN_*`/`FATTR_*`/`DT_*`, transcribed from the kernel's `include/uapi/linux/fuse.h` (tag v6.12, protocol 7.41).
 - `protocol.ts` — every struct encoded **and** decoded, opcode dispatch table (`OPCODES`), message framing, errno-on-the-wire helpers, dirent packing (`DirentPacker`).
 - `init.ts` — `negotiateInit(kernelInit, preferences)`, pure.
-- `flags.ts` — the two `open(2)` flag namespaces, pure: `driverOpenFlags()` turns the kernel's `O_*` into the host's for the hand-off to a driver, and is the identity on Linux, where the wire _is_ the host and unnamed bits have to survive. The translation exists because Tier-0 tests drive a real session on whatever host runs `pnpm test`, and macOS's `O_TRUNC` is Linux's `O_APPEND`.
+- `flags.ts` — the two `open(2)` flag namespaces, pure: `driverOpenFlags()` turns the kernel's `O_*` into the host's for the hand-off to a driver (the identity on Linux, where the wire _is_ the host, so unnamed bits survive), and `reopenFlags()` drops the one-shot creation flags a `handles: false` re-open must not repeat. The translation exists because Tier-0 tests drive a real session on whatever host runs `pnpm test`, and macOS's `O_TRUNC` is Linux's `O_APPEND`.
 - `session.ts` — `FuseSession(driver, options)`: `INIT` handshake, opcode switch, file-handle table, readdir paging, `SETATTR` bitmask → driver calls, notify encoders.
 - `inodes.ts` — `InodeTable`: nodeid ↔ path ↔ `(dev, ino)`, lookup refcounting, subtree remap on rename, orphans. Entirely synchronous.
 - `notify.ts` — `notify_inval_inode`/`notify_inval_entry` codecs.

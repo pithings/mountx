@@ -97,7 +97,7 @@ import {
   O_TRUNC,
   opcodeName,
 } from "./constants.ts";
-import { driverOpenFlags } from "./flags.ts";
+import { driverOpenFlags, reopenFlags } from "./flags.ts";
 import { negotiateInit, type InitPreferences, type NegotiatedSession } from "./init.ts";
 import { INODE_GENERATION, InodeTable, type Inode } from "./inodes.ts";
 import {
@@ -227,9 +227,9 @@ interface OpenFile {
   fh: bigint;
   inode: Inode;
   /**
-   * The `O_*` flags the kernel opened with, **in the driver's namespace** —
-   * `driverOpenFlags()` has already been applied, because the one thing this
-   * field feeds is a re-open through the driver (`#withHandle`).
+   * The `O_*` flags a **re-open** of this file uses, in the driver's namespace:
+   * `driverOpenFlags()` then `reopenFlags()`, because the one thing this field
+   * feeds is `#withHandle` re-opening from the path.
    */
   flags: number;
   /**
@@ -1194,7 +1194,9 @@ export class FuseSession {
     const file: OpenFile = {
       fh: this.#nextFh++,
       inode,
-      flags,
+      // The creation flags acted once, at this open; a re-open standing in for
+      // it must not repeat them. See `flags.ts`.
+      flags: reopenFlags(flags),
       handle,
       dir: dir ? { entries: undefined } : undefined,
     };
