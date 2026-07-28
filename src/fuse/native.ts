@@ -1,11 +1,16 @@
 /**
- * Loading the one native thing this library has.
+ * The one native thing this library has, in the shape the rest of it expects.
  *
  * Rootless mounting goes through `fusermount3`, which returns `/dev/fuse` over
  * `SCM_RIGHTS`, and Node cannot `recvmsg` a descriptor. `native/src/main.zig`
- * closes exactly that gap and nothing else; this file finds the prebuilt,
- * loads it once, and reshapes its errors into the ones the rest of the library
- * already speaks.
+ * closes exactly that gap and nothing else.
+ *
+ * Finding and `dlopen`ing the binary is `#unfs/native` (`native/index.mjs`),
+ * which is a separate, unbundled file because locating a sibling of the addon
+ * relative to `import.meta.url` only works from a file that is still where it
+ * was written. This module is the part that has opinions: it turns the addon's
+ * raw positive `errno` into a `node:fs`-shaped error, so the errno table stays
+ * transcribed exactly once, in `src/errors.ts`.
  *
  * **Nothing here is on the root-mode path.** `mount()` as root opens
  * `/dev/fuse` itself and spawns `mount(8)`, and never imports this module — so
@@ -14,83 +19,23 @@
  * it.
  */
 
-import { arch, platform } from "node:process";
+import { loadNative as dlopenNative, type NativeBinding, nativePath } from "#unfs/native";
 import { ERRNO_CODES, type ErrnoCode } from "../errors.ts";
 
-/** What `native/src/main.zig` exports. */
-export interface NativeBinding {
-  /**
-   * `socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)`.
-   *
-   * Both ends come back close-on-exec. The end a child needs is handed to it
-   * through the stdio map, which clears the flag on the copy it makes; every
-   * other spawn in the process is unaffected, which is the point.
-   */
-  socketpair(): [number, number];
-  /**
-   * Send one descriptor, with the one byte of payload `unix(7)` requires.
-   *
-   * The library never calls this — `fusermount3` is the sender. It exists so
-   * the round trip can be tested in one process with no helper, no mountpoint
-   * and no privileges.
-   */
-  sendFd(socket: number, fd: number): void;
-  /**
-   * Receive one descriptor, `O_CLOEXEC`, waiting at most `timeoutMs` for it
-   * (negative waits forever).
-   *
-   * The close-on-exec part is load-bearing: the kernel tears a FUSE connection
-   * down when the last reference to the `/dev/fuse` file goes away, which is
-   * what makes a killed server leave a mountpoint that answers `ENOTCONN`
-   * instead of one that hangs. A descriptor leaked into an unrelated child
-   * would be exactly such a reference.
-   */
-  recvFd(socket: number, timeoutMs: number): number;
-}
+export type { NativeBinding };
+export { nativePath };
 
 /** `errno` → `code`, the inverse of {@link ERRNO_CODES}. */
 const CODE_BY_ERRNO = new Map<number, ErrnoCode>(
   Object.entries(ERRNO_CODES).map(([code, errno]) => [errno, code as ErrnoCode]),
 );
 
-/** The prebuilt for the running platform, whether or not it exists. */
-export function nativePath(): URL {
-  return new URL(`../../native/prebuilt/mountx-${platform}-${arch}.node`, import.meta.url);
-}
+let wrapped: NativeBinding | undefined;
 
-let cached: NativeBinding | undefined;
-let failure: Error | undefined;
-
-/**
- * Load the addon, once per process.
- *
- * A failure is remembered as well as a success: the answer cannot change while
- * the process runs, and retrying a `dlopen` on every mount attempt would turn
- * one clear error into a stutter.
- */
+/** Load the addon and give its errors the shape everything else here uses. */
 export function loadNative(): NativeBinding {
-  if (cached !== undefined) {
-    return cached;
-  }
-  if (failure !== undefined) {
-    throw failure;
-  }
-  const path = nativePath();
-  const loaded = { exports: {} as NativeBinding };
-  try {
-    process.dlopen(loaded, path.pathname);
-  } catch (error) {
-    failure = new Error(
-      `mountx: could not load the native helper for ${platform}-${arch} ` +
-        `(${path.pathname}): ${error instanceof Error ? error.message : String(error)}. ` +
-        `It is only needed for unprivileged mounting; mounting as root does not use it. ` +
-        `To build it from source: pnpm build:native`,
-      { cause: error },
-    );
-    throw failure;
-  }
-  cached = wrap(loaded.exports);
-  return cached;
+  wrapped ??= wrap(dlopenNative());
+  return wrapped;
 }
 
 /** Is unprivileged mounting even possible in this process? */
@@ -107,10 +52,10 @@ export function nativeAvailable(): boolean {
  * Give the addon's errors the shape `node:fs` uses.
  *
  * The Zig side reports a raw positive `errno` and the syscall's name, because
- * the errno table is transcribed once, in `src/errors.ts`, and having a second
- * copy of it in another language is how the two drift. Here it becomes a
- * negative `errno` and a POSIX `code`, so these errors are indistinguishable
- * from any other error in the library and `errnoOf()` understands them.
+ * the errno table is transcribed once and having a second copy of it in
+ * another language is how the two drift. Here it becomes a negative `errno`
+ * and a POSIX `code`, so these errors are indistinguishable from any other
+ * error in the library and `errnoOf()` understands them.
  */
 function wrap(binding: NativeBinding): NativeBinding {
   return {

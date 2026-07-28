@@ -39,7 +39,7 @@ function inodeOf(fd: number): string {
   return match[1]!;
 }
 
-describe.skipIf(!nativeAvailable())(`the native helper (${nativePath().pathname})`, () => {
+describe.skipIf(!nativeAvailable())(`the native helper (${nativePath()})`, () => {
   const native = nativeAvailable() ? loadNative() : undefined!;
   const open: number[] = [];
 

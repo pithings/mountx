@@ -29,7 +29,7 @@ FUSE (`src/fuse/`, exported as `mountx/fuse`):
 - `notify.ts` — `notify_inval_inode`/`notify_inval_entry` codecs.
 - `mount.ts` — `mount(driver, mountpoint, options)` → `Mount`, plus `unmountAll()`/`liveMounts()`. Picks its path by uid: root opens `/dev/fuse` here and spawns `mount(8)` with the descriptor at its own fd number; everyone else goes through `fusermount.ts`. Past the descriptor the two paths are the same code.
 - `fusermount.ts` — the unprivileged mount path: `rootlessProbe()`, `mountViaFusermount()` → fd, `unmountViaFusermount()`. The `_FUSE_COMMFD` handshake is transcribed from libfuse 3.18.2 (`lib/mount.c`, `util/fusermount.c`), including which `-o` options the helper accepts and which four it supplies itself.
-- `native.ts` — finds and `dlopen`s the prebuilt addon once, and reshapes its raw positive `errno` into a `node:fs`-shaped `code`/negative `errno`. Never imported on the root path.
+- `native.ts` — reshapes the addon's raw positive `errno` into a `node:fs`-shaped `code`/negative `errno`. Never imported on the root path. Locating and `dlopen`ing the binary is _not_ here: that is `#unfs/native` (`native/index.mjs`), for the reason in the invariants.
 - `exec.ts` — `run()`/`describe()`/`stdioWith()`, shared by the two files that spawn.
 - `record.ts` — tees `/dev/fuse` traffic (`mount({ tap })`) into a transcript; `replayTranscript()` feeds one back through a fresh session.
 
@@ -57,6 +57,7 @@ Native (`native/`), the only non-JS in the repository:
 - `src/main.zig` — a Node-API addon with three functions and nothing else: `socketpair`, `recvFd` (`poll(2)` + `recvmsg(2)` with `MSG_CMSG_CLOEXEC`) and `sendFd`, which the library never calls and the tests do. No fork, no exec, no strings, no allocation, no libc.
 - `src/napi.zig` — the ~10 Node-API entry points used, `extern`-declared, transcribed from Node v24's `js_native_api.h`.
 - `build.zig` — cross-compiles `prebuilt/mountx-linux-{x64,arm64}.node` from any host, `ReleaseSmall`, ~7 KB each. `prebuilt/` is committed and shipped in the package (`files`), so no user needs a toolchain.
+- `index.mjs` + `index.d.mts` — finds the prebuilt for `${platform}-${arch}` beside itself and `dlopen`s it, once. Hand-written JS, shipped verbatim, imported as `#unfs/native`. Verified end to end by `npm pack` → install → mount from `node_modules`.
 
 `bench/` — `harness.ts` (warmup, adaptive loop, percentiles), `scenarios.ts` (written once against the driver interface), `index.ts` (loopback + NFS columns), `fuse.ts`+`fuse-client.ts` (the FUSE column, client in a child process); generates `.agents/benchmarks.md`.
 
@@ -64,6 +65,7 @@ Native (`native/`), the only non-JS in the repository:
 
 - **Zero runtime deps.**
 - **The native addon is optional, lazy, and never on the root path.** Mounting as root opens `/dev/fuse` itself and touches no native code, so a host with no prebuilt for its platform loses unprivileged mounting and nothing else. Anything added to `native/` has to keep that true: if it becomes required, the pure-JS story is gone.
+- **The addon is located from a file that is never bundled.** `native/index.mjs` resolves the binary relative to its own `import.meta.url`, and reaches the library through the `#unfs/native` subpath import so the bundler leaves it alone. Doing this from `src/` worked only because `dist/fuse/` happens to sit the same distance from the package root, and would have broken silently the first time the build layout moved.
 - **The errno table is transcribed once**, in `src/errors.ts`. The addon reports a raw positive `errno` and lets `src/fuse/native.ts` name it, rather than carrying a second copy of the table in another language where the two would drift.
 - **`FsDriver` is a subset of `node:fs/promises`**, proven by the assignability acid test: `const driver: FsDriver = await import("node:fs/promises")` must compile with no cast.
 - **Capabilities are declared-or-inferred, never faked.** An unmet capability answers `ENOSYS`/`ENOTSUP`; it is never silently pretended.
