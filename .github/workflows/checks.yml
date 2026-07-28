@@ -1,8 +1,17 @@
 name: checks
 on: { push: {}, pull_request: {} }
 jobs:
+  # Tier 0/1 on both hosts. macOS earns its place here rather than being a
+  # nicety: every one of the 14 cases that failed the first time this suite ran
+  # on darwin was the suite assuming Linux — host `O_*` handed to a session that
+  # reads the wire's, host `errno` numbers checked against the transcribed
+  # table — and nothing on a Linux runner can catch that class again.
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
       - run: npm i -fg corepack && corepack enable
@@ -33,3 +42,33 @@ jobs:
         with: { node-version: lts/*, cache: "pnpm" }
       - run: pnpm install
       - run: pnpm test:root
+
+  # Tier 2 on macOS, and unprivileged: `mount_nfs` is not setuid and a BSD lets
+  # an ordinary user mount onto a directory that user owns, so this needs no
+  # sudo. `pnpm test:rootless` runs the NFS mount column and `mountx/auto`
+  # against it; the FUSE half skips itself off Linux.
+  #
+  # Not blocking yet, deliberately. macOS gates access to network volumes behind
+  # a sandbox approval, and a runner is launchd-attributed — the context that is
+  # refused instantly with EPERM rather than prompted (see the macOS section of
+  # `.agents/environment.md`). Locally the gate never fired for a user-owned
+  # mountpoint, which is what this job uses, but "never fired on one host" is not
+  # "will not fire on a runner". The timeout is there because the other way that
+  # gate presents is a wait nobody answers. **Drop `continue-on-error` once this
+  # has been green for a while** — a permanently amber job teaches people to
+  # ignore it.
+  mount-macos:
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - run: npm i -fg corepack && corepack enable
+      - uses: actions/setup-node@v6
+        with: { node-version: lts/*, cache: "pnpm" }
+      - run: pnpm install
+      - run: pnpm test:rootless
+      # Whatever the outcome, say whether anything was left mounted: a leak is
+      # the failure mode that would otherwise be invisible in a green run.
+      - if: always()
+        run: mount | grep -i nfs || echo "no NFS mounts left behind"
