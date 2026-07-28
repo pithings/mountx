@@ -1,6 +1,11 @@
 node_modules
 coverage
 dist
+
+# The Zig build cache. `native/prebuilt/` is the output and *is* committed —
+# the binaries ship in the package, so they are checked in rather than built
+# on anyone's machine.
+native/.zig-cache
 .vscode
 .DS_Store
 .eslintcache
