@@ -34,7 +34,7 @@ Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
    `DataView`, opcode table, `FUSE_INIT` negotiation logic as pure functions.
    Property-tested round-trips, golden byte fixtures, decoder fuzz (no
    exception escapes; exactly-once reply invariant harness).
-3. **Session layer.** Inode table + `FORGET`/`BATCH_FORGET` refcounting,
+3. ✅ **DONE** (commit 2d138ab, 2026-07-28) **Session layer.** Inode table + `FORGET`/`BATCH_FORGET` refcounting,
    path↔inode map (rename subtree remap, unlink-while-open, hardlinks),
    file-handle table, readdir paging/snapshots, errno discipline (catch-all
    → `-EIO`, reply-exactly-once assertion in dev), `INTERRUPT` → `-ENOSYS`,

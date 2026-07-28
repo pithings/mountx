@@ -24,6 +24,21 @@
 - `sudo` is passwordless BUT root's PATH lacks node (fnm). Use
   `sudo "$(which node)" script.mjs`. Since node itself runs as root, the
   sudo `closefrom` fd-stripping caveat from IDEA.md does not apply.
+- **Leak detection:** `/sys/fs/fuse/connections` is EMPTY on this host until
+  fusectl is mounted: `sudo mount -t fusectl none /sys/fs/fuse/connections`.
+  Without it, only `/proc/self/mounts` shows leaks.
+- **Wedge recovery (verified, both agents' measurements reconciled):**
+  - `umount -l` alone does NOT unwedge a mount with in-flight requests.
+  - Closing the /dev/fuse fd aborts the connection ONLY when no reads are
+    parked on it — a threadpool-parked read(2) holds the file reference,
+    so fuse_dev_release never runs and the mount stays wedged.
+  - What always works: `umount -f` → fuse_umount_begin → fuse_abort_conn
+    (fails all in-flight requests, parked reads return ENODEV). Its exit
+    status lies when racing another umount — trust /proc/self/mounts.
+  - With fusectl mounted, `echo 1 > /sys/fs/fuse/connections/<N>/abort`
+    also unwedges (process resumes with ENOTCONN).
+  - After `kill -9` (no parked-read holder left), a PLAIN `umount` clears
+    the stale entry.
 - **No `fusermount3` or `fusermount` installed** — unprivileged mounting is
   impossible on this host until the stub exists. All Tier-2 tests must run
   via sudo; gate/skip them when not root.

@@ -107,3 +107,88 @@ Tests: `test/fuse/synthetic-kernel.ts` (the other side of the session, built
 from the same codecs — encodes requests, decodes replies, tracks `unique` and
 per-nodeid lookup counts), `session.test.ts`, `inodes.test.ts`,
 `session-fuzz.test.ts` (bytes in → never a rejection, never a missing reply).
+
+## Layout (milestone 4 — FUSE transport, root mode)
+
+- `src/fuse/mount.ts` — the only file that opens a device or spawns a process.
+  `mount(driver, mountpoint, options)` → `Mount` (`unmount()`, `closed`,
+  `session`, `notifyInval*`, `Symbol.asyncDispose`), plus `unmountAll()` and
+  `liveMounts()`. Exported from `unimount/fuse` only: putting `mount` on the
+  root would pull the session and `node:child_process` into every
+  `import … from "unimount"`, and the root `mount` should be the
+  transport-picking facade once there is more than one transport to pick.
+- `pnpm test:mount` runs the Tier-2 suite (root, `TMPDIR` redirected so root's
+  vitest caches do not accumulate in `/tmp`):
+  `sudo env TMPDIR=… UV_THREADPOOL_SIZE=32 "$(which node)" node_modules/vitest/vitest.mjs run test/fuse/mount.test.ts`.
+  `test/fuse/mount.test.ts` skips itself when not root, so `pnpm test` stays
+  green for everyone.
+
+How it works, and the parts that are load-bearing:
+
+- **Mounting is `mount(8)`.** `openSync('/dev/fuse')`, then
+  `mount -i -t fuse -o fd=N,rootmode=…,user_id=…,group_id=…,default_permissions <fsname> <mountpoint>`
+  with the fd placed **at its own number** in the child's stdio array (it is
+  ~17, never 3). `rootmode` is octal and comes from the driver's root `stat`.
+  The source argument is the `fsname` (default `unimount`); `subtype=x` in the
+  options — not `-t fuse.x`, which only works because libmount splits it back
+  apart — is what makes `/proc/mounts` say `fuse.x`. Both are rejected if they
+  contain a comma or an equals sign, which would inject mount options.
+- **The loop:** K reads (`readers`, default 2) outstanding on the fd, each
+  completion dispatched into `session.handleMessage` **without** awaiting, the
+  buffer re-armed as soon as that call returns. That is safe because the
+  session decodes (and copies) everything before its first `await` — a contract
+  with its own non-root test. One preallocated buffer per reader, sized
+  `max_write + 4 KiB`. Replies are written with **`writeSync`**: a write to
+  `/dev/fuse` never blocks, and every `fs.write` would take a threadpool thread
+  away from the readers and the driver.
+- **The threadpool is the whole concurrency story** until relay mode exists.
+  Each outstanding read parks one of `UV_THREADPOOL_SIZE` (4) threads, and so
+  does every `fs` call the driver makes. Worse, a process that is _also a
+  client_ of its own mount parks a thread per in-flight operation: reach the
+  pool limit and it wedges (main thread idle in `epoll_wait`, every pool thread
+  in `request_wait_answer`). `fs.rm(dir, { recursive: true })` alone does it on
+  a 200-entry tree. Documented at the top of `mount.ts`; the mount tests obey
+  it by deleting sequentially.
+- **Teardown, both directions.** `unmount()` spawns `umount(8)` (root only, so
+  `fusermount3 -u` is the unprivileged milestone's problem, not a fallback here)
+  and then waits for the loop: the kernel aborts the connection, every read
+  returns `ENODEV`, and only then does the transport call `session.destroy()`,
+  drain the outstanding reads and close the fd — closing it under a parked read
+  would leave callbacks pointing at a reusable fd number. Someone else's
+  `umount` arrives at the same place from the other end. `unmount()` is
+  idempotent, concurrency-safe and retryable after a failure;
+  `SIGINT`/`SIGTERM` handlers (one pair per process, removed with the last
+  mount, so a second Ctrl-C kills) unmount everything, `console.error` whatever
+  failed, and re-raise.
+- **Teardown has a deadline** (`unmountTimeout`, default 10 s), because every
+  step of it waits on a driver that may have stopped answering: `umount(8)`
+  quiesces the filesystem first, so an unanswered request blocks it in `D`
+  state and `unmount()` with it. On expiry the connection is forced down with
+  **`umount -f`** — and that is the one that works. Closing the fd aborts a
+  connection _only when no read is outstanding_: a parked `read(2)` holds a
+  reference to the open file, so `fuse_dev_release` never runs (verified: still
+  mounted two seconds after the close, `umount` still blocked). `umount -f`
+  goes in the other end, `fuse_umount_begin` → `fuse_abort_conn`, failing every
+  request in flight, after which the parked reads return `ENODEV` and the
+  normal path finishes. Its exit status lies while another `umount` races it
+  ("target is busy", status 32, mount gone anyway) — believe `/proc/self/mounts`.
+  `umount -l` is the last resort for a table entry that outlives the abort.
+- **Mounting over a live mountpoint is refused**, in both directions (this
+  process's own mounts, and a FUSE mount in `/proc/self/mounts`). Linux stacks
+  mounts happily, and then `umount` detaches the _top_ one — so the second
+  mount's teardown kills the first mount's connection and then waits forever
+  for its own.
+- **Crash safety:** the connection dies with the last reference to the fd, so a
+  killed process leaves a mountpoint that answers `ENOTCONN`, not one that
+  hangs. Nothing else may hold that fd — it is `O_CLOEXEC` and goes to exactly
+  one child, `mount(8)`. Without `fusermount3` there is no `-o auto_unmount`,
+  so the stale mount table entry does survive: `sudo umount -l <mountpoint>`.
+- **`process.exit()` does not work with a mount up.** Node's exit path joins the
+  threadpool and the K reads are parked in it (measured: 25 s and still going,
+  needed a `SIGKILL`). `await unmount()` and set `process.exitCode`; the signal
+  handlers re-raise the signal for exactly this reason.
+- **Errno conventions on the wire:** `ENOENT` from a reply write means the
+  request was interrupted — drop it. `ENODEV` (either direction) means
+  unmounted → tear down. `EINTR`/`EAGAIN`/`ENOENT` on a read → re-arm.
+- **`/sys/fs/fuse/connections` is empty in this container**, so the fusectl
+  `abort` file is not an option here even though it is the documented one.
