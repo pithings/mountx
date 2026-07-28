@@ -12,6 +12,20 @@ drawn from. See `AGENTS.md` for the current code map and invariants, and
 `.agents/conformance-matrix.md` / `.agents/benchmarks.md` for the generated
 results.
 
+## Shipped since v1
+
+- **Unprivileged FUSE mounting** (2026-07-28). `mount()` picks its path by
+  uid; non-root goes through `fusermount3`, whose `SCM_RIGHTS` reply is
+  received by a ~7 KB Zig Node-API addon in `native/` — three functions,
+  the only native code in the repository, lazily loaded and never on the
+  root path. `pnpm test:rootless` is the Tier-2 column that needs no sudo.
+  What was _not_ done, deliberately: no user-namespace mode (a mount made
+  in one is invisible outside its mount namespace, so it serves "mount for
+  my own process tree" and not much else), and no setuid binary of our own
+  (it would mean reimplementing `fusermount3`'s security model — ownership
+  checks, `allow_other` gating, `fuse.conf`, mtab — in a binary running as
+  root, to save one package dependency).
+
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
@@ -25,7 +39,9 @@ results.
   `mount(8)` spawn is the primary v1 mount path. A small zig-based
   binary/N-API stub for native parts (unprivileged mounting) IS allowed when
   needed (per Pooya, 2026-07-27), but only after the pure-JS path works and
-  is tested.
+  is tested. **Done** — see "Shipped since v1". The rule that survives it:
+  native code is allowed only where JS genuinely cannot reach, it stays off
+  the path that already works, and it is never required to install.
 - **Subagent models:** implementation work SHOULD use `opus`; docs work
   SHOULD use `sonnet`.
 
@@ -34,9 +50,6 @@ results.
 Nothing here blocks v1; each is a real gap worth picking up deliberately
 rather than by accident.
 
-- **Unprivileged mounting stub** (`zig cc`, exec or relay mode — see
-  `IDEA.md`). This host has no `fusermount3`/`fusermount`, so all v1 Tier-2
-  tests run under sudo; the stub is what removes that requirement.
 - **Relay mode and sync-driver-in-worker-threads concurrency modes.** v1
   ships async main-thread mode only. Relay would take `/dev/fuse` off the
   libuv threadpool entirely (removing the self-client hazard); sync-worker

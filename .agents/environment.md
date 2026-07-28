@@ -38,10 +38,29 @@
     also unwedges (process resumes with ENOTCONN).
   - After `kill -9` (no parked-read holder left), a PLAIN `umount` clears
     the stale entry.
-- **No `fusermount3` or `fusermount` installed** — unprivileged mounting is
-  impossible on this host until the stub exists. All Tier-2 tests must run
-  via sudo; gate/skip them when not root.
-- Toolchain: Node v24.18.0, pnpm 11.17.0, zig + gcc/clang available.
+- **`fusermount3` is installed** (`dnf install fuse3`, fuse3-3.18.2, verified
+  2026-07-28). It is `-rwsr-xr-x root root`, `/` is not `nosuid`, and the
+  container's `CapBnd` includes `cap_sys_admin` + `cap_setuid` — all three are
+  needed for a setuid helper to actually be able to mount, and a container
+  missing any of them would fail in a confusing way. **Unprivileged mounting
+  works here**: `pnpm test:rootless` mounts, uses and unmounts as `dev`.
+  Tier-2 FUSE suites other than `mount-rootless.test.ts` still need sudo.
+- `/etc/fuse.conf` exists with `user_allow_other` **commented out** (the
+  distribution default), so `{ allowOther: true }` is refused for unprivileged
+  mounts. That refusal is asserted by the rootless suite, which skips the
+  assertion if a host has enabled the line.
+- **Rootless leak recovery:** `fusermount3 -u <mnt>`, or `-u -z` for the
+  detach-now form. `umount -f` and `/sys/fs/fuse/connections/<n>/abort` are
+  root-only, so a wedged unprivileged mount has no equivalent of the abort —
+  after a `kill -9` (no parked-read holder left) a plain `fusermount3 -u`
+  clears it.
+- Toolchain: Node v24.18.0, pnpm 11.17.0, zig 0.16.0 (via zvm) + gcc/clang.
+  Zig 0.16 notes for `native/build.zig`: the errno helper is
+  `std.os.linux.errno(rc)`, not `E.init(rc)`; and passing
+  `preferred_optimize_mode` to `standardOptimizeOption` swaps `-Doptimize` for
+  a `-Drelease` bool, which is why the build hardcodes `ReleaseSmall` instead.
+  Node ships no headers in an fnm install, hence the transcribed
+  `native/src/napi.zig`.
 - Tests: vitest. Lint/format: oxlint + oxfmt. Build: obuild.
   Typecheck: `tsgo --noEmit --skipLibCheck`. Run `pnpm test` before commits.
 - **No NFS client on this host:** no `mount.nfs`/`mount.nfs4` anywhere on

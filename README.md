@@ -103,10 +103,10 @@ await using mounted = await mount(createMemoryDriver(), "/mnt/point");
 await new Promise(() => {});
 ```
 
-Run it with `sudo` (see below for why):
+Run it:
 
 ```sh
-sudo node serve.ts
+node serve.ts
 ```
 
 Then, **from another terminal**:
@@ -121,14 +121,22 @@ Press Ctrl-C in the first terminal and the folder disappears. `await using`
 unmounts when the block ends; you can also call `await mounted.unmount()`
 yourself.
 
-**Why sudo?** Mounting is a syscall Node cannot make on its own, so mountx asks
-`mount(8)` to do it, and that needs root. mountx has no unprivileged option yet.
+**Do I need root?** No, as long as `fusermount3` is installed — it is the
+setuid helper that ships with FUSE, and it is already there on most desktop
+Linux (`apt install fuse3` / `dnf install fuse3` otherwise). Mounting is a
+syscall Node cannot make on its own, so mountx asks `fusermount3` to make it
+and hand the connection back. If you are root, it skips the helper and uses
+`mount(8)` directly.
+
+Two things an unprivileged mount cannot do: `allowOther` needs
+`user_allow_other` in `/etc/fuse.conf`, and forcing down a mount whose driver
+has stopped answering is weaker (there is no `umount -f` without root).
 
 **If a process dies without unmounting**, the folder is left stale rather than
 frozen — `ls` says `ENOTCONN` instead of hanging. Clean it up with:
 
 ```sh
-sudo umount -l /mnt/point
+fusermount3 -u /mnt/point   # or, as root: umount -l /mnt/point
 ```
 
 **Want to poke at one without writing it?** The repository ships a playground —
@@ -342,17 +350,20 @@ name, so that exports your driver to anything that can reach the port.
 
 ### Which one should I use?
 
-| transport | `mount…()` runs on | serves to                     | native code | root to mount | what you lose         |
-| --------- | ------------------ | ----------------------------- | ----------- | ------------- | --------------------- |
-| **FUSE**  | Linux              | the local kernel              | none        | yes           | nothing               |
-| **NFSv3** | Linux, macOS       | anything with an NFSv3 client | none        | yes           | `handles` (see below) |
+| transport | `mount…()` runs on | serves to                     | root to mount          | what you lose         |
+| --------- | ------------------ | ----------------------------- | ---------------------- | --------------------- |
+| **FUSE**  | Linux              | the local kernel              | no, with `fusermount3` | nothing               |
+| **NFSv3** | Linux, macOS       | anything with an NFSv3 client | yes                    | `handles` (see below) |
 
-Neither needs native code — that is a design rule of this project. And
+Serving needs no native code at all — the protocols are pure JS, which is a
+design rule of this project. The one exception is a ~7 KB helper used only to
+receive the mount connection from `fusermount3`; it ships prebuilt, is loaded
+only when you mount without root, and nothing else in the library touches it.
 `createNfsServer()` runs anywhere Node does, including Windows: only putting a
 _client_ in front of it is platform-specific.
 
-**Use FUSE** when you are on Linux and have root: you get real `open`/`release`
-state, control over kernel caching, and every errno passes through untouched.
+**Use FUSE** when you are on Linux: you get real `open`/`release` state,
+control over kernel caching, and every errno passes through untouched.
 
 **Use NFSv3** when you need a mount from something that is not
 Linux-with-`/dev/fuse` — macOS, most obviously — or when FUSE is unavailable. The trade-off is that
@@ -430,8 +441,9 @@ Both take inode numbers as `bigint`. They are FUSE-only.
 
 Each of these is documented in full where the code lives.
 
-- **Root is required currently.** Both `mount()` and `mountNfs()` must run as root.
-  There is no unprivileged path yet.
+- **`mountNfs()` still requires root**, and so does `mount()` on a host with no
+  `fusermount3`. Serving never does — only attaching the mount to the
+  filesystem.
 - **Do not use your own mount from the process serving it.** A synchronous `fs`
   call against your own mountpoint deadlocks. Enough concurrent _async_ calls
   (for example `fs.rm(dir, { recursive: true })` over a few hundred entries) use
@@ -443,7 +455,8 @@ Each of these is documented in full where the code lives.
   Instead `await mounted.unmount()` and set `process.exitCode`. (This is also
   why the built-in signal handlers unmount and then re-raise the signal.)
 - **A crashed process leaves a stale mount entry**, not a frozen one. `ls`
-  answers `ENOTCONN`. Recover with `sudo umount -l <mountpoint>`.
+  answers `ENOTCONN`. Recover with `fusermount3 -u <mountpoint>`, or
+  `sudo umount -l <mountpoint>` if you mounted as root.
 
 ## How well does it work?
 
@@ -499,7 +512,10 @@ portable, and that file has the full tables and caveats.
 - `sudo "$(command -v node)" playground/index.ts` mounts the playground
   (`playground/index.ts`) and logs every driver call it serves
 - `pnpm test` runs lint, typecheck and the suites that need no root;
-  `pnpm test:root` adds the real-mount suites under `sudo`.
+  `pnpm test:rootless` adds the unprivileged real-mount suite (still no
+  `sudo`); `pnpm test:root` adds the ones that do need it.
+- `pnpm build:native` rebuilds the prebuilt FUSE mount helper with `zig build`.
+  The output is committed, so this is only needed when `native/` changes.
 - `pnpm matrix` and `pnpm bench` / `pnpm bench:root` regenerate the two
   committed reports this README draws from
   (`.agents/conformance-matrix.md`, `.agents/benchmarks.md`).
