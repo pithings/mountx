@@ -24,7 +24,7 @@ import {
   NFSPROC3_GETATTR,
   NFSPROC3_LOOKUP,
   NFSPROC3_NULL,
-} from "../../src/nfs/constants.ts";
+} from "../../../src/nfs/v3/constants.ts";
 import {
   authSys,
   decodeCall,
@@ -32,7 +32,7 @@ import {
   encodeAuthError,
   encodeCall,
   frameRecord,
-} from "../../src/nfs/rpc.ts";
+} from "../../../src/nfs/rpc.ts";
 import {
   readGetattrRes,
   writeDirOp,
@@ -41,8 +41,8 @@ import {
   writeMountRes,
   writeWccRes,
   type Fattr3,
-} from "../../src/nfs/protocol.ts";
-import { decodeXdr, encodeXdr } from "../../src/nfs/xdr.ts";
+} from "../../../src/nfs/v3/protocol.ts";
+import { decodeXdr, encodeXdr } from "../../../src/nfs/xdr.ts";
 
 /** Bytes as lowercase hex, in 4-byte words, for a readable diff. */
 function hex(bytes: Uint8Array): string {

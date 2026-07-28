@@ -5,7 +5,7 @@
  *   at all. The ceiling: whatever the FUSE and NFS columns cost, they cost it
  *   *on top of* this.
  * - **NFS**: the same scenarios over a real TCP socket to `createNfsServer`,
- *   driven by the JS client in `test/nfs/client.ts`. Note what that is and is
+ *   driven by the JS client in `test/nfs/v3/client.ts`. Note what that is and is
  *   not: protocol encode/decode plus a loopback socket round trip, measured
  *   with a client in the same process. A kernel NFS client would add its own
  *   caching (which would make several of these numbers much better) and its own
@@ -18,7 +18,7 @@
 import { createMemoryDriver } from "../src/drivers/memory.ts";
 import { createLoopback } from "../src/harness.ts";
 import { createNfsServer } from "../src/nfs/server.ts";
-import { check, NfsClient, nfsDriver } from "../test/nfs/client.ts";
+import { check, NfsClient, nfsDriver } from "../test/nfs/v3/client.ts";
 import { report, type Measurement } from "./harness.ts";
 import { FULL, runScenarios } from "./scenarios.ts";
 

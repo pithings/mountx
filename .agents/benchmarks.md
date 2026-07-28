@@ -51,7 +51,7 @@ the client code is identical; the difference between columns is transport.
   removes the hazard instead of tiptoeing around it, and it is the shape a real
   workload has.
 - **NFSv3** — the server over a real TCP socket, driven by the JS client in
-  `test/nfs/client.ts`. **This is protocol + TCP overhead, not kernel-client
+  `test/nfs/v3/client.ts`. **This is protocol + TCP overhead, not kernel-client
   overhead.** This host has no NFS client at all (`.agents/environment.md`), so
   there is no way to measure the thing a user would actually mount; a kernel
   client would add its own attribute and page caching — which would make several
@@ -293,7 +293,7 @@ result, because the two share nothing but the driver interface. Where it looks
 much worse is anything path-shaped: `stat walk` is 3,571 stats/s against FUSE's
 33,813, and `ls -l` is 4,980 entries/s against 27,246. That is not the protocol
 being slow, it is the **absence of a kernel client**: NFS has no path resolution
-on the wire, so `test/nfs/client.ts` walks every component with its own `LOOKUP`s
+on the wire, so `test/nfs/v3/client.ts` walks every component with its own `LOOKUP`s
 and repeats the walk for every operation, where a real client would have a dentry
 cache. Read the four core rows as the server's cost and the path-shaped rows as
 an artifact of the test client. Throughput (365 MiB/s read, 308 MiB/s write in

@@ -6,11 +6,11 @@ One conformance suite (`test/conformance.ts`), written against the driver interf
 
 Generated 2026-07-28 with `pnpm matrix`.
 
-| Column       | What it runs                                                                                      | Result                                                                                                       |
-| ------------ | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| **loopback** | `test/drivers.test.ts` — the driver behind `createLoopback`, no transport                         | 235 passed, 17 skipped (4 targets: memory; node-fs; unstorage; node:fs/promises (raw))                       |
-| **FUSE**     | `test/fuse/conformance-mount.test.ts` — a real kernel mount, `node:fs` as the client              | 126 passed, 0 skipped (2 targets: memory driver, through a FUSE mount; node-fs driver, through a FUSE mount) |
-| **NFS**      | `test/nfs/conformance.test.ts` — NFSv3 over a TCP socket, the JS client from `test/nfs/client.ts` | 122 passed, 4 skipped (2 targets: memory driver, over NFS; node-fs driver, over NFS)                         |
+| Column       | What it runs                                                                                            | Result                                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **loopback** | `test/drivers.test.ts` — the driver behind `createLoopback`, no transport                               | 235 passed, 17 skipped (4 targets: memory; node-fs; unstorage; node:fs/promises (raw))                       |
+| **FUSE**     | `test/fuse/conformance-mount.test.ts` — a real kernel mount, `node:fs` as the client                    | 126 passed, 0 skipped (2 targets: memory driver, through a FUSE mount; node-fs driver, through a FUSE mount) |
+| **NFS**      | `test/nfs/v3/conformance.test.ts` — NFSv3 over a TCP socket, the JS client from `test/nfs/v3/client.ts` | 122 passed, 4 skipped (2 targets: memory driver, over NFS; node-fs driver, over NFS)                         |
 
 ## Capability loss
 

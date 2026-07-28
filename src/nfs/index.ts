@@ -9,12 +9,13 @@
  *   that only ever throw `XdrError`.
  * - `rpc.ts` — ONC RPC v2 (RFC 5531): calls, replies, auth, and TCP record
  *   marking, encoded *and* decoded.
- * - `constants.ts` / `protocol.ts` — RFC 1813 transcribed: every NFSv3 and
- *   MOUNTv3 struct, both directions.
+ * - `v3/constants.ts` / `v3/protocol.ts` — RFC 1813 transcribed: every NFSv3
+ *   and MOUNTv3 struct, both directions.
  * - `handles.ts` — the file handle table and the readdir cookie scheme, which
  *   is the state a stateless protocol still needs.
- * - `session.ts` — bytes in, bytes out: both programs over a driver, with no
- *   socket anywhere.
+ * - `v3/session.ts` — bytes in, bytes out: both programs over a driver, with no
+ *   socket anywhere. `session.ts` is the router in front of it, which picks the
+ *   version a record names and hands the bytes on unchanged.
  * - `server.ts` — the socket, and `mount.ts` — `mount(8)`.
  *
  * Everything except the last two runs on any OS with no privileges, which is
@@ -22,7 +23,7 @@
  * codecs.
  */
 
-export * from "./constants.ts";
+export * from "./v3/constants.ts";
 export * from "./handles.ts";
 // Everything from `mount.ts` **except** `parseMountTable`/`mountEntryAt`/
 // `MountEntry`, which are the platform's mount-table format rather than
@@ -126,7 +127,7 @@ export {
   writeWccRes,
   writeWriteArgs,
   writeWriteRes,
-} from "./protocol.ts";
+} from "./v3/protocol.ts";
 export type {
   Access3args,
   Access3res,
@@ -170,7 +171,7 @@ export type {
   WccRes,
   Write3args,
   Write3res,
-} from "./protocol.ts";
+} from "./v3/protocol.ts";
 export * from "./rpc.ts";
 export * from "./server.ts";
 export * from "./session.ts";

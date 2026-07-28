@@ -19,7 +19,7 @@ import {
   RPC_GARBAGE_ARGS,
   RPC_SUCCESS,
   RPC_VERSION,
-} from "../../src/nfs/constants.ts";
+} from "../../src/nfs/v3/constants.ts";
 import {
   authSys,
   credentialsOf,

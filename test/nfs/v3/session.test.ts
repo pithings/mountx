@@ -12,7 +12,7 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
-import { createMemoryDriver } from "../../src/drivers/memory.ts";
+import { createMemoryDriver } from "../../../src/drivers/memory.ts";
 import {
   ACCESS3_LOOKUP,
   ACCESS3_MODIFY,
@@ -52,12 +52,12 @@ import {
   RPC_PROC_UNAVAIL,
   RPC_PROG_MISMATCH,
   RPC_PROG_UNAVAIL,
-} from "../../src/nfs/constants.ts";
-import { decodeReply, encodeCall, frameFragments } from "../../src/nfs/rpc.ts";
-import { createNfsServer, type NfsServer } from "../../src/nfs/server.ts";
-import type { FsDriver } from "../../src/types.ts";
+} from "../../../src/nfs/v3/constants.ts";
+import { decodeReply, encodeCall, frameFragments } from "../../../src/nfs/rpc.ts";
+import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
+import type { FsDriver } from "../../../src/types.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
-import { createLoopback, type Loopback } from "../../src/harness.ts";
+import { createLoopback, type Loopback } from "../../../src/harness.ts";
 
 const encoder = new TextEncoder();
 

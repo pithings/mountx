@@ -30,7 +30,7 @@ import {
   RPC_REPLY,
   RPC_SUCCESS,
   RPC_VERSION,
-} from "./constants.ts";
+} from "./v3/constants.ts";
 import { XdrError, XdrReader, XdrWriter } from "./xdr.ts";
 
 // ---------------------------------------------------------------------------

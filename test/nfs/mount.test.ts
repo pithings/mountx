@@ -13,7 +13,7 @@
  * `mkdtemp` gives us. Neither the client nor the helper is something this
  * project can provide, and the dev container it was written in has neither
  * (see `.agents/environment.md`), which is exactly why the Tier-1 column
- * exists: `test/nfs/conformance.test.ts` runs the same protocol end to end
+ * exists: `test/nfs/v3/conformance.test.ts` runs the same protocol end to end
  * with a JavaScript client and needs nothing at all.
  *
  * Written to run on both hosts. The pure half of the platform difference —

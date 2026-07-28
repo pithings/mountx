@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { NFS3_COOKIEVERFSIZE } from "../../src/nfs/constants.ts";
+import { NFS3_COOKIEVERFSIZE } from "../../src/nfs/v3/constants.ts";
 import {
   cookieVerifier,
   DirectorySnapshots,
