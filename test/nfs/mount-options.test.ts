@@ -13,7 +13,13 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { nfsClientProbe, nfsMountOptions, parseMountTable } from "../../src/nfs/mount.ts";
+import {
+  consentAdvice,
+  isConsentDenial,
+  nfsClientProbe,
+  nfsMountOptions,
+  parseMountTable,
+} from "../../src/nfs/mount.ts";
 
 /** The option string as `key` → `value`, with valueless options mapped to `""`. */
 function options(text: string): Map<string, string> {
@@ -147,6 +153,38 @@ describe("parseMountTable", () => {
   it("ignores lines that are not entries", () => {
     expect(parseMountTable("darwin", "\nmount: something went wrong\n")).toEqual([]);
     expect(parseMountTable("linux", "\n\n")).toEqual([]);
+  });
+});
+
+describe("isConsentDenial", () => {
+  // The exact line `umount(8)` prints when macOS refuses at the consent gate,
+  // observed on 26.6 with the mount still listed afterwards.
+  const refusal = "umount: unmount(/private/tmp/mountx/mnt): Operation not permitted";
+
+  it("recognizes macOS refusing a network volume", () => {
+    expect(isConsentDenial("darwin", refusal)).toBe(true);
+  });
+
+  it("is macOS-only: the same words mean something else on Linux", () => {
+    // Linux prints `EPERM` when a non-root caller tries to unmount at all,
+    // which is a different problem with a different fix.
+    expect(isConsentDenial("linux", refusal)).toBe(false);
+  });
+
+  it("does not claim a busy mountpoint is a consent problem", () => {
+    expect(isConsentDenial("darwin", "umount: unmount(/mnt): Resource busy")).toBe(false);
+    expect(isConsentDenial("darwin", "")).toBe(false);
+  });
+});
+
+describe("consentAdvice", () => {
+  it("names the grant, not a command that fails the same way", () => {
+    const advice = consentAdvice("/private/tmp/mountx/mnt");
+    expect(advice).toContain("Full Disk Access");
+    // The whole point: `umount -f` is not the way out of this one, and the
+    // advice has to say so rather than recommend it.
+    expect(advice).toContain("fails the same way");
+    expect(advice).toContain("/private/tmp/mountx/mnt");
   });
 });
 

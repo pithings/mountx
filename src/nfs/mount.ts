@@ -34,7 +34,14 @@
  *   Apple's `mount_nfs(8)`, which documents `soft` and no counterpart). Adding
  *   `nobrowse` keeps Finder and Spotlight from crawling the driver.
  * - **The escalation ladder.** macOS has `umount -f` but no `umount -l`, so
- *   the lazy step — and the advice to run it — is Linux-only.
+ *   the lazy step — and the advice to run it — is Linux-only. It is also
+ *   weaker than it looks: macOS puts network volumes behind a sandbox approval
+ *   the user has to have granted in advance (Full Disk Access for whatever app
+ *   the process is attributed to), and an ungranted process gets a `umount`
+ *   that never returns or a `umount -f` that fails with `EPERM` — no prompt is
+ *   ever shown. There is no escalation past that, so the transport bounds both
+ *   steps, names the gate when it sees it ({@link isConsentDenial},
+ *   {@link consentAdvice}), and says plainly that the mount survived.
  *
  * Windows is neither: no NFS client worth the name, and no `mount(8)`.
  *
@@ -359,14 +366,20 @@ interface SpawnResult {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  /** The deadline passed with the child still running. See {@link run}. */
+  timedOut: boolean;
 }
 
 /**
  * Run a command and collect both its streams.
  *
- * `timeout` kills the child rather than rejecting, so the caller sees the
- * ordinary "died on a signal" result and decides what that means. Only the
- * mount-table read uses it; `mount`/`umount` are under the caller's deadline.
+ * `timeout` **settles** the promise rather than rejecting or waiting for the
+ * child, and this is the part that matters: a `umount(8)` blocked inside the
+ * kernel does not die on `SIGKILL`, so a run that waited for `close` would
+ * never return and a caller that moved on without one would leave a child
+ * behind, still holding the very mount the caller is about to escalate
+ * against. The kill is sent because usually it works; the result is reported
+ * either way, with `timedOut` saying which happened.
  */
 function run(command: string, args: readonly string[], timeout?: number): Promise<SpawnResult> {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -382,7 +395,23 @@ function run(command: string, args: readonly string[], timeout?: number): Promis
       stderr += chunk;
     });
     const timer =
-      timeout === undefined ? undefined : setTimeout(() => child.kill("SIGKILL"), timeout);
+      timeout === undefined
+        ? undefined
+        : setTimeout(() => {
+            child.kill("SIGKILL");
+            // Let go of it completely: an unkillable child must not keep this
+            // process's event loop alive after the caller has given up on it.
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            child.unref();
+            resolvePromise({
+              status: null,
+              signal: null,
+              stdout,
+              stderr: stderr.trim(),
+              timedOut: true,
+            });
+          }, timeout);
     timer?.unref();
     child.once("error", (error) => {
       clearTimeout(timer);
@@ -390,14 +419,51 @@ function run(command: string, args: readonly string[], timeout?: number): Promis
     });
     child.once("close", (status, signal) => {
       clearTimeout(timer);
-      resolvePromise({ status, signal, stdout, stderr: stderr.trim() });
+      resolvePromise({ status, signal, stdout, stderr: stderr.trim(), timedOut: false });
     });
   });
 }
 
 function describe(command: string, result: SpawnResult): string {
-  const how = result.signal === null ? `exit ${result.status}` : `signal ${result.signal}`;
+  const how = result.timedOut
+    ? "no answer before the deadline, still running"
+    : result.signal === null
+      ? `exit ${result.status}`
+      : `signal ${result.signal}`;
   return result.stderr === "" ? `${command}: ${how}` : `${command}: ${how}: ${result.stderr}`;
+}
+
+/**
+ * Does this `umount(8)` failure look like macOS refusing at its consent gate?
+ *
+ * macOS puts access to *network volumes* — which is what an NFS mount is,
+ * loopback or not — behind a sandbox approval, and both `vnode_check_open` and
+ * `mount_check_umount` go through it (witnessed on 26.6: the kernel stack of a
+ * hung `umount` is `hook_mount_check_umount` → `approval_solicit` →
+ * `__WAITING_ON_APPROVAL_FROM_SANDBOXD__`). A process the user has not granted
+ * that access gets one of two answers, and this recognizes the second:
+ *
+ * - attributed to a GUI app, the call blocks waiting for an approval that is
+ *   never solicited on screen — so `umount` simply never returns;
+ * - attributed to nothing (launchd, a CI agent), it is refused outright with
+ *   `EPERM`, which `umount(8)` prints as "Operation not permitted".
+ *
+ * Pure, and exported for the Tier-0 test: the host that can check this is not
+ * the host that can reproduce it.
+ */
+export function isConsentDenial(platform: NfsPlatform, stderr: string): boolean {
+  return platform === "darwin" && /operation not permitted/i.test(stderr);
+}
+
+/** What to do about a mount macOS will not let this process take down. */
+export function consentAdvice(mountpoint: string): string {
+  return (
+    `macOS gates network volumes behind a sandbox approval and shows no prompt for a ` +
+    `command-line process, so this is a grant that has to be made in advance: give the app ` +
+    `that runs this process — your terminal, or the CI agent — Full Disk Access under System ` +
+    `Settings → Privacy & Security, then retry. Until then \`sudo umount -f ${mountpoint}\` ` +
+    `fails the same way and a reboot is the only other way out.`
+  );
 }
 
 /** A mount option that must be a non-negative integer, whatever was passed. */
@@ -561,15 +627,18 @@ class NfsMountImpl implements NfsMount {
    */
   async #unmount(): Promise<void> {
     const timeout = this.#options.unmountTimeout ?? 10_000;
+    const bounded = Number.isFinite(timeout) && timeout > 0;
     let failure: unknown;
-    const steps = this.#unmountSteps().then(
-      () => "done" as const,
+    // Bounded, `umount(8)` gets the whole deadline: the race below is what
+    // covers the mount-table reads around it, not the unmount itself.
+    const steps = this.#unmountSteps(bounded ? timeout : undefined).then(
+      (outcome) => outcome,
       (error: unknown) => {
         failure = error;
         return "failed" as const;
       },
     );
-    if (!Number.isFinite(timeout) || timeout <= 0) {
+    if (!bounded) {
       if ((await steps) === "failed") {
         // Deliberately *not* finished: the mount is still live, so the server
         // has to keep answering it or every process touching the mountpoint
@@ -586,7 +655,9 @@ class NfsMountImpl implements NfsMount {
     });
     const outcome = await Promise.race([steps, expiry]);
     clearTimeout(timer);
-    if (outcome === "expired") {
+    // "timeout" is the same situation as "expired", reached the better way:
+    // `umount(8)` never answered and is no longer running on our behalf.
+    if (outcome === "expired" || outcome === "timeout") {
       await this.#force(timeout);
       return;
     }
@@ -598,33 +669,51 @@ class NfsMountImpl implements NfsMount {
     await this.#finish();
   }
 
-  async #unmountSteps(): Promise<void> {
+  /**
+   * `umount(8)`, under `deadline`. `"timeout"` means it never answered — the
+   * caller escalates; anything genuinely wrong throws.
+   */
+  async #unmountSteps(deadline: number | undefined): Promise<"done" | "timeout"> {
     if ((await this.#mounted()) === false) {
       // Someone else already unmounted us.
-      return;
+      return "done";
     }
     let result: SpawnResult;
     try {
-      result = await run("umount", [this.mountpoint]);
+      result = await run("umount", [this.mountpoint], deadline);
     } catch (error) {
       throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
+    }
+    if (result.timedOut) {
+      return "timeout";
     }
     // A failure that raced an external unmount is not a failure. A table that
     // will not say is not that race: the mount is presumed live.
     if (result.status === 0 || (await this.#mounted()) === false) {
-      return;
+      return "done";
     }
     throw new Error(
       `mountx: could not unmount ${this.mountpoint} (${describe("umount", result)}). ` +
-        `The mount is still live. ${this.#stuckAdvice()}`,
+        `The mount is still live. ${this.#stuckAdvice(result.stderr)}`,
     );
   }
 
-  /** How to get rid of a mount this process could not, on this host. */
-  #stuckAdvice(): string {
+  /**
+   * How to get rid of a mount this process could not, on this host.
+   *
+   * `stderr` is the failed `umount(8)`'s, and on macOS it decides the answer:
+   * "Operation not permitted" is the consent gate rather than a busy
+   * mountpoint, and every piece of the usual advice is wrong for it — no
+   * process is holding the mount, and `umount -f` fails identically.
+   */
+  #stuckAdvice(stderr = ""): string {
+    if (isConsentDenial(this.#platform, stderr)) {
+      return consentAdvice(this.mountpoint);
+    }
     return this.#platform === "darwin"
       ? `If a process is holding it, \`lsof ${this.mountpoint}\` will say which; ` +
-          `\`sudo umount -f ${this.mountpoint}\` detaches it regardless.`
+          `\`sudo umount -f ${this.mountpoint}\` detaches it unless macOS refuses that too ` +
+          `(see \`consentAdvice\`).`
       : `If a process is holding it, \`fuser -m ${this.mountpoint}\` will say which; ` +
           `\`sudo umount -l ${this.mountpoint}\` detaches it regardless.`;
   }
@@ -638,34 +727,52 @@ class NfsMountImpl implements NfsMount {
    * The exit statuses are not believed; the mount table is.
    */
   async #force(timeout: number): Promise<void> {
-    const lazy = this.#platform === "darwin" ? "-f" : "-l";
+    const darwin = this.#platform === "darwin";
+    const lazy = darwin ? "-f" : "-l";
     const error = new Error(
       `mountx: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
-        `driver has probably stopped answering. The mount has been forced down, so anything ` +
-        `in flight was lost. If the mountpoint is somehow still listed: ` +
-        `sudo umount ${lazy} ${this.mountpoint}`,
+        `driver has probably stopped answering.` +
+        (darwin
+          ? ` On macOS a \`umount\` that never answers is also what the network-volume ` +
+            `consent gate looks like; the forcing below is what tells the two apart.`
+          : "") +
+        ` The mount has been forced down, so anything in flight was lost. If the mountpoint ` +
+        `is somehow still listed: sudo umount ${lazy} ${this.mountpoint}`,
     );
     this.#options.onTransportError?.(error, undefined);
-    const ladder =
-      this.#platform === "darwin"
-        ? [["-f", this.mountpoint]]
-        : [
-            ["-f", this.mountpoint],
-            ["-l", this.mountpoint],
-          ];
+    const ladder = darwin
+      ? [["-f", this.mountpoint]]
+      : [
+          ["-f", this.mountpoint],
+          ["-l", this.mountpoint],
+        ];
+    let denied: SpawnResult | undefined;
     for (const args of ladder) {
       // Only a table that says it is gone stops the ladder — see `isMounted`.
       if ((await this.#mounted()) === false) {
         break;
       }
-      await run("umount", args).catch(() => {
-        // Nothing to add: the mount table is the verdict.
-      });
+      // Bounded for the same reason the first `umount` is: a step that never
+      // returns must not outlive the ladder it is a step of.
+      const result = await run("umount", args, timeout).catch(() => undefined);
+      if (result !== undefined && isConsentDenial(this.#platform, result.stderr)) {
+        denied = result;
+      }
     }
     // Dropping the connections is itself a way out — a `soft` mount gives up
     // once the server stops answering — so the server goes down either way.
     await this.#finish();
     await delay(0);
+    if (denied !== undefined) {
+      // Not a guess: `umount -f` said `EPERM` while the mount was plainly
+      // still listed, which is the one outcome the ladder cannot recover from.
+      throw new Error(
+        `mountx: ${this.mountpoint} could not be unmounted ` +
+          `(${describe("umount -f", denied)}), and the server behind it has been shut down — ` +
+          `the mountpoint is now a live mount with nothing answering it. ` +
+          consentAdvice(this.mountpoint),
+      );
+    }
     throw error;
   }
 
