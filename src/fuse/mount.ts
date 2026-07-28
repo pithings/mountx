@@ -50,6 +50,17 @@
  * makes the fd a socket and the whole problem disappears; it is a later
  * milestone. IDEA.md, "Concurrency".)
  *
+ * The third form has nothing to do with the threadpool and is the meanest of
+ * the three: **`child_process.spawn(…, { cwd })` with a `cwd` inside your own
+ * mountpoint deadlocks immediately**, before any of the child's work begins.
+ * `uv_spawn` forks, has the *child* `chdir` into `cwd` before it execs, and
+ * blocks the **parent's main thread** on a pipe until that exec happens — so
+ * the `LOOKUP` the `chdir` generates is waiting on the one thread that could
+ * answer it. It is not a race; it hangs every time, and `spawn` is
+ * asynchronous everywhere else, which is what makes it surprising. Move the
+ * `chdir` past the `exec` — `spawn("sh", ["-c", 'cd "$1" && exec …', "sh",
+ * mountpoint])` — or run the child from somewhere else entirely.
+ *
  * **Exiting: `await unmount()`, and do not reach for `process.exit()`.** Node's
  * exit path joins the threadpool, and a live mount always has K reads parked in
  * it, so `process.exit()` does not return — it hangs until the connection is
@@ -165,6 +176,21 @@ export interface MountOptions extends FuseSessionOptions {
   unmountTimeout?: number;
   /** The device to open. Default `"/dev/fuse"`; a test double is the only reason to change it. */
   device?: string;
+  /**
+   * Tee every byte that crosses `/dev/fuse`, in both directions. Off by default.
+   *
+   * `"in"` is one whole message as the kernel wrote it; `"out"` is one whole
+   * reply or notification as the loop is about to write it. Nothing is copied
+   * before the call, so the `Uint8Array` is a **view of a buffer that is reused
+   * the moment this returns** — a recorder has to copy what it keeps.
+   *
+   * This is the hook `record`/`replay` is built on (IDEA.md, "Tier 0"): the
+   * bytes here are exactly the ones a session has to be able to answer, which
+   * makes a transcript of a real kernel a fixture that needs no kernel to
+   * replay. Anything thrown is reported through {@link MountOptions.onTransportError}
+   * and costs nothing else — a broken recorder must not break a mountpoint.
+   */
+  tap?: (direction: "in" | "out", bytes: Uint8Array) => void;
   /** Called for transport-level failures (a read or write that is not part of teardown). */
   onTransportError?: (error: unknown) => void;
 }
@@ -696,6 +722,7 @@ class MountImpl implements Mount {
    */
   #dispatch(buffer: Buffer, length: number): void {
     const message = buffer.subarray(0, length);
+    this.#tap("in", message);
     let reply: Promise<Uint8Array | null>;
     try {
       /* v8 ignore next 4 -- `handleMessage` is documented never to throw; the
@@ -735,6 +762,7 @@ class MountImpl implements Mount {
    * which is teardown, not an error.
    */
   #write(bytes: Uint8Array): void {
+    this.#tap("out", bytes);
     while (!this.#stopping && this.#fd >= 0) {
       try {
         fs.writeSync(this.#fd, bytes, 0, bytes.length, null);
@@ -770,6 +798,19 @@ class MountImpl implements Mount {
 
   #report(error: unknown): void {
     this.#options.onTransportError?.(error);
+  }
+
+  /** Feed the recorder, if there is one. It is never allowed to cost a reply. */
+  #tap(direction: "in" | "out", bytes: Uint8Array): void {
+    const tap = this.#options.tap;
+    if (tap === undefined) {
+      return;
+    }
+    try {
+      tap(direction, bytes);
+    } catch (error) {
+      this.#report(error);
+    }
   }
 
   // ---------------------------------------------------------------------------

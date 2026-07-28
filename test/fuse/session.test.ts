@@ -184,6 +184,43 @@ describe("the full mount sequence", () => {
     expectHealthy(session);
   });
 
+  it("refuses a name longer than the NAME_MAX it advertises", async () => {
+    // The kernel does *not* filter these: `fuse_lookup_name` only rejects names
+    // over `FUSE_NAME_MAX` (1024) and leaves the real limit to the server. So a
+    // driver with no limit of its own — the in-memory one — would happily
+    // create a name that the same mount's `STATFS` calls impossible, and
+    // `chmod` on one would answer `ENOENT` instead of `ENAMETOOLONG`.
+    const { session, kernel } = await mount();
+    const longest = "n".repeat(255);
+    const tooLong = "n".repeat(256);
+
+    // 255 bytes is fine, in both directions.
+    await kernel.mkdir(FUSE_ROOT_ID, longest);
+    expect((await kernel.lookup(FUSE_ROOT_ID, longest)).attr.mode & S_IFMT).toBe(0o040_000);
+
+    for (const call of [
+      kernel.lookup(FUSE_ROOT_ID, tooLong),
+      kernel.mkdir(FUSE_ROOT_ID, tooLong),
+      kernel.create(FUSE_ROOT_ID, tooLong, O_CREAT_RDWR, 0o644),
+      kernel.symlink(FUSE_ROOT_ID, tooLong, "target"),
+      kernel.unlink(FUSE_ROOT_ID, tooLong),
+    ]) {
+      await expect(call).rejects.toMatchObject({ code: "ENAMETOOLONG" });
+    }
+
+    // A byte count, not a character count: 128 two-byte characters are 256
+    // bytes and must be refused just the same.
+    await expect(kernel.mkdir(FUSE_ROOT_ID, "é".repeat(128))).rejects.toMatchObject({
+      code: "ENAMETOOLONG",
+    });
+    // ...and 127 of them, at 254 bytes, are not.
+    await kernel.mkdir(FUSE_ROOT_ID, "é".repeat(127));
+
+    // The limit refused above is the one the mount reports.
+    expect((await kernel.statfs(FUSE_ROOT_ID)).namelen).toBe(255);
+    expectHealthy(session);
+  });
+
   it("synthesizes MKNOD for regular files", async () => {
     const { session, kernel } = await mount();
     const entry = await kernel.mknod(FUSE_ROOT_ID, "node", S_IFREG | 0o600);

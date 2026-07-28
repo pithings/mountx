@@ -15,6 +15,36 @@ describe("memory driver", () => {
     expect(file.gid).toBe(20);
   });
 
+  it("applies no umask unless one is asked for", async () => {
+    // The default is `0`, and that is a decision rather than an oversight: a
+    // umask belongs to a process, and under a mount the kernel has already
+    // applied the *caller's* before the mode reaches `FUSE_MKDIR`/`FUSE_CREATE`.
+    // Masking again used the daemon's value and produced modes nobody asked
+    // for — `create f 04777` arriving as `04755` (pjdfstest `chmod/12.t`).
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/dir", { mode: 0o755 });
+    await fs.mkdir("/wide", { mode: 0o777 });
+    const handle = await fs.open("/file", "w", 0o666);
+    await handle.close();
+    expect((await fs.stat("/dir")).mode & 0o777).toBe(0o755);
+    expect((await fs.stat("/wide")).mode & 0o777).toBe(0o777);
+    expect((await fs.stat("/file")).mode & 0o777).toBe(0o666);
+  });
+
+  it("rejects a file larger than memory with EFBIG, not EIO", async () => {
+    // `new Uint8Array(1e15)` throws a `RangeError`, which a transport can only
+    // turn into `EIO` — an errno that tells the caller nothing. Every
+    // filesystem has a maximum file size and says `EFBIG` past it.
+    const fs = createLoopback(createMemoryDriver());
+    await fs.writeFile("/f", "x");
+    await expect(fs.truncate("/f", 1e15)).rejects.toMatchObject({ code: "EFBIG" });
+    const handle = await fs.open("/f", "r+");
+    await expect(handle.truncate(1e15)).rejects.toMatchObject({ code: "EFBIG" });
+    await handle.close();
+    // ...and the file it refused to grow is untouched.
+    expect((await fs.stat("/f")).size).toBe(1);
+  });
+
   it("counts directory links", async () => {
     const fs = createLoopback(createMemoryDriver());
     expect((await fs.stat("/")).nlink).toBe(2);

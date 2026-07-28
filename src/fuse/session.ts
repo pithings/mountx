@@ -361,9 +361,26 @@ function direntTypeOf(entry: DirentLike): number {
 }
 
 /** A name the kernel should never send, and that must never reach a driver. */
+/**
+ * Bytes in one path component, and the `namelen` every `STATFS` reply carries.
+ *
+ * The kernel does **not** enforce this for us: `fuse_lookup_name` only rejects
+ * names longer than `FUSE_NAME_MAX` (1024), on the assumption that the server
+ * knows its own limit. So a driver with no limit of its own — an in-memory one,
+ * say — will happily create a 300-byte name that the same mount then reports as
+ * impossible in `statfs`, and `chmod` on a too-long name answers `ENOENT` where
+ * POSIX says `ENAMETOOLONG` (found by pjdfstest, every `02.t`). Enforcing it
+ * here is what makes the two answers agree; a driver whose own limit is lower
+ * still gets to say so first.
+ */
+const NAME_MAX = 255;
+
 function checkName(name: string, syscall: string): string {
   if (name.length === 0 || name.includes("/") || name === "." || name === "..") {
     throw fsError("EINVAL", { syscall, message: `EINVAL: bad entry name '${name}'` });
+  }
+  if (nameByteLength(name) > NAME_MAX) {
+    throw fsError("ENAMETOOLONG", { syscall, message: `ENAMETOOLONG: entry name '${name}'` });
   }
   return name;
 }
@@ -801,7 +818,13 @@ export class FuseSession {
       mtimensec: mtime.nsec,
       ctimensec: ctime.nsec,
       mode: toUnsigned(stats.mode),
-      nlink: Math.max(1, toUnsigned(stats.nlink)),
+      // Verbatim, **including zero**. `nlink == 0` is how a filesystem says
+      // "this inode has no names left, and is only alive because something has
+      // it open" — `clear_nlink()` on the kernel side, and what `fstat(2)` on
+      // an unlinked-but-open fd is expected to report. Clamping it to 1 makes
+      // the mount disagree with every real filesystem for the whole
+      // `mkstemp`+`unlink` pattern (found by the differential suite).
+      nlink: toUnsigned(stats.nlink),
       uid: toUnsigned(stats.uid),
       gid: toUnsigned(stats.gid),
       rdev: toUnsigned(stats.rdev),
@@ -846,11 +869,63 @@ export class FuseSession {
     }
   }
 
-  /** Stat a freshly created path, bind it, and count the lookup the reply hands out. */
-  async #bindEntry(path: string): Promise<FuseEntryOut> {
+  /**
+   * Stat a freshly created path, bind it, and count the lookup the reply hands
+   * out. With a `header`, the new inode is given to whoever asked for it first.
+   */
+  async #bindEntry(path: string, header?: FuseInHeader): Promise<FuseEntryOut> {
+    if (header !== undefined) {
+      await this.#claim(path, header);
+    }
     const stats = await this.#statOf(path);
     const inode = this.#inodes.acquire(this.#inodes.bind(path, stats));
     return this.#entryOut(inode, stats);
+  }
+
+  /**
+   * Give a newly created inode to the process that asked for it.
+   *
+   * **The driver creates everything as itself, and that is wrong for every
+   * caller but one.** A FUSE server runs as one user (root, here) while the
+   * requests arriving on it come from all of them — `fuse_in_header` carries
+   * the caller's `uid`/`gid` precisely so the server can act on their behalf.
+   * Nothing in the `FsDriver` interface can express that, so a driver's
+   * `mkdir` or `open(O_CREAT)` necessarily produces something owned by the
+   * daemon; without this step, a file `mkdir`ed by user 1000 comes back owned
+   * by root, and then `default_permissions` denies its own creator every
+   * subsequent operation on it.
+   *
+   * The consequences of getting this wrong are not subtle, and they are not
+   * confined to ownership: pjdfstest's `EACCES` and `EPERM` cases fail *en
+   * masse* (`open/06.t`, `open/07.t`, `chmod/07.t`, `chown/07.t`), because a
+   * permission check against the wrong owner is a permission check against the
+   * wrong answer.
+   *
+   * Deliberately skipped when the caller *is* the daemon — the overwhelmingly
+   * common case, and one extra driver round-trip per create is worth avoiding
+   * — and deliberately quiet when the driver has no `lchown` (`ENOSYS`) or is
+   * not privileged enough to hand ownership away (`EPERM`): a driver with no
+   * concept of ownership is not thereby broken.
+   *
+   * Two things this does **not** do, both of which want the credentials to
+   * reach the driver properly rather than more patching here: supplementary
+   * groups (only `gid` is on the wire before `FUSE_EXT_GROUPS`), and the
+   * set-gid directory rule that gives a new entry its parent's group.
+   */
+  async #claim(path: string, header: FuseInHeader): Promise<void> {
+    const uid = process.getuid?.() ?? -1;
+    const gid = process.getgid?.() ?? -1;
+    if (header.uid === uid && header.gid === gid) {
+      return;
+    }
+    try {
+      await this.driver.lchown(path, header.uid, header.gid);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
+        throw error;
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -943,10 +1018,13 @@ export class FuseSession {
     if ((valid & (FATTR_UID | FATTR_GID)) !== 0) {
       // `-1` is POSIX for "leave this one alone", and every driver's `chown`
       // inherits that from `node:fs`.
-      await this.driver.chown(
-        path(),
+      const [uid, gid] = [
         (valid & FATTR_UID) === 0 ? -1 : body.uid,
         (valid & FATTR_GID) === 0 ? -1 : body.gid,
+      ];
+      await this.#nofollow(
+        () => this.driver.lchown(path(), uid, gid),
+        () => this.driver.chown(path(), uid, gid),
       );
     }
     if ((valid & FATTR_SIZE) !== 0) {
@@ -1004,7 +1082,37 @@ export class FuseSession {
       await utimens.call(this.driver.unimount, path, atimeNs, mtimeNs);
       return;
     }
-    await this.driver.utimes(path, Number(atimeNs) / 1e9, Number(mtimeNs) / 1e9);
+    const [atime, mtime] = [Number(atimeNs) / 1e9, Number(mtimeNs) / 1e9];
+    await this.#nofollow(
+      () => this.driver.lutimes(path, atime, mtime),
+      () => this.driver.utimes(path, atime, mtime),
+    );
+  }
+
+  /**
+   * Prefer the `AT_SYMLINK_NOFOLLOW` form of a metadata call, and fall back to
+   * the following one for drivers that have no `l*` variant.
+   *
+   * **A `SETATTR` names an inode, never a path to resolve.** The kernel has
+   * already walked the path and is telling us which inode to change — and that
+   * inode can be a symlink, because `lutimes(2)` and `lchown(2)` exist. Calling
+   * the following variant sets the times on the symlink's *target* instead,
+   * which is wrong when the target exists and fails with `ENOENT` when it does
+   * not. That second case is not exotic: `tar -xp` restores a symlink before
+   * the file it points at and then stamps it, so every archive with a
+   * forward-pointing symlink in it failed to extract (found by recording a
+   * `tar -x` transcript). For everything that is not a symlink the two calls
+   * are identical, so this needs no type check and costs no `lstat`.
+   */
+  async #nofollow<T>(preferred: () => Promise<T>, following: () => Promise<T>): Promise<T> {
+    try {
+      return await preferred();
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOSYS") {
+        return following();
+      }
+      throw error;
+    }
   }
 
   async #symlink(request: FuseRequest): Promise<Uint8Array> {
@@ -1014,7 +1122,7 @@ export class FuseSession {
     return encodeReplyFor(
       request.header.unique,
       request.header.opcode,
-      await this.#bindEntry(path),
+      await this.#bindEntry(path, request.header),
       this.protocol,
     );
   }
@@ -1046,7 +1154,7 @@ export class FuseSession {
     return encodeReplyFor(
       request.header.unique,
       request.header.opcode,
-      await this.#bindEntry(path),
+      await this.#bindEntry(path, request.header),
       this.protocol,
     );
   }
@@ -1060,7 +1168,7 @@ export class FuseSession {
     return encodeReplyFor(
       request.header.unique,
       request.header.opcode,
-      await this.#bindEntry(path),
+      await this.#bindEntry(path, request.header),
       this.protocol,
     );
   }
@@ -1129,7 +1237,7 @@ export class FuseSession {
       files: toBigUint(stats.files),
       ffree: toBigUint(stats.ffree),
       bsize: toUnsigned(stats.bsize) || 4096,
-      namelen: 255,
+      namelen: NAME_MAX,
       frsize: toUnsigned(stats.bsize) || 4096,
     };
     return encodeReplyFor(request.header.unique, FUSE_STATFS, kstatfs, this.protocol);
@@ -1284,7 +1392,7 @@ export class FuseSession {
     }
     let entry: FuseEntryOut;
     try {
-      entry = await this.#bindEntry(path);
+      entry = await this.#bindEntry(path, request.header);
     } catch (error) {
       // The file exists but we cannot describe it, so there is no fh to hand
       // over and nothing that would ever release this handle.

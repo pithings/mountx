@@ -30,6 +30,12 @@ export interface ConformanceTarget {
 
 const decoder = new TextDecoder();
 
+/** Only root may give a file away, so the tests that do are gated on it. */
+const isRoot = (process.getuid?.() ?? -1) === 0;
+/** `nobody`, by convention. Any uid that is not the one running the suite would do. */
+const NOBODY_UID = 65_534;
+const NOBODY_GID = 65_534;
+
 /** Assert a call rejects with exactly the `node:fs` error shape for `code`. */
 async function rejects(promise: Promise<unknown>, code: ErrnoCode): Promise<void> {
   await expect(promise).rejects.toMatchObject({ code, errno: -ERRNO_CODES[code] });
@@ -580,14 +586,35 @@ export function conformance(target: ConformanceTarget): void {
         },
       );
 
-      it.skipIf(!capabilities.permissions || !capabilities.symlinks)(
-        "changes ownership of the symlink itself with lchown",
+      /**
+       * Handing ownership *away* is a privileged operation on a real
+       * filesystem, so the interesting half of `lchown` can only be checked as
+       * root. Everything below the `skipIf` would otherwise degenerate into
+       * `chown` to the uid the file already has — an assertion nothing can
+       * fail, which is exactly how the symlink-following bug in `SETATTR`
+       * survived a green suite.
+       */
+      it.skipIf(!capabilities.permissions || !capabilities.symlinks || !isRoot)(
+        "changes ownership of the symlink itself with lchown, not of its target",
         async () => {
           await fs.writeFile("/target", "x");
           await fs.symlink("target", "/link");
-          const stats = await fs.lstat("/link");
-          await fs.lchown("/link", stats.uid, stats.gid);
-          expect((await fs.lstat("/link")).uid).toBe(stats.uid);
+          const before = await fs.stat("/target");
+
+          await fs.lchown("/link", NOBODY_UID, NOBODY_GID);
+          const link = await fs.lstat("/link");
+          expect(link.uid).toBe(NOBODY_UID);
+          expect(link.gid).toBe(NOBODY_GID);
+
+          // The whole point of the `l`: the target is untouched.
+          const target = await fs.stat("/target");
+          expect(target.uid).toBe(before.uid);
+          expect(target.gid).toBe(before.gid);
+
+          // And the following variant does reach the target, so the two are
+          // demonstrably different calls rather than one aliased twice.
+          await fs.chown("/link", NOBODY_UID, NOBODY_GID);
+          expect((await fs.stat("/target")).uid).toBe(NOBODY_UID);
         },
       );
     });

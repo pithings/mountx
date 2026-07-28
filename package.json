@@ -34,9 +34,14 @@
     "fmt": "automd && oxlint . --fix && oxfmt .",
     "lint": "oxlint . && oxfmt --check .",
     "prepack": "pnpm build",
+    "record:fixtures": "sudo env UV_THREADPOOL_SIZE=32 \"$(command -v node)\" test/fuse/record-fixtures.ts",
     "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",
     "test": "pnpm lint && pnpm typecheck && vitest run --coverage",
-    "test:mount": "mkdir -p /tmp/unimount-vitest && sudo env TMPDIR=/tmp/unimount-vitest UV_THREADPOOL_SIZE=32 \"$(which node)\" node_modules/vitest/vitest.mjs run test/fuse/mount.test.ts; status=$?; grep -q ' /tmp/unimount-vitest' /proc/self/mounts || sudo rm -rf /tmp/unimount-vitest; exit $status",
+    "test:conformance:mount": "sh test/root.sh test/fuse/conformance-mount.test.ts",
+    "test:differential": "sh test/root.sh test/fuse/differential.test.ts",
+    "test:mount": "sh test/root.sh test/fuse/mount.test.ts",
+    "test:pjdfstest": "sh test/pjdfstest/run.sh",
+    "test:root": "sh test/root.sh test/fuse/mount.test.ts test/fuse/differential.test.ts test/fuse/conformance-mount.test.ts",
     "typecheck": "tsgo --noEmit --skipLibCheck"
   },
   "devDependencies": {

@@ -7,3 +7,10 @@ dist
 tsconfig.tsbuildinfo
 *.log*
 *.env*
+
+# pjdfstest: the suite is cloned and built on demand (test/pjdfstest/run.sh),
+# pinned to a commit there. Only the analysis is committed.
+test/pjdfstest/pjdfstest
+test/pjdfstest/results.txt
+test/pjdfstest/results.json
+test/pjdfstest/mnt

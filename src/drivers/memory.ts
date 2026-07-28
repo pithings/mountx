@@ -57,7 +57,18 @@ export interface MemoryDriverOptions {
   /** Owner of everything created. Defaults to the current process. */
   uid?: number;
   gid?: number;
-  /** Applied to `mkdir`/`open` modes, as the kernel would. */
+  /**
+   * Bits cleared from every `mkdir`/`open` mode. **Default `0`, i.e. none.**
+   *
+   * A umask belongs to a *process*, and a driver is not one. Under a mount it
+   * is worse than redundant: the kernel has already applied the calling
+   * process's umask before the mode reaches `FUSE_MKDIR`/`FUSE_CREATE` (there
+   * is no `FUSE_DONT_MASK` in this build), so a second one here masks with the
+   * wrong process's value and produces a file the caller did not ask for —
+   * `create f 04777` arriving as `04755` (found by pjdfstest `chmod/12.t`).
+   * Set it explicitly for a loopback filesystem that wants `node:fs`-like
+   * behaviour.
+   */
   umask?: number;
   /** Mode of the root directory. */
   rootMode?: number;
@@ -113,7 +124,7 @@ function validatePosition(position: number | null | undefined): number | undefin
 export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDriver {
   const uid = options.uid ?? process.getuid?.() ?? 0;
   const gid = options.gid ?? process.getgid?.() ?? 0;
-  const umask = options.umask ?? 0o022;
+  const umask = options.umask ?? 0;
 
   let nextIno = 1;
   let nextFd = 3;
@@ -260,7 +271,23 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
     if (size === data.byteLength) {
       return;
     }
-    const next = new Uint8Array(size);
+    // Every filesystem has a maximum file size and answers `EFBIG` past it.
+    // This one's is whatever the engine will hand out, which is a moving
+    // target — V8's cap has changed between releases and `buffer.constants`
+    // reports a limit far above what actually allocates — so it is *asked*
+    // rather than assumed. Without this, `truncate(f, 1e15)` escapes as a
+    // `RangeError`, which a transport can only report as `EIO`: an errno that
+    // tells the caller nothing (found by pjdfstest `truncate/12.t`).
+    let next: Uint8Array;
+    try {
+      next = new Uint8Array(size);
+    } catch (error) {
+      if (error instanceof RangeError) {
+        throw fsError("EFBIG", { syscall: "truncate" });
+      }
+      /* v8 ignore next 2 -- nothing else comes out of a typed-array allocation. */
+      throw error;
+    }
     next.set(data.subarray(0, Math.min(size, data.byteLength)));
     node.data = next;
   }

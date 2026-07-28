@@ -14,3 +14,22 @@ jobs:
       - run: pnpm run lint
       # - uses: codecov/codecov-action@v5
       #   with: { token: "${{ secrets.CODECOV_TOKEN }}" }
+
+  # Tier 2: real mounts. Stock Linux runners have `/dev/fuse` and passwordless
+  # sudo, which is the whole reason root-mode FUSE being pure JS matters — no
+  # native artifact, no self-hosted runner (IDEA.md, "Testing"). Every file here
+  # skips itself when not root, so `checks` above covers the same code without
+  # mounting anything.
+  #
+  # pjdfstest is deliberately *not* here: it takes about fifteen minutes, and
+  # its value is the analysis rather than a pass/fail. It is run locally and its
+  # results are committed in `.agents/pjdfstest-results.md`.
+  mount:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: npm i -fg corepack && corepack enable
+      - uses: actions/setup-node@v6
+        with: { node-version: lts/*, cache: "pnpm" }
+      - run: pnpm install
+      - run: pnpm test:root

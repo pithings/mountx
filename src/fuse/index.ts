@@ -16,4 +16,5 @@ export * from "./inodes.ts";
 export * from "./mount.ts";
 export * from "./notify.ts";
 export * from "./protocol.ts";
+export * from "./record.ts";
 export * from "./session.ts";

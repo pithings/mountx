@@ -8,6 +8,7 @@ Design source of truth: `IDEA.md`.
 
 - Plan & finalized decisions: `.agents/roadmap.md`
 - Verified environment facts (FUSE, sudo, toolchain caveats): `.agents/environment.md`
+- pjdfstest results and failure analysis: `.agents/pjdfstest-results.md`
 
 Conventions: pure JS/TS, zero runtime deps, pure-JS-first (no native code in
 v1). Single package with subpath exports. Small conventional commits to
@@ -117,11 +118,13 @@ per-nodeid lookup counts), `session.test.ts`, `inodes.test.ts`,
   root would pull the session and `node:child_process` into every
   `import … from "unimount"`, and the root `mount` should be the
   transport-picking facade once there is more than one transport to pick.
-- `pnpm test:mount` runs the Tier-2 suite (root, `TMPDIR` redirected so root's
-  vitest caches do not accumulate in `/tmp`):
-  `sudo env TMPDIR=… UV_THREADPOOL_SIZE=32 "$(which node)" node_modules/vitest/vitest.mjs run test/fuse/mount.test.ts`.
-  `test/fuse/mount.test.ts` skips itself when not root, so `pnpm test` stays
-  green for everyone.
+- `test/root.sh` runs any Tier-2 file under sudo (absolute node path, raised
+  `UV_THREADPOOL_SIZE`, `TMPDIR` redirected so root's vitest caches do not
+  accumulate in `/tmp`, `UNIMOUNT_*` variables forwarded through `sudo`'s
+  environment reset). `pnpm test:mount` is `sh test/root.sh
+test/fuse/mount.test.ts`; see the milestone-5 section for the rest.
+  Every Tier-2 file skips itself when not root, so `pnpm test` stays green for
+  everyone.
 
 How it works, and the parts that are load-bearing:
 
@@ -192,3 +195,86 @@ How it works, and the parts that are load-bearing:
   unmounted → tear down. `EINTR`/`EAGAIN`/`ENOENT` on a read → re-arm.
 - **`/sys/fs/fuse/connections` is empty in this container**, so the fusectl
   `abort` file is not an option here even though it is the documented one.
+
+## Layout (milestone 5 — validation)
+
+Four oracles, none of which anyone had to author test cases for. All of them
+found real bugs; each fix is named in the comment that guards it.
+
+- `test/fuse/differential.ts` + `differential.test.ts` — **the differential
+  suite**. One operation script run step-by-step against a real mount of the
+  `node:fs` passthrough _and_ against a plain directory, comparing each
+  operation's result (or errno) and then the two trees in full, plus the
+  mount's own backing directory as a third view. A scripted sequence covers
+  everything in the task list; a seeded generator (`UNIMOUNT_DIFF_SEED`,
+  `UNIMOUNT_DIFF_OPS`) adds a few hundred more. `pnpm test:differential`.
+  A non-root test runs the same script against two plain directories, which is
+  what proves the script itself is deterministic and root-independent.
+  Not compared, on purpose: `st_dev`/`st_ino` _values_ (the hardlink
+  _partition_ is), timestamps in the tree walk (`utimes` is checked as an
+  operation result instead), and directory `size`.
+- `src/fuse/record.ts` + `test/fuse/record-fixtures.ts` + `replay.test.ts` —
+  **record/replay**. `mount({ tap })` tees every byte crossing `/dev/fuse` in
+  both directions; `TranscriptRecorder` frames them into a dead-simple file
+  (`"UMFT"`, version, then `[dir u8, flags u8, pad u16, len u32le, ts u64le,
+bytes]`), and `replayTranscript(session, frames)` feeds the kernel→daemon
+  direction back through a fresh session with no root and no kernel.
+  `test/fixtures/*.fuse` (~320 KB total) are committed transcripts of `ls -laR`
+  - `find`, a write/rename/stat loop, and `tar -xp`; `pnpm record:fixtures`
+    re-records them. **Replay asserts protocol invariants, not bytes** — replies
+    depend on the driver state that produced them, so a fresh driver cannot
+    reproduce them, and comparing would only prove the fixture was recorded
+    twice. What is asserted: every request decodes, every request that needs a
+    reply gets exactly one addressed to its own `unique`, nothing throws, the
+    exactly-once assertions stay silent, counters balance, and the opcode
+    histogram still contains what the fixture was recorded for.
+- `test/fuse/conformance-mount.test.ts` — **the conformance matrix's FUSE
+  column**. The same `test/conformance.ts` suite, run over a real mount of each
+  driver with `node:fs` as the client (`test/rooted-node-fs.ts` is the adapter,
+  shared with the loopback column). **126/126, no capability skips**: the FUSE
+  transport loses nothing either v1 driver has. `pnpm test:conformance:mount`.
+- `test/pjdfstest/run.sh` + `run.ts` — **pjdfstest** against a memory-driver
+  mount, pinned to commit `ededbeb`. The clone and its build are gitignored;
+  the analysis is committed in `.agents/pjdfstest-results.md`. No `prove`
+  needed (this host has no `TAP::Harness`): the `.t` files are shell scripts
+  printing TAP, and `run.ts` parses it and writes the per-category breakdown.
+
+`pnpm test:root` runs all three Tier-2 vitest files, and is what the CI
+`mount` job runs on a stock Linux runner. pjdfstest stays out of CI (~15
+minutes, and its output is an analysis rather than a verdict): it runs locally
+and its results are committed.
+
+Bugs the oracles found, all fixed:
+
+- **`nlink` was clamped to `≥ 1`** in `fuse_attr`, so `fstat` on an
+  unlinked-but-open file said 1 where every real filesystem says 0. (Differential.)
+- **`SETATTR` followed symlinks.** A nodeid names an inode, and that inode can
+  be a symlink, so the driver call must be the `AT_SYMLINK_NOFOLLOW` one
+  (`lchown`/`lutimes`, falling back on `ENOSYS`). `tar -xp` of any archive with
+  a forward-pointing symlink in it failed outright. (Found while recording the
+  `tar-extract` fixture.)
+- **New inodes were owned by the daemon, not the caller.** `fuse_in_header`
+  carries the caller's `uid`/`gid` and nothing in `FsDriver` can express them,
+  so the session now `lchown`s a freshly created entry to the requester
+  (skipped when that is the daemon; quiet on `ENOSYS`/`EPERM`). Without it,
+  `default_permissions` denied a file's own creator every subsequent
+  operation — hundreds of pjdfstest `EACCES`/`EPERM` failures. Still not done,
+  and wanting credentials in the driver interface rather than more patching:
+  supplementary groups, and set-gid directory inheritance.
+- **`NAME_MAX` was advertised but not enforced.** The kernel only rejects names
+  over `FUSE_NAME_MAX` (1024) and expects the server to know its own limit, so
+  a driver without one created names its own `statfs` called impossible.
+  `checkName` now answers `ENAMETOOLONG` past 255 bytes, the same number the
+  `STATFS` reply carries. (pjdfstest, every `02.t`.)
+- **Memory driver: a umask out of nowhere.** Its default was `0o022`, so it
+  masked a mode the kernel had _already_ masked with the caller's umask —
+  using the wrong process's value, and turning `create f 04777` into `04755`.
+  Now `0`; a umask belongs to a process, and a driver is not one.
+- **Memory driver: `EFBIG`.** `truncate` past what a `Uint8Array` can hold was
+  a `RangeError`, which the session could only report as `EIO`.
+- Two test-side traps worth remembering: `Buffer.prototype.slice` **does not
+  copy** (it is `subarray`), which silently corrupted the first transcripts;
+  and `spawn(…, { cwd })` with a `cwd` inside your own mountpoint deadlocks in
+  `uv_spawn` — the child `chdir`s before `exec` while the parent blocks on the
+  exec pipe, so the `LOOKUP` waits on the only thread that could answer it.
+  Both are documented where they bite (`src/fuse/record.ts`, `src/fuse/mount.ts`).
