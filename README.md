@@ -1,5 +1,10 @@
 # ⛰️mountx
 
+> [!WARNING]
+> **Alpha.** Mountx is early development: the API can still change, and it has not
+> been through a security or correctness audit. A driver is reachable by every
+> program on the machine once it is mounted.
+
 **Write a filesystem in JavaScript, mount it as a real kernel filesystem.**
 
 You can write a driver with the same methods as `node:fs/promises` (`stat`,
