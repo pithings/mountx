@@ -416,3 +416,77 @@ Bugs found while building it, and in review:
   made `handles.ts` binary to `file(1)` and `grep`. It is `"\0"` now — the
   behaviour was always right, and a test pins `["a b"]` against `["a", "b"]` so a
   tidy-up cannot turn it into a character a filename could contain.
+
+## Layout (milestone 7 — conformance matrix + benchmarks)
+
+Two generated reports, both committed, both regenerable with one command. The
+README is written from them and may claim nothing they do not say.
+
+- `test/matrix.ts` (`pnpm matrix`) → **`.agents/conformance-matrix.md`**. Runs
+  the three conformance columns that already exist as ordinary vitest files
+  (`test/drivers.test.ts`, `test/fuse/conformance-mount.test.ts` through
+  `test/root.sh`, `test/nfs/conformance.test.ts`), parses vitest's JSON reporter
+  and lays them side by side. The root column skips itself with a reason
+  (`UNIMOUNT_MATRIX_SKIP_ROOT=1`, no `/dev/fuse`, no passwordless `sudo`) rather
+  than failing. The npm script pipes the output through `oxfmt`, because
+  `pnpm lint` formats markdown too and a generated table is not oxfmt-shaped.
+  - **A skip's reason lives in the test's name.** A skipped test leaves nothing
+    else behind — vitest reports `pending` with no reason — so `conformance()`
+    appends `[needs <capability> + …]` to every gated case, whether or not it
+    ran, via the `itNeeds`/`describeNeeds` helpers that also compute the skip.
+    One call site, so the two cannot drift.
+  - **Capability loss is derived, not declared:** a requirement counts as unmet
+    in a column when _no_ case naming it passed there. Current answer: FUSE loses
+    nothing, NFSv3 loses `handles`, and `root` is an environment fact reported
+    separately.
+- `bench/` (`pnpm bench`, `pnpm bench:root`) → **`.agents/benchmarks.md`**.
+  Scenarios written once against `Loopback` and run in all three columns, the
+  same trick the matrix uses. `harness.ts` is a warmup, an adaptive loop and
+  percentiles; `--json <path>` writes the machine-readable form. Nothing here
+  runs inside `pnpm test`.
+  - **`ops/sec` is wall-clock, `p50`/`p99` are the timed bracket**, so `1 / p50`
+    is deliberately not `ops/sec`. Dividing throughput by the sum of the samples
+    would hand the harness's own ~90 ns of per-iteration bookkeeping to the
+    ceiling column for free — nothing against a FUSE round trip, 5–20% on a
+    loopback `stat`, and a systematic flattering of the denominator every
+    transport is compared against.
+  - **The FUSE client is a child process** (`bench/fuse-client.ts`), which is
+    what makes it safe to have operations in flight at all — see the threadpool
+    note in `src/fuse/mount.ts`.
+  - **`bench/fuse.ts` mounts once per negotiation variant** and gives up exactly
+    one win each time, which is the measurement IDEA.md calls the proof of its
+    central claim. It also samples `session.stats.requests` while the client
+    works, because scenario ops/sec undercount the transport (one `stat(2)` is
+    two FUSE requests at `entry_timeout = 0`).
+
+What the numbers said, in one line each — the file has the tables and the
+caveats:
+
+- **IDEA.md's "low tens of thousands of ops/sec" holds**, at the upper end:
+  **41.5–50.3 k FUSE requests/sec** with requests in flight, 13.6 k/s strictly
+  sequential. A single-threaded client sees 2–4 k _syscalls_/sec on uncached
+  metadata, because each is two to five requests.
+- **Negotiation dominates, as claimed.** `attr_timeout`/`entry_timeout` are
+  worth 8–15×; `FOPEN_KEEP_CACHE` 4.9× on re-read; `max_write` at 1 MiB only
+  ~15–40% against this driver (expect more against one that does real I/O per
+  request). Nothing JS-side in this codebase has been worth anything comparable.
+- **`FUSE_READDIRPLUS_AUTO` is costing us the readdirplus win.** The kernel only
+  uses plus for the _first page_ of a listing under `AUTO`, so a cold 1000-entry
+  `ls -l` is 10.3 k entries/s with our defaults and 25.0 k without `AUTO` —
+  IDEA.md's predicted 2.4×, currently unclaimed. Dropping `AUTO` costs ~20% on a
+  names-only `readdir`. **Not changed** (benchmark milestone, not a defaults
+  one); it is the best-supported open question in the repo.
+- **`readers` is not a useful knob** with a CPU-bound driver: 1/2/4 readers span
+  ~20% (8.1 / 9.5 / 10.0 k ops/s on 64 concurrent stats) across a 4× change, and
+  reorder between runs, because every completion lands on the same main thread. The
+  modes that would change that (sync-worker, relay) do not exist yet, and
+  IDEA.md's "sync-worker should be meaningfully better" stays **unmeasured**.
+- **Writeback caching would be worth 2.6× on small writes** and is off on
+  purpose; that is what the semantics cost.
+- **A real bug, found by the benchmarks:** the memory driver's `resize()`
+  reallocated on every growth, so a file arriving in `max_write` chunks cost
+  O(n²) — 100 MiB written moved ~5 GiB. The loopback column, which is supposed to
+  be the _ceiling_, was slower than the transports it was the denominator for.
+  Now geometric with shrink-to-fit; sequential write went 60 → 1,382 MiB/s
+  loopback and 53 → 308 MiB/s over NFS, and the `EFBIG` behaviour pjdfstest
+  pinned is preserved (doubling first, exact size as the fallback).

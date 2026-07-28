@@ -266,29 +266,70 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
     };
   }
 
-  function resize(node: MemNode, size: number): void {
-    const data = node.data ?? EMPTY;
-    if (size === data.byteLength) {
-      return;
-    }
-    // Every filesystem has a maximum file size and answers `EFBIG` past it.
-    // This one's is whatever the engine will hand out, which is a moving
-    // target — V8's cap has changed between releases and `buffer.constants`
-    // reports a limit far above what actually allocates — so it is *asked*
-    // rather than assumed. Without this, `truncate(f, 1e15)` escapes as a
-    // `RangeError`, which a transport can only report as `EIO`: an errno that
-    // tells the caller nothing (found by pjdfstest `truncate/12.t`).
-    let next: Uint8Array;
+  /**
+   * Allocate `bytes`, or say `EFBIG`.
+   *
+   * Every filesystem has a maximum file size and answers `EFBIG` past it. This
+   * one's is whatever the engine will hand out, which is a moving target —
+   * V8's cap has changed between releases and `buffer.constants` reports a
+   * limit far above what actually allocates — so it is *asked* rather than
+   * assumed. Without this, `truncate(f, 1e15)` escapes as a `RangeError`, which
+   * a transport can only report as `EIO`: an errno that tells the caller
+   * nothing (found by pjdfstest `truncate/12.t`).
+   */
+  function allocate(bytes: number): ArrayBuffer | undefined {
     try {
-      next = new Uint8Array(size);
+      return new ArrayBuffer(bytes);
     } catch (error) {
       if (error instanceof RangeError) {
-        throw fsError("EFBIG", { syscall: "truncate" });
+        return undefined;
       }
-      /* v8 ignore next 2 -- nothing else comes out of a typed-array allocation. */
+      /* v8 ignore next 2 -- nothing else comes out of an ArrayBuffer allocation. */
       throw error;
     }
-    next.set(data.subarray(0, Math.min(size, data.byteLength)));
+  }
+
+  /**
+   * Set a file's length, keeping spare capacity behind it.
+   *
+   * `node.data` is always a view of exactly the file's size, so everything
+   * reading it still sees `byteLength` as the length — but the buffer under it
+   * is grown geometrically and is usually bigger. That matters more than it
+   * looks: a file arrives in `max_write`-sized chunks, and reallocating on
+   * every one of them makes writing an *n*-byte file cost O(n²) bytes of
+   * copying. Measured, before this: 100 MiB through the memory driver in 1 MiB
+   * chunks moved ~5 GiB and ran at 60 MiB/s, with the same 60 MiB/s showing up
+   * at the far end of the NFS transport and looking like a protocol cost.
+   *
+   * Shrinking keeps the capacity unless the file has lost most of its size, so
+   * that `truncate(f, 0)` on something large does give the memory back.
+   */
+  function resize(node: MemNode, size: number): void {
+    const data = node.data ?? EMPTY;
+    const length = data.byteLength;
+    if (size === length) {
+      return;
+    }
+    const capacity = data.buffer.byteLength;
+    if (size <= capacity && size * 4 >= capacity) {
+      // Bytes past a shrink are not cleared, so a file truncated down and back
+      // up would otherwise resurrect them instead of reading as zeros.
+      const next = new Uint8Array(data.buffer, 0, size);
+      if (size > length) {
+        next.fill(0, length);
+      }
+      node.data = next;
+      return;
+    }
+    // Doubling first, the exact size as the fallback: the file may be within
+    // what the engine can allocate while twice its capacity is not.
+    let buffer = size > length ? allocate(Math.max(size, capacity * 2)) : undefined;
+    buffer ??= allocate(size);
+    if (buffer === undefined) {
+      throw fsError("EFBIG", { syscall: "truncate" });
+    }
+    const next = new Uint8Array(buffer, 0, size);
+    next.set(data.subarray(0, Math.min(size, length)));
     node.data = next;
   }
 

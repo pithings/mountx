@@ -52,7 +52,7 @@ Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
    pass/fail, so the results are committed instead
    (`.agents/pjdfstest-results.md`). CI gets a `mount` job running
    `pnpm test:root` — the three Tier-2 vitest files — on a stock Linux runner.
-6. ✅ **DONE** (2026-07-28, uncommitted at time of writing)
+6. ✅ **DONE** (commit 5fed4d9, 2026-07-28)
    **NFSv3 loopback.** XDR codecs, MOUNT + NFSv3 servers over TCP (explicit
    `port=`/`mountport=`, no portmap), handle synthesis in the session layer
    for stateless ops. Tier-1 tests with a JS NFS client built from the same

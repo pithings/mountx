@@ -33,10 +33,13 @@
     }
   },
   "scripts": {
+    "bench": "node bench/index.ts",
+    "bench:root": "sudo env UV_THREADPOOL_SIZE=32 \"$(command -v node)\" bench/fuse.ts",
     "build": "obuild",
     "dev": "vitest dev",
     "fmt": "automd && oxlint . --fix && oxfmt .",
     "lint": "oxlint . && oxfmt --check .",
+    "matrix": "node test/matrix.ts && oxfmt .agents/conformance-matrix.md",
     "prepack": "pnpm build",
     "record:fixtures": "sudo env UV_THREADPOOL_SIZE=32 \"$(command -v node)\" test/fuse/record-fixtures.ts",
     "release": "pnpm test && pnpm build && changelogen --release && npm publish && git push --follow-tags",

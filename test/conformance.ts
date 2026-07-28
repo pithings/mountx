@@ -46,8 +46,40 @@ async function rejectsRange(promise: Promise<unknown>): Promise<void> {
   await expect(promise).rejects.toMatchObject({ code: "ERR_OUT_OF_RANGE" });
 }
 
+/** Something a case needs before it can mean anything: a capability, or root. */
+export type Requirement = keyof ResolvedCapabilities | "root";
+
+/** The `[needs …]` marker appended to every gated case name. */
+export const REQUIREMENT_TAG = /\s\[needs ([^\]]+)]$/;
+
 export function conformance(target: ConformanceTarget): void {
   const { capabilities } = target;
+
+  /**
+   * `it` / `describe` for a case that only means something when the target has
+   * what it names: skipped without it, and **tagged with it either way**.
+   *
+   * The tag is not decoration. A skipped test leaves nothing behind but its
+   * name — vitest reports it as `pending`, with no reason attached — so the
+   * name is the only place the reason can live if the conformance matrix is to
+   * say *why* a cell is a skip rather than merely that it is (`pnpm matrix`,
+   * `.agents/conformance-matrix.md`). Declaring the requirement and the skip in
+   * one call is what keeps the two from drifting apart.
+   */
+  const met = (requirement: Requirement): boolean =>
+    requirement === "root" ? isRoot : capabilities[requirement] === true;
+  const tag = (requirements: readonly Requirement[]): string =>
+    ` [needs ${requirements.join(" + ")}]`;
+  const itNeeds =
+    (...requirements: Requirement[]) =>
+    (name: string, fn: () => Promise<void>): void => {
+      it.skipIf(!requirements.every(met))(name + tag(requirements), fn);
+    };
+  const describeNeeds =
+    (...requirements: Requirement[]) =>
+    (name: string, fn: () => void): void => {
+      describe.skipIf(!requirements.every(met))(name + tag(requirements), fn);
+    };
 
   describe(`conformance: ${target.name}`, () => {
     let fs: Loopback;
@@ -152,7 +184,7 @@ export function conformance(target: ConformanceTarget): void {
         await rejects(fs.open("/exists", "wx"), "EEXIST");
       });
 
-      it.skipIf(!capabilities.symlinks)(
+      itNeeds("symlinks")(
         "rejects an exclusive open of a symlink, dangling or not, with EEXIST",
         async () => {
           await fs.symlink("nowhere", "/dangling");
@@ -261,7 +293,7 @@ export function conformance(target: ConformanceTarget): void {
         await rejects(fs.lstat("/nope"), "ENOENT");
       });
 
-      it.skipIf(!capabilities.statfs)("reports filesystem statistics", async () => {
+      itNeeds("statfs")("reports filesystem statistics", async () => {
         const stats = await fs.statfs("/");
         expect(stats.bsize).toBeGreaterThan(0);
         expect(stats.blocks).toBeGreaterThan(0);
@@ -369,7 +401,7 @@ export function conformance(target: ConformanceTarget): void {
         await rejects(fs.unlink("/nope"), "ENOENT");
       });
 
-      it.skipIf(!capabilities.handles)("keeps an open handle readable after unlink", async () => {
+      itNeeds("handles")("keeps an open handle readable after unlink", async () => {
         await fs.writeFile("/doomed", "still here");
         const handle = await fs.open("/doomed", "r");
         await fs.unlink("/doomed");
@@ -446,7 +478,7 @@ export function conformance(target: ConformanceTarget): void {
       });
     });
 
-    describe.skipIf(!capabilities.hardlinks)("hard links", () => {
+    describeNeeds("hardlinks")("hard links", () => {
       it("shares an inode and counts nlink", async () => {
         await fs.writeFile("/original", "shared");
         await fs.link("/original", "/alias");
@@ -478,7 +510,7 @@ export function conformance(target: ConformanceTarget): void {
       });
     });
 
-    describe.skipIf(!capabilities.symlinks)("symlinks", () => {
+    describeNeeds("symlinks")("symlinks", () => {
       it("round-trips through readlink and distinguishes lstat from stat", async () => {
         await fs.writeFile("/target", "payload");
         await fs.symlink("target", "/link");
@@ -538,7 +570,7 @@ export function conformance(target: ConformanceTarget): void {
     });
 
     describe("metadata", () => {
-      it.skipIf(!capabilities.permissions)("changes permission bits", async () => {
+      itNeeds("permissions")("changes permission bits", async () => {
         await fs.writeFile("/f", "x");
         await fs.chmod("/f", 0o600);
         expect((await fs.stat("/f")).mode & 0o777).toBe(0o600);
@@ -547,19 +579,16 @@ export function conformance(target: ConformanceTarget): void {
         await rejects(fs.chmod("/nope", 0o644), "ENOENT");
       });
 
-      it.skipIf(!capabilities.permissions)(
-        "keeps ownership when set to the current owner",
-        async () => {
-          await fs.writeFile("/f", "x");
-          const before = await fs.stat("/f");
-          await fs.chown("/f", before.uid, before.gid);
-          const after = await fs.stat("/f");
-          expect(after.uid).toBe(before.uid);
-          expect(after.gid).toBe(before.gid);
-        },
-      );
+      itNeeds("permissions")("keeps ownership when set to the current owner", async () => {
+        await fs.writeFile("/f", "x");
+        const before = await fs.stat("/f");
+        await fs.chown("/f", before.uid, before.gid);
+        const after = await fs.stat("/f");
+        expect(after.uid).toBe(before.uid);
+        expect(after.gid).toBe(before.gid);
+      });
 
-      it.skipIf(!capabilities.times)("sets access and modification times", async () => {
+      itNeeds("times")("sets access and modification times", async () => {
         await fs.writeFile("/f", "x");
         await fs.utimes("/f", new Date(1000), new Date(2000));
         const stats = await fs.stat("/f");
@@ -574,17 +603,14 @@ export function conformance(target: ConformanceTarget): void {
         await rejects(fs.utimes("/nope", 1, 1), "ENOENT");
       });
 
-      it.skipIf(!capabilities.times || !capabilities.symlinks)(
-        "sets times on the symlink itself with lutimes",
-        async () => {
-          await fs.writeFile("/target", "x");
-          await fs.symlink("target", "/link");
-          await fs.utimes("/target", new Date(1000), new Date(1000));
-          await fs.lutimes("/link", new Date(9000), new Date(9000));
-          expect((await fs.lstat("/link")).mtimeMs).toBe(9000);
-          expect((await fs.stat("/target")).mtimeMs).toBe(1000);
-        },
-      );
+      itNeeds("times", "symlinks")("sets times on the symlink itself with lutimes", async () => {
+        await fs.writeFile("/target", "x");
+        await fs.symlink("target", "/link");
+        await fs.utimes("/target", new Date(1000), new Date(1000));
+        await fs.lutimes("/link", new Date(9000), new Date(9000));
+        expect((await fs.lstat("/link")).mtimeMs).toBe(9000);
+        expect((await fs.stat("/target")).mtimeMs).toBe(1000);
+      });
 
       /**
        * Handing ownership *away* is a privileged operation on a real
@@ -594,32 +620,33 @@ export function conformance(target: ConformanceTarget): void {
        * fail, which is exactly how the symlink-following bug in `SETATTR`
        * survived a green suite.
        */
-      it.skipIf(!capabilities.permissions || !capabilities.symlinks || !isRoot)(
-        "changes ownership of the symlink itself with lchown, not of its target",
-        async () => {
-          await fs.writeFile("/target", "x");
-          await fs.symlink("target", "/link");
-          const before = await fs.stat("/target");
+      itNeeds(
+        "permissions",
+        "symlinks",
+        "root",
+      )("changes ownership of the symlink itself with lchown, not of its target", async () => {
+        await fs.writeFile("/target", "x");
+        await fs.symlink("target", "/link");
+        const before = await fs.stat("/target");
 
-          await fs.lchown("/link", NOBODY_UID, NOBODY_GID);
-          const link = await fs.lstat("/link");
-          expect(link.uid).toBe(NOBODY_UID);
-          expect(link.gid).toBe(NOBODY_GID);
+        await fs.lchown("/link", NOBODY_UID, NOBODY_GID);
+        const link = await fs.lstat("/link");
+        expect(link.uid).toBe(NOBODY_UID);
+        expect(link.gid).toBe(NOBODY_GID);
 
-          // The whole point of the `l`: the target is untouched.
-          const target = await fs.stat("/target");
-          expect(target.uid).toBe(before.uid);
-          expect(target.gid).toBe(before.gid);
+        // The whole point of the `l`: the target is untouched.
+        const target = await fs.stat("/target");
+        expect(target.uid).toBe(before.uid);
+        expect(target.gid).toBe(before.gid);
 
-          // And the following variant does reach the target, so the two are
-          // demonstrably different calls rather than one aliased twice.
-          await fs.chown("/link", NOBODY_UID, NOBODY_GID);
-          expect((await fs.stat("/target")).uid).toBe(NOBODY_UID);
-        },
-      );
+        // And the following variant does reach the target, so the two are
+        // demonstrably different calls rather than one aliased twice.
+        await fs.chown("/link", NOBODY_UID, NOBODY_GID);
+        expect((await fs.stat("/target")).uid).toBe(NOBODY_UID);
+      });
     });
 
-    describe.skipIf(!capabilities.truncate)("truncate", () => {
+    describeNeeds("truncate")("truncate", () => {
       it("shrinks and grows a file", async () => {
         await fs.writeFile("/f", "0123456789");
         await fs.truncate("/f", 4);
