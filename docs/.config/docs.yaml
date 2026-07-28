@@ -9,6 +9,13 @@ automd: true
 
 github: pithings/mountx
 
+socials:
+  discord: "https://discord.com/invite/Q5j93z4Me3"
+  x: https://x.com/_pi0_
+
+sponsors:
+  api: https://sponsors.pi0.io/sponsors.json
+
 landing:
   heroDescription: >-
     Write an object with the same methods as `node:fs/promises` and mountx
