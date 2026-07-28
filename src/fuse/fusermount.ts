@@ -126,10 +126,10 @@ export interface FusermountOptions {
  * leave a mountpoint that answers `ENOTCONN` rather than one that hangs — the
  * whole fd-lifecycle argument at the top of `mount.ts` applies here unchanged.
  *
- * Both socket ends are closed before this returns, in every path. The helper
- * has already exited by then (no `auto_unmount`, so it does not linger), and
- * leaving an end open would keep a socket alive for the life of the mount for
- * no reason.
+ * Both socket ends are closed before this returns, in every path — the sending
+ * end as soon as the helper has exited, for the reason given below, and the
+ * receiving end in the `finally`. Leaving either open would keep a socket alive
+ * for the life of the mount for no reason.
  */
 export async function mountViaFusermount(
   mountpoint: string,
@@ -142,6 +142,7 @@ export async function mountViaFusermount(
   }
 
   const [ours, theirs] = native.socketpair();
+  let sender = theirs;
   try {
     let result;
     try {
@@ -152,6 +153,16 @@ export async function mountViaFusermount(
     } catch (error) {
       throw new Error(`mountx: could not run ${helper}: ${errorMessage(error)}`);
     }
+    // Drop the sending end *before* receiving, not in the `finally`. While this
+    // process holds a copy the socket can never reach EOF, so a helper that
+    // exits 0 without sending anything is indistinguishable from one that is
+    // about to send — and `recvFd` is synchronous, so the backstop below stops
+    // being a backstop and becomes ten seconds of stalled event loop. Closing
+    // it first turns that case into an immediate "the peer closed without
+    // sending a descriptor". The helper has already exited by now (no
+    // `auto_unmount`, so it does not linger) and has no use for it either way.
+    closeQuietly(theirs);
+    sender = -1;
     if (result.status !== 0) {
       throw new Error(
         `mountx: mounting ${mountpoint} failed — ` +
@@ -164,7 +175,9 @@ export async function mountViaFusermount(
     return native.recvFd(ours, options.timeout ?? 10_000);
   } finally {
     closeQuietly(ours);
-    closeQuietly(theirs);
+    if (sender >= 0) {
+      closeQuietly(sender);
+    }
   }
 }
 
