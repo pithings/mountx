@@ -1,0 +1,162 @@
+/**
+ * The NFSv3 loopback transport: `unimount/nfs`.
+ *
+ * The second transport over the same `FsDriver`, and the one that needs no
+ * `/dev/fuse` and no native code — just a TCP socket (IDEA.md, "NFSv3
+ * loopback"). Layered the way the FUSE side is:
+ *
+ * - `xdr.ts` — XDR primitives (RFC 4506): a bounds-checked reader and writer
+ *   that only ever throw `XdrError`.
+ * - `rpc.ts` — ONC RPC v2 (RFC 5531): calls, replies, auth, and TCP record
+ *   marking, encoded *and* decoded.
+ * - `constants.ts` / `protocol.ts` — RFC 1813 transcribed: every NFSv3 and
+ *   MOUNTv3 struct, both directions.
+ * - `handles.ts` — the file handle table and the readdir cookie scheme, which
+ *   is the state a stateless protocol still needs.
+ * - `session.ts` — bytes in, bytes out: both programs over a driver, with no
+ *   socket anywhere.
+ * - `server.ts` — the socket, and `mount.ts` — `mount(8)`.
+ *
+ * Everything except the last two runs on any OS with no privileges, which is
+ * what makes the whole protocol testable by a JS client built from these same
+ * codecs.
+ */
+
+export * from "./constants.ts";
+export * from "./handles.ts";
+export * from "./mount.ts";
+// Everything from `protocol.ts` **except** the sub-struct helpers
+// (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, the `post_op_*` and
+// `wcc_data` pairs, `nfstime3`, `specdata3`). Those are the pieces the
+// procedure codecs are built from, not something a consumer composes with —
+// they are still exported from `unimount/nfs`'s own `protocol.ts` for the
+// tests, they just do not belong on the package's public surface.
+export {
+  FATTR3_SIZE,
+  entryPlusSize,
+  entrySize,
+  errnoCodeOfStatus,
+  errnoOfStatus,
+  fattrOf,
+  fromTime,
+  ftypeOf,
+  modeTypeOf,
+  nfsStatusOf,
+  readAccessArgs,
+  readAccessRes,
+  readCommitArgs,
+  readCommitRes,
+  readCreateArgs,
+  readCreateRes,
+  readDirOp,
+  readExportList,
+  readFsinfoRes,
+  readFsstatRes,
+  readGetattrRes,
+  readLinkArgs,
+  readLinkRes,
+  readLookupRes,
+  readMkdirArgs,
+  readMknodArgs,
+  readMountList,
+  readMountRes,
+  readPathconfRes,
+  readReadArgs,
+  readReadRes,
+  readReaddirArgs,
+  readReaddirRes,
+  readReaddirplusArgs,
+  readReaddirplusRes,
+  readReadlinkRes,
+  readRenameArgs,
+  readRenameRes,
+  readSetattrArgs,
+  readSymlinkArgs,
+  readWccRes,
+  readWriteArgs,
+  readWriteRes,
+  statusName,
+  toTime,
+  wccAttrOf,
+  writeAccessArgs,
+  writeAccessRes,
+  writeCommitArgs,
+  writeCommitRes,
+  writeCreateArgs,
+  writeCreateRes,
+  writeDirOp,
+  writeExportList,
+  writeFsinfoRes,
+  writeFsstatRes,
+  writeGetattrRes,
+  writeLinkArgs,
+  writeLinkRes,
+  writeLookupRes,
+  writeMkdirArgs,
+  writeMknodArgs,
+  writeMountList,
+  writeMountRes,
+  writePathconfRes,
+  writeReadArgs,
+  writeReadRes,
+  writeReaddirArgs,
+  writeReaddirRes,
+  writeReaddirplusArgs,
+  writeReaddirplusRes,
+  writeReadlinkRes,
+  writeRenameArgs,
+  writeRenameRes,
+  writeSetattrArgs,
+  writeSymlinkArgs,
+  writeWccRes,
+  writeWriteArgs,
+  writeWriteRes,
+} from "./protocol.ts";
+export type {
+  Access3args,
+  Access3res,
+  Commit3args,
+  Commit3res,
+  Create3args,
+  CreateRes,
+  DirOpArgs,
+  Entry3,
+  EntryPlus3,
+  ExportEntry3,
+  Fattr3,
+  Fsinfo3res,
+  Fsstat3res,
+  Getattr3res,
+  Link3args,
+  Link3res,
+  Lookup3res,
+  Mkdir3args,
+  Mknod3args,
+  MountEntry3,
+  Mountres3,
+  NfsTime3,
+  Pathconf3res,
+  Read3args,
+  Read3res,
+  Readdir3args,
+  Readdir3res,
+  Readdirplus3args,
+  Readdirplus3res,
+  Readlink3res,
+  Rename3args,
+  Rename3res,
+  Sattr3,
+  SetTime3,
+  Setattr3args,
+  SpecData3,
+  Symlink3args,
+  WccAttr,
+  WccData,
+  WccRes,
+  Write3args,
+  Write3res,
+} from "./protocol.ts";
+export * from "./rpc.ts";
+export * from "./server.ts";
+export * from "./session.ts";
+export * from "./xdr.ts";

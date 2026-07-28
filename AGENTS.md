@@ -278,3 +278,141 @@ Bugs the oracles found, all fixed:
   `uv_spawn` — the child `chdir`s before `exec` while the parent blocks on the
   exec pipe, so the `LOOKUP` waits on the only thread that could answer it.
   Both are documented where they bite (`src/fuse/record.ts`, `src/fuse/mount.ts`).
+
+## Layout (milestone 6 — NFSv3 loopback transport, `unimount/nfs`)
+
+The second transport over the same `FsDriver`, and the one that needs no
+`/dev/fuse` and no native code — just a TCP socket. Layered exactly like the
+FUSE side, and for the same reason: everything above the socket is bytes in,
+bytes out, so a JavaScript client built from the same codecs can drive the whole
+protocol with **no mount and no root** (IDEA.md, "Tier 1").
+
+- `src/nfs/xdr.ts` — XDR (RFC 4506): `XdrReader`/`XdrWriter`, bounds-checked,
+  big-endian, 64-bit fields as `bigint`. **Only `XdrError` escapes a decoder**,
+  the same invariant `ProtocolError` has on the FUSE side, and it is fuzzed.
+  Every counted read is bounded before it allocates.
+- `src/nfs/rpc.ts` — ONC RPC v2 (RFC 5531): call/reply, `AUTH_NONE`/`AUTH_SYS`,
+  and TCP record marking (`frameRecord`, `frameFragments`, `RecordAssembler`).
+- `src/nfs/constants.ts` + `src/nfs/protocol.ts` — RFC 1813 transcribed. Every
+  struct encoded **and** decoded; each codec repeats the XDR declaration it
+  implements.
+- `src/nfs/handles.ts` — `FileHandleTable` and the readdir cookie scheme.
+- `src/nfs/session.ts` — `NfsSession(driver, options)`: `handleCall(bytes)` →
+  `Promise<Uint8Array | null>`, answering both programs. Never rejects.
+- `src/nfs/server.ts` — `createNfsServer(driver, options)`; the only file here
+  that opens a socket. `src/nfs/mount.ts` — `mountNfs()` and `nfsClientProbe()`.
+- `src/nfs/index.ts` re-exports `protocol.ts` **by name**, minus the fourteen
+  sub-struct helpers (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, and the
+  `post_op_*` / `wcc_data` / `nfstime3` / `specdata3` pairs). Those are what the
+  procedure codecs are built from, not something a consumer composes with.
+- `src/lock.ts` — `PathLock`, shared with the FUSE session (see below).
+
+Decisions worth not re-litigating:
+
+- **One TCP port, no portmapper.** MOUNT (100005 v3) and NFS (100003 v3) are
+  answered on the same socket and the mount command is told so with `port=`
+  _and_ `mountport=`, so `rpcbind` is never contacted (IDEA.md).
+- **The socket is the security boundary.** `AUTH_SYS` is a uid the client
+  asserts, so it is parsed and never believed; the server binds `127.0.0.1` and
+  drops non-loopback peers unless `allowRemote` says otherwise. New objects are
+  still `lchown`ed to the caller's credentials, the same fix the FUSE session
+  needed for the same reason.
+- **File handles are 20 bytes**: magic, an 8-byte boot verifier, a 64-bit entry
+  id. They are identity-keyed on the driver's `(dev, ino)`, so a handle survives
+  `rename` (including a rename of a directory _above_ it) and two hardlinks
+  share one. The verifier makes a handle from a previous process `ESTALE`
+  instead of aliasing a live entry.
+- **Nothing is ever forgotten.** NFSv3 has no `FORGET`, so a handle entry lives
+  as long as the server: a real, bounded leak (one per path the client ever
+  named) and the honest v1 tradeoff. A generation-stamped LRU is the fix if a
+  workload needs one.
+- **A handle with no path left is `NFS3ERR_STALE`**, immediately. FUSE keeps an
+  unlinked-but-open inode alive because the kernel says the file is open; NFSv3
+  never says so. Real clients paper over this with silly-rename, which is a
+  _client_-side trick. This is the one capability the transport loses.
+- **Readdir cookies** are `index + 1` into a snapshot of the listing, and the
+  `cookieverf3` is an FNV-1a hash of the entry names. Two useful consequences: a
+  client paging through is unaffected by concurrent changes (the snapshot it is
+  reading is cached), and a client whose snapshot was _evicted_ still resumes as
+  long as the directory has not changed, because re-listing reproduces the same
+  verifier. Only evicted-and-changed gets `NFS3ERR_BAD_COOKIE`.
+- **Writes are always `FILE_SYNC`.** The driver has whole-file semantics and no
+  writeback, so a resolved `WRITE` is already as durable as it can be; claiming
+  `UNSTABLE` would describe a buffer that does not exist. `COMMIT` exists and
+  succeeds anyway, because clients send it regardless. One `writeverf3` per
+  server instance.
+- **`.` and `..` are not in `READDIR`.** RFC 1813 does not require them and the
+  Linux client emits its own (`dir_emit_dots`), so a server that adds them makes
+  a listing that shows them twice. `LOOKUP` of both still works, and `..` is
+  clamped at the export root.
+- **`RENAME` takes a writer lock** over the path map, exactly as in the FUSE
+  session; `READ` and `WRITE` deliberately run outside it. The lock is now
+  **`src/lock.ts`, shared by both sessions** — it was character-identical in the
+  two and depends on nothing, so there was never a bundle-size reason to keep
+  two copies (an earlier draft of this file claimed there was; there wasn't).
+- Not supported, on purpose: `MKNOD` (`NFS3ERR_NOTSUPP` — the driver interface
+  cannot express a device node) and `CREATE` with `EXCLUSIVE` (`NFS3ERR_NOTSUPP`
+  — the verifier would have to be _stored_ somewhere that survives a retry, and
+  Linux falls back to `GUARDED`). NLM locking is out of scope, hence `nolock`.
+
+Tests in `test/nfs/`:
+
+- `client.ts` — the Tier-1 client: RPC over TCP plus one method per procedure,
+  and `nfsDriver()`, an `FsDriver` over it that walks paths and follows symlinks
+  itself (which is what an NFS client does). The counterpart of
+  `test/fuse/synthetic-kernel.ts`.
+- `xdr.test.ts`, `protocol.test.ts`, `handles.test.ts`, `golden.test.ts`,
+  `fuzz.test.ts` — Tier 0. **The golden fixtures give every field a distinct
+  value on purpose**: a fixture built from `uid: 0, gid: 0, size == used,
+fsid == fileid` is satisfied by an encoder _and_ decoder that transpose the
+  same pair, so the bytes and the round-trips both stay green while the wire
+  format is wrong. Mutation testing confirmed it — five symmetric transpositions
+  passed the entire suite against the old fixture, and all five fail against the
+  new one. Symmetric codecs cannot catch a symmetric mistake; only an asymmetric
+  fixture can, and `golden.test.ts` asserts its own 21 words are distinct so the
+  property cannot quietly erode.
+- `conformance.test.ts` — the conformance matrix's **NFS column**: the same
+  `test/conformance.ts` suite over a real socket, both drivers, no root.
+  **122/126**, with `handles` off (see above) — that is the whole capability
+  loss, and it is declared rather than derived.
+- `mount.test.ts` — Tier 2, `pnpm test:nfs:mount`, gated on `nfsClientProbe()`.
+  **This host cannot run it**: no `mount.nfs`, no `nfs` in `/proc/filesystems`,
+  no loadable modules at all (see `.agents/environment.md`). That is precisely
+  why the Tier-1 column carries the weight.
+
+Verified independently: `libnfs`'s `nfs-ls`/`nfs-cp`/`nfs-io` (a real NFSv3
+client sharing none of this code) drove a 30-assertion workload, a 3000-entry
+readdir and 4 MiB round-trips against the server, and `tshark` dissected the
+exchange with no warnings. That is the oracle the Tier-1 column cannot be, since
+the Tier-1 client is built from the server's own codecs. Reach for it again when
+the wire format changes — see `.agents/environment.md`.
+
+Bugs found while building it, and in review:
+
+- **`XdrWriter` wrote into a discarded buffer whenever it grew.**
+  `this.#view.setUint32(this.#room(4), …)` evaluates `this.#view` _before_ the
+  call that may replace it. Any message past the initial capacity — a large
+  `READ` reply — was silently corrupted or threw a `RangeError`. Fixed by
+  taking the offset into a local first, in every scalar writer and in `raw()`.
+- **`code in ERRNO_TO_NFS` matched `Object.prototype`.** An error with
+  `code: "toString"` looked up a _function_, which the writer coerced to `0` — an
+  `NFS3_OK` status word in front of a failure body, so a client's decoder
+  desyncs rather than merely getting the wrong answer. `Object.hasOwn` now, and
+  the "unmapped becomes `NFS3ERR_IO`" guarantee the module documents is true again.
+- **"Decoders copy" was false.** `Buffer.prototype.slice` is `subarray`, so a
+  `WRITE` payload reached the driver as a _view of the socket's receive pool_ —
+  the identical trap that corrupted the first FUSE transcripts. The three
+  `XdrReader` byte-readers go through `Uint8Array.prototype.slice.call` now. The
+  framing layer above them still hands out views on purpose, and
+  `RecordAssembler.push` says so: records are consumed by decoders that copy what
+  they keep, which is the narrowest place the copy has to happen.
+- **A reused inode number aliased a handle to a stale path.** Bind `/a`, then
+  have something outside the server move it to `/c` and bind that: the entry was
+  found by identity, kept `/a` as its primary name, and every operation on the
+  `/c` handle landed on whatever `/a` had become. `bind` now drops names a file's
+  `nlink` says it cannot still have (oldest first, the just-bound one kept), and
+  `pathOf` skips any name the table no longer maps to that entry.
+- **The cookie verifier's delimiter was a raw NUL byte in the source**, which
+  made `handles.ts` binary to `file(1)` and `grep`. It is `"\0"` now — the
+  behaviour was always right, and a test pins `["a b"]` against `["a", "b"]` so a
+  tidy-up cannot turn it into a character a filename could contain.

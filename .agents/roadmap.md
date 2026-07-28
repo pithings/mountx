@@ -44,7 +44,7 @@ Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
    negotiation defaults (`max_write` 1 MiB, `readdirplus`, attr/entry
    timeouts, `default_permissions`; writeback cache OFF), signal handlers +
    unmount + recovery docs. Real-mount smoke test under sudo (Tier 2).
-5. ✅ **DONE** (2026-07-28, uncommitted at time of writing)
+5. ✅ **DONE** (commit 06d8210, 2026-07-28)
    **Validation.** Differential suite: same op sequence against passthrough
    mount vs real `node:fs`, diff results. `unimount record`/replay fixtures.
    pjdfstest run against a real mount, **locally under sudo only** — the run
@@ -52,10 +52,13 @@ Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
    pass/fail, so the results are committed instead
    (`.agents/pjdfstest-results.md`). CI gets a `mount` job running
    `pnpm test:root` — the three Tier-2 vitest files — on a stock Linux runner.
-6. **NFSv3 loopback.** XDR codecs, MOUNT + NFSv3 servers over TCP (explicit
+6. ✅ **DONE** (2026-07-28, uncommitted at time of writing)
+   **NFSv3 loopback.** XDR codecs, MOUNT + NFSv3 servers over TCP (explicit
    `port=`/`mountport=`, no portmap), handle synthesis in the session layer
    for stateless ops. Tier-1 tests with a JS NFS client built from the same
-   XDR codecs (no mount, no root), then sudo mount test.
+   XDR codecs (no mount, no root), then sudo mount test — the last of which
+   **cannot run on this host** (no kernel NFS client at all, see
+   `.agents/environment.md`) and is gated on a probe.
 7. **Conformance matrix + benchmarks + docs.** One driver-interface
    conformance suite run three ways (loopback, FUSE, NFS); report per-
    transport capability loss honestly. Benchmark suite (ops/sec per mode).

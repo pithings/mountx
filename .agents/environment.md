@@ -45,3 +45,20 @@
 - Toolchain: Node v24.18.0, pnpm 11.17.0, zig + gcc/clang available.
 - Tests: vitest. Lint/format: oxlint + oxfmt. Build: obuild.
   Typecheck: `tsgo --noEmit --skipLibCheck`. Run `pnpm test` before commits.
+- **No NFS client on this host** (verified 2026-07-28, milestone 6): no
+  `mount.nfs`/`mount.nfs4` anywhere on `PATH` or in `/sbin`, no `nfs` line in
+  `/proc/filesystems`, `/lib/modules` is an empty symlink to /usr/lib/modules
+  and there is no `modprobe` — so the kernel NFS client cannot be loaded even
+  as root. NOTE: this is Fedora 44 — package manager is `dnf` (with network
+  access), NOT apt. libnfs/libnfs-utils/wireshark-cli/gdb are now installed
+  (milestone-6 verification); libnfs's nfs-ls/nfs-cp are userspace NFSv3
+  clients usable as independent oracles (caveat: getlogin() segfaults in
+  this container — LD_PRELOAD a shim returning a name). `rpcbind` and
+  `nfsstat` are absent too. The NFS _server_ (`unimount/nfs`) is unaffected: it
+  is pure JS over a TCP socket and its Tier-0/Tier-1 suites need nothing. Only
+  `pnpm test:nfs:mount` (Tier 2) is affected, and it skips itself on
+  `nfsClientProbe()`. On a host with `nfs-common`/`nfs-utils` installed it
+  should run as-is.
+  **Use libnfs whenever the wire format changes**: it shares none of our
+  codecs, which is exactly what the Tier-1 JS client — built from the server's
+  own codecs — cannot give. `tshark` dissects the exchange to confirm.

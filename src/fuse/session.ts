@@ -34,6 +34,7 @@
 import { constants } from "node:fs";
 import { fsError } from "../errors.ts";
 import { createLoopback, type Loopback } from "../harness.ts";
+import { PathLock } from "../lock.ts";
 import { joinPath } from "../path.ts";
 import type { DirentLike, FileHandleLike, FsDriver, StatsLike } from "../types.ts";
 import {
@@ -232,69 +233,6 @@ interface OpenFile {
    */
   handle: FileHandleLike | undefined;
   dir: DirState | undefined;
-}
-
-/**
- * A single writer / many readers lock over the path map.
- *
- * `RENAME` is the only operation that rewrites paths it did not resolve itself,
- * so it is the only one that can invalidate another request's work: a `LOOKUP`
- * that resolved `/a/b` before the rename must not bind that path after it. The
- * writer waits for in-flight readers and blocks new ones; everything else runs
- * concurrently, which is the whole point of not having a queue.
- *
- * **Liveness, stated honestly.** A writer blocks new readers *before* waiting
- * for the outstanding ones, so a driver call that never settles inside a reader
- * stalls every rename behind it, and every path-resolving request behind that.
- * Two things keep the blast radius small: only `RENAME` is a writer, and the
- * requests a driver can realistically hang on for an unbounded time — `READ`
- * and `WRITE` — are deliberately dispatched *outside* the lock, because they
- * resolve nothing in the path map. What remains exposed is a hung `LOOKUP`,
- * `READDIR` or `GETATTR`. A finer-grained scheme (per-subtree locks, or making
- * a reader's bind fail closed against a map epoch instead of blocking) is a
- * benchmark-milestone concern, not a v1 one.
- */
-class PathLock {
-  #tail: Promise<unknown> = Promise.resolve();
-  #gate: Promise<void> | undefined;
-  #active = new Set<Promise<unknown>>();
-
-  async read<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.#gate !== undefined) {
-      await this.#gate;
-    }
-    const running = fn();
-    this.#active.add(running);
-    try {
-      return await running;
-    } finally {
-      this.#active.delete(running);
-    }
-  }
-
-  write<T>(fn: () => Promise<T>): Promise<T> {
-    const run = async (): Promise<T> => {
-      let open!: () => void;
-      this.#gate = new Promise<void>((resolve) => {
-        open = resolve;
-      });
-      try {
-        await Promise.allSettled(this.#active);
-        return await fn();
-      } finally {
-        this.#gate = undefined;
-        open();
-      }
-    };
-    // Writers are serialized against each other by the chain; both callbacks
-    // are `run` so a failed rename does not wedge the next one.
-    const result = this.#tail.then(run, run);
-    this.#tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
 }
 
 function splitSeconds(seconds: number): { sec: bigint; nsec: number } {
