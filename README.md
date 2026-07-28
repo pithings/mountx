@@ -372,11 +372,11 @@ Serving needs no native code at all — the protocols are pure JS, which is a
 design rule of this project. The one exception is a ~7 KB helper used only to
 receive the mount connection from `fusermount3`; it ships prebuilt, is loaded
 only when you mount without root, and nothing else in the library touches it.
-It survives bundling: the same bytes ship a second time as base64 inside
-`native/prebuilt.mjs`, so when a bundler has moved the code away from the `.node`
-file the loader extracts the embedded copy to a private temporary directory,
-`dlopen`s it, and deletes it again. Nothing to configure, and nothing to mark as
-external.
+It ships as compressed base64 inside `native/prebuilt.mjs` rather than as a `.node` file —
+a binary is loaded by path, and a path is the one thing a bundle does not have.
+The loader extracts it to a private temporary directory, `dlopen`s it, and
+deletes it again. So it bundles: nothing to configure, nothing to mark as
+external, no sibling file to copy into your output.
 `createNfsServer()` runs anywhere Node does, including Windows: only putting a
 _client_ in front of it is platform-specific.
 
@@ -588,10 +588,10 @@ portable, and that file has the full tables and caveats.
 - `pnpm test` runs lint, typecheck and the suites that need no root;
   `pnpm test:rootless` adds the unprivileged real-mount suite (still no
   `sudo`); `pnpm test:root` adds the ones that do need it.
-- `pnpm build:native` rebuilds the prebuilt FUSE mount helper with `zig build`
-  and re-embeds it into `native/prebuilt.mjs`. Both outputs are committed, so
-  this is only needed when `native/` changes; `pnpm build:native:embed`
-  re-embeds the committed binaries without a Zig toolchain.
+- `pnpm build:native` rebuilds the FUSE mount helper with `zig build` and
+  re-embeds it into `native/prebuilt.mjs`, which is the committed artifact —
+  the `.node` files it is built from are gitignored. Only needed when
+  `native/src/` changes.
 - `pnpm matrix` and `pnpm bench` / `pnpm bench:root` regenerate the two
   committed reports this README draws from
   (`.agents/conformance-matrix.md`, `.agents/benchmarks.md`).

@@ -34,8 +34,11 @@ export interface NativeBinding {
   recvFd(socket: number, timeoutMs: number): number;
 }
 
-/** The prebuilt for the running platform, whether or not it exists. */
-export function nativePath(): string;
-
-/** Load the addon, once per process. Throws with a message naming the file. */
+/**
+ * Load the addon, once per process — the copy embedded in
+ * `native/prebuilt.mjs`, which is the only one there is.
+ *
+ * Throws when this platform has no embedded addon or it will not `dlopen`;
+ * unprivileged mounting is all that needs it.
+ */
 export function loadNative(): NativeBinding;

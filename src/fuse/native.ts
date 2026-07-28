@@ -19,11 +19,8 @@
  * it.
  */
 
-import { loadNative as dlopenNative, type NativeBinding, nativePath } from "#unfs/native";
+import { loadNative as dlopenNative, type NativeBinding } from "#unfs/native";
 import { ERRNO_CODES, type ErrnoCode } from "../errors.ts";
-
-export type { NativeBinding };
-export { nativePath };
 
 /** `errno` → `code`, the inverse of {@link ERRNO_CODES}. */
 const CODE_BY_ERRNO = new Map<number, ErrnoCode>(
@@ -36,16 +33,6 @@ let wrapped: NativeBinding | undefined;
 export function loadNative(): NativeBinding {
   wrapped ??= wrap(dlopenNative());
   return wrapped;
-}
-
-/** Is unprivileged mounting even possible in this process? */
-export function nativeAvailable(): boolean {
-  try {
-    loadNative();
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /**

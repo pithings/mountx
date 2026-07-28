@@ -2,10 +2,12 @@ node_modules
 coverage
 dist
 
-# The Zig build cache. `native/prebuilt/` is the output and *is* committed —
-# the binaries ship in the package, so they are checked in rather than built
-# on anyone's machine.
+# The Zig build cache and its output. Neither is committed and neither ships:
+# what git and the package carry is `native/prebuilt.mjs`, the same bytes as
+# base64, generated from these by `native/build.ts`. One committed copy of a
+# binary is enough, and the one that survives bundling is the useful one.
 native/.zig-cache
+native/prebuilt/
 .vscode
 .DS_Store
 .eslintcache
