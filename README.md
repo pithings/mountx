@@ -67,7 +67,7 @@ npx mountx
 **[mountx.vercel.app](https://mountx.vercel.app)**
 
 - [Quick Start](https://mountx.vercel.app/guide/quick-start) — install it and have a folder in about a minute.
-- [Writing a driver](https://mountx.vercel.app/guide/drivers) — the interface, errors, capabilities, testing.
+- [Drivers](https://mountx.vercel.app/guide/drivers) — the three built-in ones, and the interface for writing your own.
 - [Mounting](https://mountx.vercel.app/guide/mounting) — `mount()`, the mount object, lifecycle and unmount.
 - [Tuning](https://mountx.vercel.app/guide/tuning) — caching, concurrency, and the measured numbers.
 - [Troubleshooting](https://mountx.vercel.app/guide/troubleshooting) — the things that will bite you, and how to recover.
