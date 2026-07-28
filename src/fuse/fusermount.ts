@@ -172,13 +172,49 @@ export async function mountViaFusermount(
     // The helper has exited, so the descriptor is sitting in the socket buffer
     // and this returns immediately. The timeout is a backstop against a helper
     // that exits 0 without sending anything, not a wait anyone should observe.
-    return native.recvFd(ours, options.timeout ?? 10_000);
+    try {
+      return native.recvFd(ours, options.timeout ?? 10_000);
+    } catch (error) {
+      // The helper mounted, sent, and exited 0 *before* this ran, so by now the
+      // filesystem is live and this process has no descriptor for it. Nothing
+      // is left to serve it or to close, so it sits there answering `ENOTCONN`
+      // until somebody unmounts it by hand. Undo the mount before propagating.
+      //
+      // Unmounting by path rather than by connection is only sound because
+      // `mount()` refuses to stack — the path cannot have come to name a
+      // different mount in the microseconds since the helper made this one. Not
+      // `-z` either: nothing can hold a reference yet, so a plain `-u` gives a
+      // definite answer, where a lazy detach would report success and leave the
+      // mount listed.
+      throw await undoMount(mountpoint, error);
+    }
   } finally {
     closeQuietly(ours);
     if (sender >= 0) {
       closeQuietly(sender);
     }
   }
+}
+
+/**
+ * Unmount what a failed receive left behind, and say what to throw.
+ *
+ * `cause` is the failure that got us here and stays the diagnostic when the
+ * unmount works. When it does not, the leftover mount is the thing the caller
+ * cannot fix from the error alone, so that becomes the message and `cause`
+ * keeps the detail.
+ */
+async function undoMount(mountpoint: string, cause: unknown): Promise<unknown> {
+  try {
+    await unmountViaFusermount(mountpoint);
+  } catch (failure) {
+    return new Error(
+      `mountx: ${mountpoint} was mounted, no descriptor for it arrived, and unmounting ` +
+        `it failed too (${errorMessage(failure)}) — unmount it by hand`,
+      { cause },
+    );
+  }
+  return cause;
 }
 
 /**
