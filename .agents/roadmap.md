@@ -70,23 +70,36 @@ rather than by accident.
   libuv threadpool entirely (removing the self-client hazard); sync-worker
   is the mode `IDEA.md` expects to scale with worker count. Both are
   unmeasured — see the "known gaps" in `.agents/benchmarks.md`.
-- **macOS NFS mounting is written but not yet witnessed.** `src/nfs/mount.ts`
-  handles darwin — helper path, `nolocks`, no `hard`, `nobrowse`, `mount(8)`
-  as the mount table, `-f`-only escalation, realpath'd mountpoints — and each
-  option is transcribed from Apple's `mount_nfs(8)`/`mount(8)`, not guessed.
-  What is missing is a run on a real Mac: the pure half has Tier-0 coverage
-  (`test/nfs/mount-options.test.ts`) and `test/nfs/mount.test.ts` is written to
-  run there, but this dev host cannot execute the Tier-2 column. **Pooya is
-  running that column manually on real hardware** (2026-07-28); a
-  `macos-latest` CI job was considered and deliberately deferred until the
-  manual run says the transport works at all. Until then, treat darwin as
-  unproven.
-  **Tier 0/1 is green on darwin as of 2026-07-28**, which it was not before:
-  `pnpm test` failed 14 cases there, all of them the suite assuming Linux —
-  host `O_*` handed to a session that reads the wire's (now `src/fuse/flags.ts`)
-  and host `errno` numbers checked against the transcribed table (now a target's
-  `errors: "host"`). A `macos-latest` job would be a real signal for the pure
-  layers today, even with the Tier-2 NFS column still unwitnessed.
+- **macOS NFS mounting is witnessed** (2026-07-28, macOS 26.6 arm64 — see
+  `.agents/environment.md`). `pnpm test:nfs:mount` passes there: mounts, appears
+  in `mount(8)`'s table, carries the full workload, refuses to stack, reports
+  `statfs`, unmounts clean, three runs with no leaks. Every option
+  `nfsMountOptions()` sends comes back intact in `nfsstat -m`, so the transcribed
+  darwin half — helper path, `nolocks`, no `hard`, `nobrowse`, `mount(8)` as the
+  table, realpath'd mountpoints — was right as written.
+  **Tier 0/1 is green on darwin too**, which it was not before: `pnpm test`
+  failed 14 cases there, all of them the suite assuming Linux — host `O_*` handed
+  to a session that reads the wire's (now `src/fuse/flags.ts`) and host `errno`
+  numbers checked against the transcribed table (now a target's `errors: "host"`).
+  A `macos-latest` CI job is now worth doing for both layers, with one open
+  question first: a CI runner is launchd-attributed, which is the context that
+  gets an instant `EPERM` from the consent gate rather than a prompt, so the
+  Tier-2 column may need a PPPC profile to run there at all.
+  What the run _changed_:
+  - **The `-f`-only escalation ladder is weaker than it claimed.** macOS gates
+    network volumes behind a sandbox approval that is never prompted for a
+    command-line process, and `umount` blocks (GUI-attributed) or fails `EPERM`
+    (launchd-attributed) behind it. There is no escalation past that, so the
+    transport now bounds both `umount` steps, refuses to leak a child that
+    outlives its own deadline, and names the gate instead of blaming the driver
+    (`isConsentDenial`/`consentAdvice`).
+  - **AppleDouble sidecars.** `com.apple.provenance` on every new file + no xattr
+    procedure in NFSv3 means the client writes a `._name` companion per file, so
+    a driver mounted on macOS accumulates them. Nothing server-side can prevent
+    it; the Tier-2 suite filters and asserts them. Worth saying out loud in the
+    README's macOS section before anyone is surprised by it.
+  - `unlink` of a directory answers `EPERM` there, the same host split
+    `test/conformance.ts` already carries.
 - **Rootless NFS mounting on macOS** — the same shape as the rootless FUSE work
   above, and the reason not to hard-code "NFS needs root" anywhere outside
   `nfsClientProbe()`. `mount_nfs(8)` needs root, but Finder mounts `nfs://`
