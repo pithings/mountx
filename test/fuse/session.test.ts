@@ -25,6 +25,10 @@ import {
   FUSE_NOTIFY_INVAL_ENTRY,
   FUSE_NOTIFY_INVAL_INODE,
   FUSE_ROOT_ID,
+  O_CREAT,
+  O_RDWR,
+  O_TRUNC,
+  O_WRONLY,
 } from "../../src/fuse/constants.ts";
 import {
   decodeNotify,
@@ -41,8 +45,13 @@ import { createFuseSession, FuseSession, type FuseSessionOptions } from "../../s
 import { S_IFDIR, S_IFMT, S_IFREG, type FsDriver, type StatsLike } from "../../src/types.ts";
 import { KernelError, SyntheticKernel } from "./synthetic-kernel.ts";
 
-const O_RDWR = constants.O_RDWR;
-const O_CREAT_RDWR = constants.O_CREAT | constants.O_RDWR;
+/**
+ * Flags handed to `kernel` are the **wire's** — `constants.ts`'s transcribed
+ * `O_*`, not `node:fs`'s — because that is what a Linux kernel would have put
+ * in `fuse_open_in.flags`, whatever host this suite runs on. A driver written
+ * *inside* a test is the other side of `flags.ts` and uses `node:fs`'s.
+ */
+const O_CREAT_RDWR = O_CREAT | O_RDWR;
 const decoder = new TextDecoder();
 
 interface Mounted {
@@ -1421,7 +1430,7 @@ describe("O_TRUNC", () => {
 
     // `> f`: the kernel hands O_TRUNC over because FUSE_ATOMIC_O_TRUNC is
     // negotiated, and expects the file to be empty by the time OPEN replies.
-    const opened = await kernel.open(created.entry.nodeid, constants.O_WRONLY | constants.O_TRUNC);
+    const opened = await kernel.open(created.entry.nodeid, O_WRONLY | O_TRUNC);
     expect((await kernel.getattr(created.entry.nodeid)).attr.size).toBe(0n);
     await kernel.release(created.entry.nodeid, opened.fh);
     expectHealthy(session);
@@ -1432,7 +1441,8 @@ describe("O_TRUNC", () => {
     const driver: FsDriver = {
       ...base,
       // Strips O_TRUNC on the way through, as a driver that never thought
-      // about it would.
+      // about it would. `node:fs`'s O_TRUNC, not the wire's: this is a driver,
+      // and the session has already translated.
       open: (path, flags, mode) =>
         base.open(path, typeof flags === "number" ? flags & ~constants.O_TRUNC : flags, mode),
     };
@@ -1441,7 +1451,7 @@ describe("O_TRUNC", () => {
     await kernel.write(created.entry.nodeid, created.open.fh, 0, "old contents");
     await kernel.release(created.entry.nodeid, created.open.fh);
 
-    const opened = await kernel.open(created.entry.nodeid, constants.O_RDWR | constants.O_TRUNC);
+    const opened = await kernel.open(created.entry.nodeid, O_RDWR | O_TRUNC);
     expect((await kernel.getattr(created.entry.nodeid)).attr.size).toBe(0n);
     await kernel.release(created.entry.nodeid, opened.fh);
     expectHealthy(session);
@@ -1578,9 +1588,9 @@ describe("fix regressions", () => {
     await kernel.release(created.entry.nodeid, created.open.fh);
     const before = closed;
 
-    await expect(
-      kernel.open(created.entry.nodeid, constants.O_WRONLY | constants.O_TRUNC),
-    ).rejects.toMatchObject({ code: "EACCES" });
+    await expect(kernel.open(created.entry.nodeid, O_WRONLY | O_TRUNC)).rejects.toMatchObject({
+      code: "EACCES",
+    });
 
     // The open never yielded an fh, so nothing would ever have released it.
     expect(closed).toBe(before + 1);

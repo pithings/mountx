@@ -97,6 +97,7 @@ import {
   O_TRUNC,
   opcodeName,
 } from "./constants.ts";
+import { driverOpenFlags } from "./flags.ts";
 import { negotiateInit, type InitPreferences, type NegotiatedSession } from "./init.ts";
 import { INODE_GENERATION, InodeTable, type Inode } from "./inodes.ts";
 import {
@@ -225,7 +226,11 @@ interface DirState {
 interface OpenFile {
   fh: bigint;
   inode: Inode;
-  /** Raw `O_*` flags the kernel opened with. */
+  /**
+   * The `O_*` flags the kernel opened with, **in the driver's namespace** —
+   * `driverOpenFlags()` has already been applied, because the one thing this
+   * field feeds is a re-open through the driver (`#withHandle`).
+   */
   flags: number;
   /**
    * Real per-open state, when the driver has any. `undefined` means the driver
@@ -1290,10 +1295,10 @@ export class FuseSession {
     const inode = this.#inodes.require(request.header.nodeid);
     const path = this.#inodes.pathOf(inode);
     // `body.flags` is the kernel's, so it is inspected with the kernel's
-    // constants; it is forwarded to the driver as-is, which is exact on Linux
-    // (the only host this transport mounts on) and the reason the O_* values
-    // live in `constants.ts` rather than coming from `node:fs`.
-    const handle = await this.driver.open(path, body.flags);
+    // constants; the driver's is the host's namespace, so it gets the
+    // translation — which is the identity on Linux. See `flags.ts`.
+    const flags = driverOpenFlags(body.flags);
+    const handle = await this.driver.open(path, flags);
     // `FUSE_ATOMIC_O_TRUNC` is negotiated, so the kernel hands `O_TRUNC` over
     // and expects *us* to have applied it — but nothing in the driver contract
     // promises `open()` honours the flag. Doing it explicitly is idempotent for
@@ -1315,7 +1320,7 @@ export class FuseSession {
       // reports `ENOENT`, `EISDIR` and the permission errors.
       await this.#closeQuietly(handle);
     }
-    const file = this.#addFile(inode, body.flags, keep ? handle : undefined);
+    const file = this.#addFile(inode, flags, keep ? handle : undefined);
     const reply: FuseOpenOut = { fh: file.fh, openFlags: this.#openFlags(), backingId: 0 };
     return encodeReplyFor(request.header.unique, FUSE_OPEN, reply, this.protocol);
   }
@@ -1323,7 +1328,8 @@ export class FuseSession {
   async #create(request: FuseRequest): Promise<Uint8Array> {
     const body = request.body as FuseCreateIn;
     const path = this.#childOf(request.header.nodeid, body.name, "open");
-    const handle = await this.driver.open(path, body.flags, body.mode & 0o7777);
+    const flags = driverOpenFlags(body.flags);
+    const handle = await this.driver.open(path, flags, body.mode & 0o7777);
     const keep = this.driver.capabilities.handles;
     if (!keep) {
       await this.#closeQuietly(handle);
@@ -1340,7 +1346,7 @@ export class FuseSession {
       throw error;
     }
     const inode = this.#inodes.require(entry.nodeid);
-    const file = this.#addFile(inode, body.flags, keep ? handle : undefined);
+    const file = this.#addFile(inode, flags, keep ? handle : undefined);
     const reply: FuseCreateOut = {
       entry,
       open: { fh: file.fh, openFlags: this.#openFlags(), backingId: 0 },
@@ -1355,7 +1361,7 @@ export class FuseSession {
     if (!stats.isDirectory()) {
       throw fsError("ENOTDIR", { syscall: "opendir", path: this.#inodes.pathOf(inode) });
     }
-    const file = this.#addFile(inode, body.flags, undefined, true);
+    const file = this.#addFile(inode, driverOpenFlags(body.flags), undefined, true);
     const reply: FuseOpenOut = { fh: file.fh, openFlags: 0, backingId: 0 };
     return encodeReplyFor(request.header.unique, FUSE_OPENDIR, reply, this.protocol);
   }

@@ -43,6 +43,8 @@ conformance({
 conformance({
   name: "node-fs",
   capabilities: resolveCapabilities(createNodeFsDriver(tmpdir())),
+  // Every error not raised by its own path resolution is the host kernel's.
+  errors: "host",
   setup: async () => {
     const { root, cleanup } = await temporaryRoot();
     return { fs: createLoopback(createNodeFsDriver(root)), cleanup };
@@ -52,6 +54,8 @@ conformance({
 conformance({
   name: "node:fs/promises (raw)",
   capabilities: resolveCapabilities(rootedNodeFs(tmpdir())),
+  // The oracle *is* the host kernel, so its errors are the host's throughout.
+  errors: "host",
   setup: async () => {
     const { root, cleanup } = await temporaryRoot();
     return { fs: createLoopback(rootedNodeFs(root)), cleanup };

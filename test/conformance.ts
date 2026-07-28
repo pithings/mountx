@@ -10,6 +10,7 @@
  */
 
 import { constants } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ErrnoCode } from "../src/errors.ts";
 import { ERRNO_CODES } from "../src/errors.ts";
@@ -26,6 +27,23 @@ export interface ConformanceTarget {
   capabilities: ResolvedCapabilities;
   /** Fresh, empty filesystem per test. */
   setup: () => Promise<{ fs: Loopback; cleanup?: () => Promise<void> }>;
+  /**
+   * Where this target's errors come from, which decides how exactly the numbers
+   * and codes below can be pinned down.
+   *
+   * - `"linux"` (the default) — the target carries `src/errors.ts`'s
+   *   transcribed table and answers identically on every host, so both the code
+   *   and the number are exact.
+   * - `"host"` — the target forwards errors the host kernel raised. On Linux
+   *   that is the same thing; on darwin it is not (`ENOTEMPTY` is 66 rather
+   *   than 39, `ELOOP` 62 rather than 40) and the number is accepted as either.
+   *   Not a weakening of the interesting assertion: a driver like `node-fs`
+   *   resolves some path components itself — those errors come from the
+   *   transcribed table — and forwards the rest, so on a non-Linux host it is
+   *   genuinely a mixture, and the *code* is what the transports and the tests
+   *   downstream of them rely on.
+   */
+  errors?: "linux" | "host";
 }
 
 const decoder = new TextDecoder();
@@ -36,10 +54,8 @@ const isRoot = (process.getuid?.() ?? -1) === 0;
 const NOBODY_UID = 65_534;
 const NOBODY_GID = 65_534;
 
-/** Assert a call rejects with exactly the `node:fs` error shape for `code`. */
-async function rejects(promise: Promise<unknown>, code: ErrnoCode): Promise<void> {
-  await expect(promise).rejects.toMatchObject({ code, errno: -ERRNO_CODES[code] });
-}
+/** The host kernel's own numbers, for a target that forwards its errors. */
+const HOST_ERRNO = osConstants.errno as Record<string, number | undefined>;
 
 /** Assert a call rejects the way `node:fs` rejects a bad offset/length/position. */
 async function rejectsRange(promise: Promise<unknown>): Promise<void> {
@@ -54,6 +70,35 @@ export const REQUIREMENT_TAG = /\s\[needs ([^\]]+)]$/;
 
 export function conformance(target: ConformanceTarget): void {
   const { capabilities } = target;
+  const hostErrors = target.errors === "host";
+
+  /** Every `errno` this target is allowed to report for `code`. */
+  const errnosFor = (code: ErrnoCode): number[] => {
+    const linux = -ERRNO_CODES[code];
+    const host = HOST_ERRNO[code];
+    return !hostErrors || host === undefined || -host === linux ? [linux] : [linux, -host];
+  };
+
+  /** Assert a call rejects with the `node:fs` error shape for `code`. */
+  const rejects = async (promise: Promise<unknown>, code: ErrnoCode): Promise<void> => {
+    const error = (await promise.then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )) as { errno?: number } | undefined;
+    if (error === undefined) {
+      expect.fail(`expected a rejection with code ${code}, but the call resolved`);
+    }
+    expect(error).toMatchObject({ code });
+    expect(errnosFor(code)).toContain(error.errno);
+  };
+
+  /**
+   * `unlink` of a directory. POSIX permits either answer and the two families
+   * differ: Linux says `EISDIR`, the BSDs (darwin included) say `EPERM`. Only a
+   * host-backed target can disagree with Linux here — one carrying the
+   * transcribed table answers `EISDIR` everywhere and is held to it.
+   */
+  const unlinkDirCode: ErrnoCode = hostErrors && process.platform !== "linux" ? "EPERM" : "EISDIR";
 
   /**
    * `it` / `describe` for a case that only means something when the target has
@@ -397,7 +442,7 @@ export function conformance(target: ConformanceTarget): void {
 
       it("rejects a directory with EISDIR and a missing file with ENOENT", async () => {
         await fs.mkdir("/dir");
-        await rejects(fs.unlink("/dir"), "EISDIR");
+        await rejects(fs.unlink("/dir"), unlinkDirCode);
         await rejects(fs.unlink("/nope"), "ENOENT");
       });
 

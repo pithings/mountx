@@ -81,6 +81,12 @@ rather than by accident.
   `macos-latest` CI job was considered and deliberately deferred until the
   manual run says the transport works at all. Until then, treat darwin as
   unproven.
+  **Tier 0/1 is green on darwin as of 2026-07-28**, which it was not before:
+  `pnpm test` failed 14 cases there, all of them the suite assuming Linux —
+  host `O_*` handed to a session that reads the wire's (now `src/fuse/flags.ts`)
+  and host `errno` numbers checked against the transcribed table (now a target's
+  `errors: "host"`). A `macos-latest` job would be a real signal for the pure
+  layers today, even with the Tier-2 NFS column still unwitnessed.
 - **Rootless NFS mounting on macOS** — the same shape as the rootless FUSE work
   above, and the reason not to hard-code "NFS needs root" anywhere outside
   `nfsClientProbe()`. `mount_nfs(8)` needs root, but Finder mounts `nfs://`

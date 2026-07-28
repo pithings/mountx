@@ -93,6 +93,9 @@ describe("over an NFSv3 server", () => {
   conformance({
     name: "node-fs driver, over NFS",
     capabilities: THROUGH_NFS,
+    // The driver forwards the host kernel's errors, and `NFS3ERR_*` carries the
+    // ones this suite asks about straight through.
+    errors: "host",
     setup: async () => {
       const backing = await mkdtemp(join(tmpdir(), "mountx-nfs-"));
       const served = await serve(createNodeFsDriver(backing));
