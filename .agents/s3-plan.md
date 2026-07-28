@@ -103,7 +103,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       `test/s3/sigv4.test.ts` against AWS's published SigV4 test vectors as
       goldens. Verify: vectors are transcribed (named source), not invented;
       `node:crypto` only.
-- [ ] **2. `src/s3/xml.ts`** — bounded XML encoder for list/error/multipart
+- [x] **2. `src/s3/xml.ts`** — bounded XML encoder for list/error/multipart
       responses and parser for the two request bodies (DeleteObjects,
       CompleteMultipartUpload); escaping both ways. Tests: round-trips + golden
       fixtures. Verify: fixtures give every field a distinct value; parser is
