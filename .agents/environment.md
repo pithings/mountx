@@ -12,10 +12,15 @@
 - **Caveat — teardown:** if FUSE_INIT is never replied to, `umount` hangs
   (D-state). Closing the `/dev/fuse` fd aborts the connection and unblocks.
   Always reply to INIT before anything else; always install teardown.
-- **Caveat — teardown after INIT (verified during milestone 2):** once INIT
-  is answered, `umount(8)` blocks until the server answers `FUSE_DESTROY`.
-  Teardown must keep the read loop alive across umount (answering DESTROY),
-  else fall back to closing the fd / `umount -l`.
+- **Caveat — teardown after INIT (corrected during milestone 3):** for
+  `-t fuse` mounts the kernel NEVER sends `FUSE_DESTROY` (that's `fuseblk`
+  only — see `fuse_init_fs_context` in fs/fuse/inode.c; verified twice on
+  a live mount: last opcode before a clean umount was STATFS). Therefore
+  the transport MUST detect unmount via read() returning EOF/ENODEV on
+  /dev/fuse and call `session.destroy()` itself — that call is the only
+  thing that closes leftover handles and clears the inode table. Keep the
+  read loop alive through umount; if INIT was never answered, close the
+  fd to abort the connection.
 - `sudo` is passwordless BUT root's PATH lacks node (fnm). Use
   `sudo "$(which node)" script.mjs`. Since node itself runs as root, the
   sudo `closefrom` fd-stripping caveat from IDEA.md does not apply.

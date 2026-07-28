@@ -30,7 +30,7 @@ Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
    In-memory driver + node:fs passthrough driver. Loopback harness feeding
    calls straight to a driver (no mount) + one conformance suite run against
    both drivers (Tier 0).
-2. **FUSE protocol layer.** Pure JS, zero deps: all struct codecs with
+2. ✅ **DONE** (commit 3aa8e2f, 2026-07-28) **FUSE protocol layer.** Pure JS, zero deps: all struct codecs with
    `DataView`, opcode table, `FUSE_INIT` negotiation logic as pure functions.
    Property-tested round-trips, golden byte fixtures, decoder fuzz (no
    exception escapes; exactly-once reply invariant harness).

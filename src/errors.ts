@@ -48,6 +48,12 @@ export const ERRNO_CODES = {
   EPROTO: 71,
   EOVERFLOW: 75,
   ENOTSUP: 95,
+  /**
+   * Not a code `node:fs` can produce — libuv has no name for it — but the one
+   * POSIX answer for "that handle names something that no longer exists",
+   * which is exactly what a transport owes the kernel for a forgotten nodeid.
+   */
+  ESTALE: 116,
   EDQUOT: 122,
 } as const;
 
@@ -87,6 +93,7 @@ const ERRNO_MESSAGES: Record<ErrnoCode, string> = {
   EPROTO: "protocol error",
   EOVERFLOW: "value too large for defined data type",
   ENOTSUP: "operation not supported on socket",
+  ESTALE: "stale file handle",
   EDQUOT: "disk quota exceeded",
 };
 

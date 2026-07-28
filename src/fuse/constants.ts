@@ -245,6 +245,32 @@ export const DT_REG = 8;
 export const DT_LNK = 10;
 export const DT_SOCK = 12;
 
+/**
+ * `open(2)` flags **as they appear on the FUSE wire**.
+ *
+ * Not from `fuse.h` — these are Linux's `asm-generic/fcntl.h` values, and they
+ * are transcribed here for the same reason everything else in this file is:
+ * `fuse_open_in.flags` and `fuse_create_in.flags` carry whatever the *Linux*
+ * kernel put there, whatever host the server happens to run on.
+ *
+ * **Do not substitute `node:fs`'s `constants.O_*` for these.** Those are the
+ * host's values, and they disagree: macOS's `O_TRUNC` is `0o2000`, which is
+ * Linux's `O_APPEND`, so a Tier-0 test run on macOS would read an append-open
+ * as a truncating one. The converse also holds — flags this server *originates*
+ * for a driver (`unimount.mknod`'s fallback, say) must use `node:fs`'s
+ * constants, because the driver resolves them against the host.
+ *
+ * Only the bits the session actually inspects are listed.
+ */
+export const O_ACCMODE = 0o3;
+export const O_RDONLY = 0o0;
+export const O_WRONLY = 0o1;
+export const O_RDWR = 0o2;
+export const O_CREAT = 0o100;
+export const O_EXCL = 0o200;
+export const O_TRUNC = 0o1000;
+export const O_APPEND = 0o2000;
+
 /** `lseek(2)` whence values carried by `fuse_lseek_in.whence`. */
 export const SEEK_SET = 0;
 export const SEEK_CUR = 1;
