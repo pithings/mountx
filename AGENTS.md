@@ -17,6 +17,7 @@ Core (`src/`):
 - `path.ts` — absolute POSIX path helpers; `..` clamps at the root.
 - `harness.ts` — `createLoopback(driver)`: normalizes paths, fills missing methods with `ENOSYS`, resolves capabilities. What driver authors test against.
 - `lock.ts` — `PathLock`, the writer lock over the path map, shared by the FUSE and NFS sessions (`RENAME` takes it; `READ`/`WRITE` run outside it).
+- `auto.ts` — exported as `mountx/auto`: `probeTransports()` and a `mount()` that picks FUSE where FUSE works (root _or_ `fusermount3`) and NFS otherwise, which is what macOS gets. Both transports arrive via `await import()`, and the probe reaches only `nfs/probe.ts` and `fuse/fusermount.ts`, so choosing one never loads the other's codec. The result is the transport's own mount object with a `transport` discriminant defined on it — tagged, not wrapped. No fallback after a failure, and no probe when a transport is named: both are deliberate, see the module docs.
 - `drivers/memory.ts`, `drivers/node-fs.ts` — the two v1 drivers; the passthrough resolves every path component itself so nothing escapes its root.
 
 FUSE (`src/fuse/`, exported as `mountx/fuse`):
@@ -40,13 +41,15 @@ NFS (`src/nfs/`, exported as `mountx/nfs`):
 - `constants.ts` + `protocol.ts` — RFC 1813 transcribed; every struct encoded **and** decoded.
 - `handles.ts` — `FileHandleTable` and the readdir cookie scheme.
 - `session.ts` — `NfsSession(driver, options)`: `handleCall(bytes)` → `Promise<Uint8Array | null>`, answering both MOUNT and NFS programs.
-- `server.ts` — `createNfsServer(driver, options)`, the only file here that opens a socket. `mount.ts` — `mountNfs()`/`nfsClientProbe()`, and the only platform-aware file in the project: it mounts on **Linux and macOS**, and keeps the difference in three pure, tested pieces (`nfsMountOptions()`, `parseMountTable()`, the probe's helper paths) plus a `-f`-only escalation ladder on macOS. macOS is NFS-only by necessity — macFUSE is a third-party kext with its own protocol dialect, so `src/fuse/` cannot serve it.
+- `probe.ts` — `nfsClientProbe()` and the `NfsPlatform` narrowing, split out of `mount.ts` because `mountx/auto` asks before deciding what to load: it imports `node:fs` and nothing else, where `mount.ts` pulls the server and the whole codec behind it. `mount.ts` re-exports it.
+- `server.ts` — `createNfsServer(driver, options)`, the only file here that opens a socket. `mount.ts` — `mountNfs()`/`nfsMountOptions()`, and the only platform-aware transport in the project: it mounts on **Linux and macOS**, and keeps the difference in three pure, tested pieces (`nfsMountOptions()`, `parseMountTable()`, the probe's helper paths) plus a `-f`-only escalation ladder on macOS. macOS is NFS-only by necessity — macFUSE is a third-party kext with its own protocol dialect, so `src/fuse/` cannot serve it.
 - `index.ts` — re-exports `protocol.ts` by name, minus the sub-struct helpers (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, ...).
 
 Tests (`test/`):
 
 - `conformance.ts` — the one Tier-0 suite, written against the driver interface; `drivers.test.ts` runs it against memory, node-fs and raw `node:fs/promises` (loopback column).
 - `rooted-node-fs.ts` — `node:fs/promises` rooted at a directory; the oracle shared by `drivers.test.ts` and the FUSE conformance column.
+- `auto.test.ts` — Tier 0 for `mountx/auto`: the preference order and the ruled-out reasons, answered for darwin and win32 from any host via the `platform` override. `auto-mount.test.ts` — Tier 2, whichever transport this host chose; runs under `test:rootless` and skips unless something can mount _and_ the threadpool has been raised.
 - `fuse/` — protocol/session Tier 0 (`random.ts`, `protocol.test.ts`, `golden.test.ts`, `dirent.test.ts`, `init.test.ts`, `session.test.ts`, `inodes.test.ts`, `session-fuzz.test.ts`, `synthetic-kernel.ts`, `fuzz.test.ts`), `native.test.ts` (the whole addon, Tier 0 — passing a descriptor to yourself needs no helper and no privileges), Tier 2 `mount.test.ts` and `mount-rootless.test.ts` (no sudo), the differential oracle (`differential.ts`+`differential.test.ts`), record/replay (`record-fixtures.ts`+`replay.test.ts`), the FUSE conformance column (`conformance-mount.test.ts`).
 - `nfs/` — Tier 0 (`xdr.test.ts`, `protocol.test.ts`, `handles.test.ts`, `golden.test.ts`, `fuzz.test.ts`, `mount-options.test.ts` — the platform difference, checked from either host), the Tier-1 JS client (`client.ts`) and its conformance column (`conformance.test.ts`, `session.test.ts`), Tier 2 `mount.test.ts` (gated on `nfsClientProbe()`, runs on Linux and macOS).
 - `pjdfstest/` — `run.sh`+`run.ts` drive the pinned pjdfstest clone (gitignored) against a real mount and write the committed analysis.

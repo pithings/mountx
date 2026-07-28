@@ -26,11 +26,26 @@ results.
   checks, `allow_other` gating, `fuse.conf`, mtab — in a binary running as
   root, to save one package dependency).
 
+- **`mountx/auto`** (2026-07-28). The transport chooser `src/index.ts`
+  predicted, as its own subpath rather than the root export: `probeTransports()`
+  publishes what each transport can do here and why not, `mount()` takes the
+  first usable one in preference order (FUSE on Linux — root _or_ rootless —
+  NFS otherwise), and both transports arrive through `await import()` so
+  choosing one never loads the other's codec. The returned object is the
+  transport's own mount with a `transport` discriminant defined on it, so
+  narrowing reaches every transport-specific member and `await using` is
+  unaffected. Two refusals are part of the design: no fallback after a mount
+  failure (the probe decides from host facts, once — a silent second attempt
+  would hand back different semantics than the error nobody saw), and no probe
+  at all when a transport is named. Options are a shared subset plus
+  `fuse: {…}`/`nfs: {…}` escape hatches, because the two transports'
+  same-named options are genuinely different shapes.
+
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
 - **Layout:** single `mountx` package with subpath exports (`mountx`,
-  `mountx/fuse`, `mountx/nfs`, `mountx/drivers/memory`,
+  `mountx/auto`, `mountx/fuse`, `mountx/nfs`, `mountx/drivers/memory`,
   `mountx/drivers/node-fs`). pnpm workspace kept for future splitting.
 - **Drivers in v1:** in-memory driver + `node:fs` passthrough (the
   differential-test oracle). unstorage adapter deferred.
@@ -61,13 +76,20 @@ rather than by accident.
   option is transcribed from Apple's `mount_nfs(8)`/`mount(8)`, not guessed.
   What is missing is a run on a real Mac: the pure half has Tier-0 coverage
   (`test/nfs/mount-options.test.ts`) and `test/nfs/mount.test.ts` is written to
-  run there, but this dev host cannot execute the Tier-2 column. The fix is a
-  `macos-latest` CI job — GitHub's runners have passwordless sudo — and until
-  it exists, treat darwin as unproven.
-- **`mountx/auto`.** The transport chooser `src/index.ts` predicts: probe, then
-  FUSE on Linux / NFS on macOS, with a narrow shared `Mount` supertype and a
-  dynamic `import()` so neither transport's bytes reach a caller who does not
-  use it. Blocked on nothing except the macOS verification above.
+  run there, but this dev host cannot execute the Tier-2 column. **Pooya is
+  running that column manually on real hardware** (2026-07-28); a
+  `macos-latest` CI job was considered and deliberately deferred until the
+  manual run says the transport works at all. Until then, treat darwin as
+  unproven.
+- **Rootless NFS mounting on macOS** — the same shape as the rootless FUSE work
+  above, and the reason not to hard-code "NFS needs root" anywhere outside
+  `nfsClientProbe()`. `mount_nfs(8)` needs root, but Finder mounts `nfs://`
+  URLs as an ordinary user, which means something unprivileged can already ask
+  for the mount: `NetFS.framework`'s `NetFSMountURLSync`, and possibly the
+  `open nfs://127.0.0.1:<port>/` URL handler that sits on top of it. Neither is
+  verified — in particular whether a non-standard port survives the URL, and
+  where the volume lands (`/Volumes/…`, not a path we chose). Investigate
+  before promising anything.
 - **WebDAV and Windows support.** Not designed against; WebDAV is the
   unprivileged, zero-native-code path for macOS/Windows per `IDEA.md`.
   Windows also has no `mount(8)`, so it stays out of the NFS transport's

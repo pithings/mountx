@@ -12,8 +12,7 @@ So anything that behaves a bit like a filesystem can get a real path: an
 in-memory store, a zip file, an S3 bucket, a database, or a plain folder served back out with your own rules on top.
 
 ```ts
-import { mount } from "mountx/fuse";
-import { mountNfs } from "mountx/nfs";
+import { mount } from "mountx/auto";
 import { createLoopback } from "mountx";
 import { createMemoryDriver } from "mountx/drivers/memory";
 
@@ -27,13 +26,13 @@ await fs.mkdir("/notes");
 await fs.writeFile("/notes/hello.txt", "hi!");
 new TextDecoder().decode(await fs.readFile("/notes/hello.txt")); // "hi"
 
-// Mount the driver to the kernel (Linux):
+// Mount the driver to the kernel with whatever this host can use —
+// FUSE on Linux (no root needed), NFSv3 on macOS:
 await using mounted = await mount(driver, "/mnt/point", {
-  attrTimeout: 10, // seconds the kernel may cache attributes
+  fuse: { attrTimeout: 10 }, // seconds the kernel may cache attributes
 });
 
-// or, where FUSE is not available (macOS, say), mount it over NFSv3:
-// await using served = await mountNfs(driver, "/mnt/point")
+mounted.transport; // "fuse" | "nfs" — or import a transport directly to pick one
 
 /**
 # /mnt/point is a real folder now, so every program on the machine can use it:
@@ -41,7 +40,9 @@ $ cat /mnt/point/notes/hello.txt   =>   hi!
 $ echo hey > /mnt/point/notes/other.txt
 **/
 
-mounted.notifyInvalInode(2n); // storage changed behind mountx's back? drop the cache
+if (mounted.transport === "fuse") {
+  mounted.notifyInvalInode(2n); // storage changed behind mountx's back? drop the cache
+}
 await mounted.unmount(); // or let `await using` do it at the end of the block
 ```
 
@@ -51,15 +52,19 @@ await mounted.unmount(); // or let `await using` do it at the end of the block
 npx nypm i mountx
 ```
 
-The package has five entry points:
+The package has six entry points:
 
-| import from              | what you get                               |
-| ------------------------ | ------------------------------------------ |
-| `mountx`                 | the driver types, errors, loopback harness |
-| `mountx/fuse`            | `mount()` — a real Linux mount             |
-| `mountx/nfs`             | `mountNfs()` / `createNfsServer()`         |
-| `mountx/drivers/memory`  | a ready-made in-memory filesystem          |
-| `mountx/drivers/node-fs` | a ready-made passthrough to a real folder  |
+| import from              | what you get                                      |
+| ------------------------ | ------------------------------------------------- |
+| `mountx`                 | the driver types, errors, loopback harness        |
+| `mountx/auto`            | `mount()` — picks the transport this host can use |
+| `mountx/fuse`            | `mount()` — a real Linux mount                    |
+| `mountx/nfs`             | `mountNfs()` / `createNfsServer()`                |
+| `mountx/drivers/memory`  | a ready-made in-memory filesystem                 |
+| `mountx/drivers/node-fs` | a ready-made passthrough to a real folder         |
+
+Each subpath loads only what it needs — `mountx/auto` reaches a transport
+through `await import()`, so choosing FUSE never loads the NFS stack.
 
 ## Step 1 — try it with no mounting at all
 
@@ -371,6 +376,42 @@ NFSv3 is stateless: there is no `open`/`release`, so every request carries a
 handle built from the driver's `(dev, ino)` identity. In practice this costs one
 behaviour — a file that is deleted while still open stays readable over FUSE,
 but gives `ESTALE` over NFS.
+
+### Or let mountx choose: `mountx/auto`
+
+```ts
+import { mount, probeTransports } from "mountx/auto";
+import { createMemoryDriver } from "mountx/drivers/memory";
+
+await using mounted = await mount(createMemoryDriver(), "/mnt/point");
+mounted.transport; // "fuse" on Linux, "nfs" on macOS
+```
+
+It prefers FUSE wherever FUSE works — including unprivileged, via
+`fusermount3` — and falls back to NFSv3, which is what macOS gets. The result
+is the transport's own mount object with a `transport` tag added, so narrowing
+on it reaches everything that transport has (`session`, `fd`,
+`notifyInvalInode` for FUSE; `server`, `port` for NFS) and `await using` works
+the same.
+
+Ask before you commit to it:
+
+```ts
+const probe = await probeTransports();
+probe.chosen; // "fuse" | "nfs" | undefined
+probe.reason; // when nothing can mount, what each transport is missing
+```
+
+Two deliberate limits. Naming a transport (`{ transport: "nfs" }`) skips the
+probe, so the error you get is that transport's own. And there is no fallback
+_after_ a failure: the probe decides once, and if the chosen transport then
+fails, that error is what you get rather than a silent mount with different
+semantics.
+
+Options common to both (`readOnly`, `signals`, `unmountTimeout`,
+`useDriverIno`, `onError`, `onTransportError`) sit at the top level;
+transport-specific ones go in `fuse: {…}` or `nfs: {…}` and win over the
+shared ones.
 
 ## Tuning
 
