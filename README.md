@@ -26,13 +26,11 @@ await fs.mkdir("/notes");
 await fs.writeFile("/notes/hello.txt", "hi!");
 new TextDecoder().decode(await fs.readFile("/notes/hello.txt")); // "hi"
 
-// Mount the driver to the kernel with whatever this host can use —
-// FUSE on Linux (no root needed), NFSv3 on macOS:
+// Mount the driver to the kernel with whatever this host can use
+// FUSE on Linux (no root needed), NFSv3 on macOS
 await using mounted = await mount(driver, "/mnt/point", {
   fuse: { attrTimeout: 10 }, // seconds the kernel may cache attributes
 });
-
-mounted.transport; // "fuse" | "nfs" — or import a transport directly to pick one
 
 /**
 # /mnt/point is a real folder now, so every program on the machine can use it:
@@ -43,6 +41,7 @@ $ echo hey > /mnt/point/notes/other.txt
 if (mounted.transport === "fuse") {
   mounted.notifyInvalInode(2n); // storage changed behind mountx's back? drop the cache
 }
+
 await mounted.unmount(); // or let `await using` do it at the end of the block
 ```
 
@@ -54,16 +53,18 @@ npx nypm i mountx
 
 The package has six entry points:
 
-| import from              | what you get                                      |
-| ------------------------ | ------------------------------------------------- |
-| `mountx`                 | the driver types, errors, loopback harness        |
-| `mountx/auto`            | `mount()` — picks the transport this host can use |
-| `mountx/fuse`            | `mount()` — a real Linux mount                    |
-| `mountx/nfs`             | `mountNfs()` / `createNfsServer()`                |
-| `mountx/drivers/memory`  | a ready-made in-memory filesystem                 |
-| `mountx/drivers/node-fs` | a ready-made passthrough to a real folder         |
+| import from              | what you get                                                  |
+| ------------------------ | ------------------------------------------------------------- |
+| `mountx/auto`            | **start here** — `mount()`, picks the transport for this host |
+| `mountx`                 | the driver types, errors, loopback harness                    |
+| `mountx/drivers/memory`  | a ready-made in-memory filesystem                             |
+| `mountx/drivers/node-fs` | a ready-made passthrough to a real folder                     |
+| `mountx/fuse`            | the FUSE transport on its own, if you want to pin it          |
+| `mountx/nfs`             | the NFSv3 transport, and `createNfsServer()`                  |
 
-Each subpath loads only what it needs — `mountx/auto` reaches a transport
+`mountx/auto` is the one to import unless you have a reason not to: it works
+out what this host can mount with and hands back that transport's own mount
+object. Each subpath loads only what it needs — `auto` reaches a transport
 through `await import()`, so choosing FUSE never loads the NFS stack.
 
 ## Step 1 — try it with no mounting at all
@@ -93,16 +94,20 @@ paths, answers `ENOSYS` for methods your driver does not have, and works out
 what your driver supports. Nothing is mounted, no root needed, works on every
 platform. This is the best place to develop and test a driver.
 
-## Step 2 — mount it for real (FUSE, Linux)
+## Step 2 — mount it for real
 
-Now the same driver, but as a folder anyone on the machine can open:
+Now the same driver, but as a folder anyone on the machine can open. `mount()`
+from `mountx/auto` picks the transport this host can use — FUSE on Linux,
+NFSv3 on macOS — so this is the same code everywhere:
 
 ```ts
 // serve.ts
-import { mount } from "mountx/fuse";
+import { mount } from "mountx/auto";
 import { createMemoryDriver } from "mountx/drivers/memory";
 
 await using mounted = await mount(createMemoryDriver(), "/mnt/point");
+
+mounted.transport; // "fuse" | "nfs" — which one you got
 
 // /mnt/point is a real folder now. Keep the process alive.
 await new Promise(() => {});
@@ -126,19 +131,20 @@ Press Ctrl-C in the first terminal and the folder disappears. `await using`
 unmounts when the block ends; you can also call `await mounted.unmount()`
 yourself.
 
-**Do I need root?** No, as long as `fusermount3` is installed — it is the
-setuid helper that ships with FUSE, and it is already there on most desktop
-Linux (`apt install fuse3` / `dnf install fuse3` otherwise). Mounting is a
-syscall Node cannot make on its own, so mountx asks `fusermount3` to make it
-and hand the connection back. If you are root, it skips the helper and uses
-`mount(8)` directly.
+**Do I need root?** On Linux, where you get FUSE: no, as long as `fusermount3`
+is installed — it is the setuid helper that ships with FUSE, and it is already
+there on most desktop Linux (`apt install fuse3` / `dnf install fuse3`
+otherwise). Mounting is a syscall Node cannot make on its own, so mountx asks
+`fusermount3` to make it and hand the connection back. If you are root, it
+skips the helper and uses `mount(8)` directly. On macOS, where you get NFSv3,
+mounting does need root — serving never does, on either transport.
 
-Two things an unprivileged mount cannot do: `allowOther` needs
+Two things an unprivileged FUSE mount cannot do: `allowOther` needs
 `user_allow_other` in `/etc/fuse.conf`, and forcing down a mount whose driver
 has stopped answering is weaker (there is no `umount -f` without root).
 
-**If a process dies without unmounting**, the folder is left stale rather than
-frozen — `ls` says `ENOTCONN` instead of hanging. Clean it up with:
+**If a FUSE process dies without unmounting**, the folder is left stale rather
+than frozen — `ls` says `ENOTCONN` instead of hanging. Clean it up with:
 
 ```sh
 fusermount3 -u /mnt/point   # or, as root: umount -l /mnt/point
@@ -160,7 +166,7 @@ The second bundled driver hands requests to a real directory, and makes sure
 nothing outside it can be reached:
 
 ```ts
-import { mount } from "mountx/fuse";
+import { mount } from "mountx/auto";
 import { createNodeFsDriver } from "mountx/drivers/node-fs";
 
 await using mounted = await mount(createNodeFsDriver("/home/me/data"), "/mnt/point");
@@ -306,29 +312,98 @@ interface, and it runs against the loopback harness with no mount needed. Point
 it at your driver, or write your own checks the same way — anything that works
 through `createLoopback()` works through a mount.
 
-## Step 5 — NFSv3 transport
+## Step 5 — transports
 
-FUSE needs Linux and `/dev/fuse`. If you do not have that, mountx can serve the
-same driver as an NFSv3 share over a TCP socket instead:
+There are two, and `mountx/auto` is how you should normally reach either:
 
 ```ts
-import { mountNfs } from "mountx/nfs";
+import { mount, probeTransports } from "mountx/auto";
 import { createMemoryDriver } from "mountx/drivers/memory";
 
-await using mounted = await mountNfs(createMemoryDriver(), "/mnt/point");
+await using mounted = await mount(createMemoryDriver(), "/mnt/point");
+mounted.transport; // "fuse" on Linux, "nfs" on macOS
 ```
 
-`mountNfs()` also needs root, and needs the host to have an NFS client.
-`nfsClientProbe()` tells you before it tries, and names the missing piece.
+It prefers FUSE wherever FUSE works — including unprivileged, via
+`fusermount3` — and uses NFSv3 otherwise, which is what macOS gets. The result
+is the transport's own mount object with a `transport` tag added, so narrowing
+on it reaches everything that transport has (`session`, `fd`,
+`notifyInvalInode` for FUSE; `server`, `port` for NFS) and `await using` works
+the same.
 
-It mounts on **Linux and macOS**. macOS is the reason this matters: it has no
-usable FUSE (macFUSE is a third-party kernel extension speaking its own
-protocol), but it does ship an NFSv3 client, so NFSv3 is the transport there.
-The option-string differences between the two hosts are handled for you —
-`nfsMountOptions()` returns the exact `-o` string if you want to see it.
+Ask before you commit to it:
 
-Serving does **not** need root, though. You can start just the server, then
-mount it yourself with whatever NFSv3 client you have:
+```ts
+const probe = await probeTransports();
+probe.chosen; // "fuse" | "nfs" | undefined
+probe.reason; // when nothing can mount, what each transport is missing
+```
+
+Options common to both (`readOnly`, `signals`, `unmountTimeout`,
+`useDriverIno`, `onError`, `onTransportError`) sit at the top level;
+transport-specific ones go in `fuse: {…}` or `nfs: {…}` and win over the
+shared ones.
+
+Two deliberate limits. Naming a transport (`{ transport: "nfs" }`) skips the
+probe, so the error you get is that transport's own. And there is no fallback
+_after_ a failure: the probe decides once, and if the chosen transport then
+fails, that error is what you get rather than a silent mount with different
+semantics.
+
+### What it is choosing between
+
+| transport | `mount…()` runs on | serves to                     | root to mount          | what you lose         |
+| --------- | ------------------ | ----------------------------- | ---------------------- | --------------------- |
+| **FUSE**  | Linux              | the local kernel              | no, with `fusermount3` | nothing               |
+| **NFSv3** | Linux, macOS       | anything with an NFSv3 client | yes                    | `handles` (see below) |
+
+**FUSE** is preferred on Linux: you get real `open`/`release` state, control
+over kernel caching, and every errno passes through untouched.
+
+**NFSv3** covers everything that is not Linux-with-`/dev/fuse` — macOS, most
+obviously, which has no usable FUSE (macFUSE is a third-party kernel extension
+speaking its own protocol) but does ship an NFSv3 client. The trade-off is that
+NFSv3 is stateless: there is no `open`/`release`, so every request carries a
+handle built from the driver's `(dev, ino)` identity. In practice this costs one
+behaviour — a file that is deleted while still open stays readable over FUSE,
+but gives `ESTALE` over NFS.
+
+Serving needs no native code at all — the protocols are pure JS, which is a
+design rule of this project. The one exception is a ~7 KB helper used only to
+receive the mount connection from `fusermount3`; it ships prebuilt, is loaded
+only when you mount without root, and nothing else in the library touches it.
+It survives bundling: the same bytes ship a second time as base64 inside
+`native/prebuilt.mjs`, so when a bundler has moved the code away from the `.node`
+file the loader extracts the embedded copy to a private temporary directory,
+`dlopen`s it, and deletes it again. Nothing to configure, and nothing to mark as
+external.
+`createNfsServer()` runs anywhere Node does, including Windows: only putting a
+_client_ in front of it is platform-specific.
+
+### Pinning one yourself
+
+`mountx/fuse` and `mountx/nfs` are the same transports without the probe, for
+when you know what you want and would rather have that transport's own error
+than a choice made for you:
+
+```ts
+import { mount } from "mountx/fuse"; // Linux only
+import { mountNfs } from "mountx/nfs"; // Linux and macOS, needs root
+
+await using mounted = await mount(createMemoryDriver(), "/mnt/point");
+```
+
+Their options sit at the top level rather than under `fuse: {…}`/`nfs: {…}`;
+everything else is identical, because this is what `mountx/auto` calls.
+`nfsClientProbe()` tells you whether the host has an NFS client before
+`mountNfs()` tries, and names the missing piece; the option-string differences
+between Linux and macOS are handled for you, and `nfsMountOptions()` returns the
+exact `-o` string if you want to see it.
+
+### Serving NFSv3 without mounting
+
+Serving does **not** need root, on either transport. You can start just the NFS
+server, then mount it yourself with whatever NFSv3 client you have:
 
 ```ts
 import { createNfsServer } from "mountx/nfs";
@@ -353,78 +428,23 @@ connections. To reach it from another machine you must set both `host` and
 `allowRemote: true` — and be aware that NFSv3 has no authentication worth the
 name, so that exports your driver to anything that can reach the port.
 
-### Which one should I use?
-
-| transport | `mount…()` runs on | serves to                     | root to mount          | what you lose         |
-| --------- | ------------------ | ----------------------------- | ---------------------- | --------------------- |
-| **FUSE**  | Linux              | the local kernel              | no, with `fusermount3` | nothing               |
-| **NFSv3** | Linux, macOS       | anything with an NFSv3 client | yes                    | `handles` (see below) |
-
-Serving needs no native code at all — the protocols are pure JS, which is a
-design rule of this project. The one exception is a ~7 KB helper used only to
-receive the mount connection from `fusermount3`; it ships prebuilt, is loaded
-only when you mount without root, and nothing else in the library touches it.
-`createNfsServer()` runs anywhere Node does, including Windows: only putting a
-_client_ in front of it is platform-specific.
-
-**Use FUSE** when you are on Linux: you get real `open`/`release` state,
-control over kernel caching, and every errno passes through untouched.
-
-**Use NFSv3** when you need a mount from something that is not
-Linux-with-`/dev/fuse` — macOS, most obviously — or when FUSE is unavailable. The trade-off is that
-NFSv3 is stateless: there is no `open`/`release`, so every request carries a
-handle built from the driver's `(dev, ino)` identity. In practice this costs one
-behaviour — a file that is deleted while still open stays readable over FUSE,
-but gives `ESTALE` over NFS.
-
-### Or let mountx choose: `mountx/auto`
-
-```ts
-import { mount, probeTransports } from "mountx/auto";
-import { createMemoryDriver } from "mountx/drivers/memory";
-
-await using mounted = await mount(createMemoryDriver(), "/mnt/point");
-mounted.transport; // "fuse" on Linux, "nfs" on macOS
-```
-
-It prefers FUSE wherever FUSE works — including unprivileged, via
-`fusermount3` — and falls back to NFSv3, which is what macOS gets. The result
-is the transport's own mount object with a `transport` tag added, so narrowing
-on it reaches everything that transport has (`session`, `fd`,
-`notifyInvalInode` for FUSE; `server`, `port` for NFS) and `await using` works
-the same.
-
-Ask before you commit to it:
-
-```ts
-const probe = await probeTransports();
-probe.chosen; // "fuse" | "nfs" | undefined
-probe.reason; // when nothing can mount, what each transport is missing
-```
-
-Two deliberate limits. Naming a transport (`{ transport: "nfs" }`) skips the
-probe, so the error you get is that transport's own. And there is no fallback
-_after_ a failure: the probe decides once, and if the chosen transport then
-fails, that error is what you get rather than a silent mount with different
-semantics.
-
-Options common to both (`readOnly`, `signals`, `unmountTimeout`,
-`useDriverIno`, `onError`, `onTransportError`) sit at the top level;
-transport-specific ones go in `fuse: {…}` or `nfs: {…}` and win over the
-shared ones.
-
 ## Tuning
 
-Sensible defaults are already set; these are the knobs worth knowing.
+Sensible defaults are already set; these are the knobs worth knowing. The two
+that matter most for speed are FUSE options, so through `mountx/auto` they go
+in `fuse: {…}` and are simply ignored on a host that mounts over NFS —
+importing `mountx/fuse` directly takes the same options at the top level.
 
 ### Caching (this is where the speed is)
 
 ```ts
 await mount(driver, "/mnt/point", {
-  attrTimeout: 10, // seconds the kernel may cache file attributes (default: 10)
-  entryTimeout: 10, // seconds it may cache name → file lookups (default: 10)
-  keepCache: true, // keep page cache between opens (default: true)
-  negativeTimeout: 0, // also cache "this file does not exist" (default: 0, off)
+  fuse: {
+    attrTimeout: 10, // seconds the kernel may cache file attributes (default: 10)
+    entryTimeout: 10, // seconds it may cache name → file lookups (default: 10)
+    keepCache: true, // keep page cache between opens (default: true)
+    negativeTimeout: 0, // also cache "this file does not exist" (default: 0, off)
+  },
 });
 ```
 
@@ -437,7 +457,7 @@ mountx's back stays invisible for the whole timeout.
 ### Concurrency
 
 ```ts
-await mount(driver, "/mnt/point", { readers: 2 });
+await mount(driver, "/mnt/point", { fuse: { readers: 2 } });
 ```
 
 `readers` is how many reads are kept waiting on `/dev/fuse` at once. Each one
@@ -454,37 +474,50 @@ UV_THREADPOOL_SIZE=32 node serve.ts   # then readers: 8 is reasonable
 
 ```ts
 await mount(driver, "/mnt/point", {
-  fsname: "mydata", // what /proc/mounts shows as the device
-  subtype: "myfs", // makes the type read `fuse.myfs`
-  readOnly: true, // mount -o ro; the driver never sees writes
-  allowOther: false, // let other users in (default: false)
+  // shared — these mean the same thing on both transports
+  readOnly: true, // the driver never sees writes
   unmountTimeout: 10_000, // ms before unmount stops asking nicely
   signals: true, // unmount on SIGINT/SIGTERM (default: true)
+
+  fuse: {
+    fsname: "mydata", // what /proc/mounts shows as the device
+    subtype: "myfs", // makes the type read `fuse.myfs`
+    allowOther: false, // let other users in (default: false)
+  },
+  nfs: {
+    exportPath: "/", // hard, timeo, retrans and mountOptions live here too
+    nobrowse: true, // macOS only, on by default: keeps Finder and Spotlight out
+  },
 });
 ```
 
-`mountNfs()` has its own set: `exportPath`, `readOnly`, `hard`, `timeo`,
-`retrans`, `mountOptions`, and `nobrowse` (macOS only — on by default, which
-keeps Finder and Spotlight from crawling your driver).
+`useDriverIno`, `onError` and `onTransportError` are shared as well. Whichever
+transport is chosen gets its own block applied after the shared options, so a
+value in `fuse: {…}`/`nfs: {…}` wins.
 
 ### Telling the kernel something changed
 
 If your storage changes behind mountx's back, drop the kernel's cached copy:
 
 ```ts
-mounted.notifyInvalInode(42n); // forget this file's cached data and attributes
-mounted.notifyInvalEntry(1n, "hello.txt"); // forget this name → file mapping
+if (mounted.transport === "fuse") {
+  mounted.notifyInvalInode(42n); // forget this file's cached data and attributes
+  mounted.notifyInvalEntry(1n, "hello.txt"); // forget this name → file mapping
+}
 ```
 
-Both take inode numbers as `bigint`. They are FUSE-only.
+Both take inode numbers as `bigint`. They are FUSE-only, which is what the
+`transport` check narrows to — with `mountx/fuse` imported directly they are
+just there.
 
 ## Things that will bite you
 
 Each of these is documented in full where the code lives.
 
-- **`mountNfs()` still requires root**, and so does `mount()` on a host with no
-  `fusermount3`. Serving never does — only attaching the mount to the
-  filesystem.
+- **Mounting over NFS still requires root**, and so does FUSE on a host with no
+  `fusermount3` — so `mount()` from `mountx/auto` needs root on macOS and on a
+  Linux host without the helper. Serving never does; only attaching the mount to
+  the filesystem.
 - **Do not use your own mount from the process serving it.** A synchronous `fs`
   call against your own mountpoint deadlocks. Enough concurrent _async_ calls
   (for example `fs.rm(dir, { recursive: true })` over a few hundred entries) use
@@ -555,8 +588,10 @@ portable, and that file has the full tables and caveats.
 - `pnpm test` runs lint, typecheck and the suites that need no root;
   `pnpm test:rootless` adds the unprivileged real-mount suite (still no
   `sudo`); `pnpm test:root` adds the ones that do need it.
-- `pnpm build:native` rebuilds the prebuilt FUSE mount helper with `zig build`.
-  The output is committed, so this is only needed when `native/` changes.
+- `pnpm build:native` rebuilds the prebuilt FUSE mount helper with `zig build`
+  and re-embeds it into `native/prebuilt.mjs`. Both outputs are committed, so
+  this is only needed when `native/` changes; `pnpm build:native:embed`
+  re-embeds the committed binaries without a Zig toolchain.
 - `pnpm matrix` and `pnpm bench` / `pnpm bench:root` regenerate the two
   committed reports this README draws from
   (`.agents/conformance-matrix.md`, `.agents/benchmarks.md`).
