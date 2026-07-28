@@ -48,18 +48,18 @@ jobs:
   # sudo. `pnpm test:rootless` runs the NFS mount column and `mountx/auto`
   # against it; the FUSE half skips itself off Linux.
   #
-  # Not blocking yet, deliberately. macOS gates access to network volumes behind
-  # a sandbox approval, and a runner is launchd-attributed — the context that is
-  # refused instantly with EPERM rather than prompted (see the macOS section of
-  # `.agents/environment.md`). Locally the gate never fired for a user-owned
-  # mountpoint, which is what this job uses, but "never fired on one host" is not
-  # "will not fire on a runner". The timeout is there because the other way that
-  # gate presents is a wait nobody answers. **Drop `continue-on-error` once this
-  # has been green for a while** — a permanently amber job teaches people to
-  # ignore it.
+  # It blocks, like every other job here. The reason to doubt it was macOS's
+  # network-volume consent gate: a runner is launchd-attributed, the context
+  # that gate refuses instantly with EPERM rather than prompting (see the macOS
+  # section of `.agents/environment.md`). The first run settled it — the
+  # workload case opens, reads, writes and lists through a real mount, and it
+  # passed here as an ordinary user. The gate does not fire for a mountpoint the
+  # caller owns, which is what `mkdtemp` gives the suite.
+  #
+  # The timeout stays, because the other way that gate presents is a wait nobody
+  # answers, and a hung runner is worse than a failed one.
   mount-macos:
     runs-on: macos-latest
-    continue-on-error: true
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6

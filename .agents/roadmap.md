@@ -103,14 +103,15 @@ rather than by accident.
   failed 14 cases there, all of them the suite assuming Linux — host `O_*` handed
   to a session that reads the wire's (now `src/fuse/flags.ts`) and host `errno`
   numbers checked against the transcribed table (now a target's `errors: "host"`).
-  `.github/workflows/checks.yml` now runs both: Tier 0/1 on a `macos-latest`
-  matrix leg alongside ubuntu, and the unprivileged Tier-2 column as
-  `mount-macos`. That second job is **non-blocking on purpose** — a runner is
-  launchd-attributed, which is the context the consent gate refuses instantly
-  with `EPERM` rather than prompting, and the gate never fired locally for a
-  user-owned mountpoint but "never here" is not "never there". If it stays
-  green, drop `continue-on-error`; if it fails on the gate, a PPPC profile is
-  the answer.
+  `.github/workflows/checks.yml` runs both: Tier 0/1 on a `macos-latest` matrix
+  leg alongside ubuntu, and the unprivileged Tier-2 column as `mount-macos`,
+  both blocking. The doubt about that second job was the consent gate — a
+  runner is launchd-attributed, the context it refuses instantly with `EPERM`
+  rather than prompting — and the first run answered it: 9 passed, including
+  the workload case that opens, reads, writes and lists through a real mount,
+  with nothing left mounted. **The gate does not fire for a mountpoint the
+  caller owns**, which is what `mkdtemp` gives the suite, so no PPPC profile is
+  needed. Whole run, four jobs, ~50 s.
   What the run _changed_:
   - **The `-f`-only escalation ladder is weaker than it claimed.** macOS gates
     network volumes behind a sandbox approval that is never prompted for a
