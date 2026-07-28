@@ -11,6 +11,40 @@ interface, and the errors it throws already _are_ the error format.
 So anything that behaves a bit like a filesystem can get a real path: an
 in-memory store, a zip file, an S3 bucket, a database, or a plain folder served back out with your own rules on top.
 
+```ts
+import { mount } from "mountx/fuse";
+import { mountNfs } from "mountx/nfs"
+import { createLoopback } from "mountx";
+import { createMemoryDriver } from "mountx/drivers/memory";
+
+// A driver is any object with stat(), readdir(), open(), [mkdir()] and [rename()] methods.
+// Mountx has built-in memory and fs drivers
+const driver = createMemoryDriver();
+
+// Work with FS in-process without mounting
+const fs = createLoopback(driver);
+await fs.mkdir("/notes");
+await fs.writeFile("/notes/hello.txt", "hi!");
+new TextDecoder().decode(await fs.readFile("/notes/hello.txt")); // "hi"
+
+// Mount the driver to the kernel (Linux):
+await using mounted = await mount(driver, "/mnt/point", {
+  attrTimeout: 10, // seconds the kernel may cache attributes — the main dial
+});
+
+// or mount the driver where FUSE is not available using over NFSv3
+// await using served = await mountNfs(driver, "/mnt/point")
+
+/**
+# /mnt/point is a real folder now, so every program on the machine can use it:
+$ cat /mnt/point/notes/hello.txt   =>   hi!
+$ echo hey > /mnt/point/notes/other.txt
+**/
+
+mounted.notifyInvalInode(2n); // storage changed behind mountx's back? drop the cache
+await mounted.unmount(); // or let `await using` do it at the end of the block
+```
+
 ## Install
 
 ```sh
