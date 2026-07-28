@@ -1,8 +1,8 @@
 /**
  * The FUSE transport: `/dev/fuse`, a real mountpoint, and the read/reply loop.
  *
- * This is the only file in the library that touches a device or spawns a
- * process. Everything below it — protocol, session, drivers — is bytes in,
+ * This file and `fusermount.ts` are the only ones that touch a device or spawn
+ * a process. Everything below them — protocol, session, drivers — is bytes in,
  * bytes out, which is why all of it is testable with no root and no kernel.
  *
  * ```ts
@@ -13,24 +13,31 @@
  * // ... /mnt/point is live until unmount() or the process exits ...
  * ```
  *
- * **Root mode only, in v1.** Getting the fd is pure JS (`/dev/fuse` is mode
- * 0666 everywhere), but `mount(2)` is not a syscall Node can issue. As root the
- * way around it is stock `mount(8)`: the `fd=N` mount option resolves in the
+ * **Two ways in, chosen by uid.** `mount(2)` is not a syscall Node can issue,
+ * and the way around it depends on who is asking.
+ *
+ * As root, getting the fd is pure JS (`/dev/fuse` is mode 0666 everywhere) and
+ * stock `mount(8)` does the rest: the `fd=N` mount option resolves in the
  * *caller's* fd table, and fds are inheritable, so the child mounts and exits
- * while the parent keeps its copy of the descriptor for the loop. Unprivileged
- * mounting needs `fusermount3` and `SCM_RIGHTS`, which Node cannot receive —
- * that is the native stub, and a later milestone.
+ * while the parent keeps its copy of the descriptor for the loop.
+ *
+ * As anyone else, `fusermount3` does both — it opens the device and issues the
+ * `mount(2)`, then sends the descriptor back over `SCM_RIGHTS`. Receiving it is
+ * the one thing Node cannot do, and the only reason this library has native
+ * code; see `fusermount.ts` and `native.ts`. Everything from here down is
+ * identical either way, because what comes back is the same descriptor.
  *
  * **fd lifecycle, which is also the crash-safety story.** The kernel tears the
  * connection down when the last reference to the `/dev/fuse` file goes away, so
  * a killed process cannot leave a mountpoint that hangs on `ls` — it leaves one
  * that answers `ENOTCONN`, which `umount` clears without ceremony. That
  * guarantee only holds if nothing else keeps the descriptor alive, so the fd is
- * opened `O_CLOEXEC` (libuv's default) and is handed to exactly one child,
- * `mount(8)`, which exits immediately. `umount(8)` and every other spawn run
- * without it. Without `fusermount3` there is no `-o auto_unmount`, so the stale
- * *mount table entry* does survive a crash; recovery is one command, and it is
- * named in the error messages here: `sudo umount -l <mountpoint>`.
+ * close-on-exec on both paths (libuv's default when this process opens it,
+ * `MSG_CMSG_CLOEXEC` when `fusermount3` sends it) and is handed to exactly one
+ * child, `mount(8)`, which exits immediately. Every other spawn runs without
+ * it. `-o auto_unmount` is not used, so the stale *mount table entry* does
+ * survive a crash; recovery is one command, and it is named in the error
+ * messages here.
  *
  * **Serving a mount and using it from the same process is the sharp edge**, and
  * it has two forms. The first is obvious once seen: anything *synchronous* —
@@ -71,13 +78,14 @@
  * `await mount.unmount()` first and set `process.exitCode`.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { stat as statPath } from "node:fs/promises";
 import { resolve as resolveNative } from "node:path";
 import type { FsDriver } from "../types.ts";
 import { S_IFDIR, S_IFMT } from "../types.ts";
 import { FUSE_MAX_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_PAGE_SIZE } from "./constants.ts";
+import { describe, errorMessage, run, type SpawnResult, stdioWith } from "./exec.ts";
+import { mountViaFusermount, rootlessProbe, unmountViaFusermount } from "./fusermount.ts";
 import { DEFAULT_MAX_WRITE } from "./init.ts";
 import { FuseSession, type FuseSessionOptions } from "./session.ts";
 
@@ -135,9 +143,9 @@ export interface MountOptions extends FuseSessionOptions {
   /**
    * Let users other than the mounting one in. Default `false`.
    *
-   * Harmless here (v1 mounts are root's anyway, and `default_permissions` still
-   * applies), but note that the unprivileged path will need `user_allow_other`
-   * in `/etc/fuse.conf` for the same option.
+   * `default_permissions` still applies, so this is not a way around mode bits.
+   * Unprivileged mounts additionally need `user_allow_other` in
+   * `/etc/fuse.conf`; without it `fusermount3` refuses the mount and says so.
    */
   allowOther?: boolean;
   /** Mount read-only (`-o ro`). The driver is not told; it just never sees writes. */
@@ -174,7 +182,11 @@ export interface MountOptions extends FuseSessionOptions {
    * should raise it.
    */
   unmountTimeout?: number;
-  /** The device to open. Default `"/dev/fuse"`; a test double is the only reason to change it. */
+  /**
+   * The device to open. Default `"/dev/fuse"`; a test double is the only reason
+   * to change it. Root mode only — unprivileged mounts never open the device
+   * themselves, so setting it is an error rather than a no-op.
+   */
   device?: string;
   /**
    * Tee every byte that crosses `/dev/fuse`, in both directions. Off by default.
@@ -298,9 +310,11 @@ export function liveMounts(): Mount[] {
  * Mount `driver` at `mountpoint`.
  *
  * Resolves once the kernel's `FUSE_INIT` has been answered, so a resolved
- * `mount()` means the path is usable, not merely that `mount(8)` exited.
- * Requires root (see the module docs); throws before touching anything if it
- * does not have it.
+ * `mount()` means the path is usable, not merely that the mount helper exited.
+ *
+ * As root this needs nothing but a kernel. As anyone else it needs
+ * `fusermount3` and this package's native addon, and throws before touching
+ * anything if either is missing.
  */
 export async function mount(
   driver: FsDriver,
@@ -312,11 +326,20 @@ export async function mount(
   }
   const uid = process.getuid?.() ?? -1;
   if (uid !== 0) {
-    throw new Error(
-      "mountx: mounting FUSE needs root. Without `fusermount3` (this host has none) " +
-        "there is no unprivileged path, so run the process as root — under `sudo`, note " +
-        'that root\'s PATH may lack node: sudo "$(which node)" script.mjs',
-    );
+    const probe = rootlessProbe();
+    if (!probe.usable) {
+      throw new Error(
+        `mountx: mounting without root needs the fusermount3 helper and mountx's native ` +
+          `addon, and ${probe.reason}. The alternative is to run as root — note that ` +
+          `root's PATH may lack node: sudo "$(command -v node)" script.mjs`,
+      );
+    }
+    if (options.device !== undefined) {
+      throw new Error(
+        "mountx: `device` is a root-mode option — unprivileged mounting never opens the " +
+          "device itself, fusermount3 does",
+      );
+    }
   }
   const target = resolveNative(mountpoint);
   const targetStat = await statPath(target).catch((error: unknown) => {
@@ -361,13 +384,9 @@ export async function mount(
     );
   }
 
-  const impl = new MountImpl(session, target, options);
+  const impl = new MountImpl(session, target, options, uid !== 0);
   await impl.start(rootMode, uid);
   return impl;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -438,42 +457,6 @@ function checkMountToken(name: string, value: string | undefined): string | unde
   return value;
 }
 
-interface SpawnResult {
-  status: number | null;
-  signal: NodeJS.Signals | null;
-  stderr: string;
-}
-
-/**
- * Run a command to completion.
- *
- * `stdio` is passed through because the mount child is the one place where a
- * specific *fd number* has to survive into the child — see {@link MountImpl.start}.
- */
-function run(
-  command: string,
-  args: readonly string[],
-  stdio: Array<"ignore" | "pipe" | number>,
-): Promise<SpawnResult> {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, [...args], { stdio });
-    let stderr = "";
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", rejectPromise);
-    child.once("close", (status, signal) => {
-      resolvePromise({ status, signal, stderr: stderr.trim() });
-    });
-  });
-}
-
-function describe(command: string, result: SpawnResult): string {
-  const how = result.signal === null ? `exit ${result.status}` : `signal ${result.signal}`;
-  return result.stderr === "" ? `${command}: ${how}` : `${command}: ${how}: ${result.stderr}`;
-}
-
 class MountImpl implements Mount {
   readonly mountpoint: string;
   readonly source: string;
@@ -481,6 +464,8 @@ class MountImpl implements Mount {
   readonly closed: Promise<void>;
 
   readonly #options: MountOptions;
+  /** Mounting through `fusermount3` rather than as root. Fixed at construction. */
+  readonly #rootless: boolean;
   readonly #readers: number;
   readonly #buffers: Buffer[] = [];
   #fd = -1;
@@ -496,10 +481,11 @@ class MountImpl implements Mount {
   /** Teardown has been forced: stop waiting for anything that might not come. */
   #forced = false;
 
-  constructor(session: FuseSession, mountpoint: string, options: MountOptions) {
+  constructor(session: FuseSession, mountpoint: string, options: MountOptions, rootless: boolean) {
     this.session = session;
     this.mountpoint = mountpoint;
     this.#options = options;
+    this.#rootless = rootless;
     this.source = checkMountToken("fsname", options.fsname) ?? "mountx";
     checkMountToken("subtype", options.subtype);
     const readers = options.readers ?? 2;
@@ -524,15 +510,25 @@ class MountImpl implements Mount {
   // ---------------------------------------------------------------------------
 
   async start(rootMode: number, uid: number): Promise<void> {
-    const gid = process.getgid?.() ?? 0;
-    const device = this.#options.device ?? "/dev/fuse";
-    this.#fd = fs.openSync(device, "r+");
-    try {
-      await this.#spawnMount(rootMode, uid, gid);
-    } catch (error) {
-      fs.closeSync(this.#fd);
-      this.#fd = -1;
-      throw error;
+    if (this.#rootless) {
+      // `fusermount3` opens the device, mounts, and sends the descriptor back;
+      // there is no window in which this process holds an fd for a mount that
+      // does not exist, so there is nothing to unwind on failure.
+      this.#fd = await mountViaFusermount(this.mountpoint, {
+        options: this.#fusermountOptions(),
+        timeout: this.#options.initTimeout,
+      });
+    } else {
+      const gid = process.getgid?.() ?? 0;
+      const device = this.#options.device ?? "/dev/fuse";
+      this.#fd = fs.openSync(device, "r+");
+      try {
+        await this.#spawnMount(rootMode, uid, gid);
+      } catch (error) {
+        fs.closeSync(this.#fd);
+        this.#fd = -1;
+        throw error;
+      }
     }
 
     // Only now is there something to tear down.
@@ -558,22 +554,15 @@ class MountImpl implements Mount {
     // the options is parsed by the kernel itself and produces the same
     // `fuse.subtype` in the mount table.
     const type = "fuse";
-    // The fd has to land in the child at *its own number*, because that is the
-    // number `-o fd=N` names. `openSync` returns whatever the process has free
-    // (17 is typical, not 3), so the stdio array is padded out to it — hardcode
-    // fd 3 and `mount` reports "wrong fs type" from reading stdin instead.
-    const stdio: Array<"ignore" | "pipe" | number> = Array.from(
-      { length: this.#fd + 1 },
-      () => "ignore",
-    );
-    stdio[2] = "pipe";
-    stdio[this.#fd] = this.#fd;
     // `-i` matters: without it `mount(8)` hands off to `/sbin/mount.fuse`,
     // which reinterprets the source argument as a program to execute.
     const args = ["-i", "-t", type, "-o", options, this.source, this.mountpoint];
     let result: SpawnResult;
     try {
-      result = await run("mount", args, stdio);
+      // The fd has to land in the child at *its own number*, because that is
+      // the number `-o fd=N` names — hardcode fd 3 and `mount` reports "wrong
+      // fs type" from reading stdin instead.
+      result = await run("mount", args, { stdio: stdioWith(this.#fd) });
     } catch (error) {
       throw new Error(`mountx: could not run mount(8): ${errorMessage(error)}`);
     }
@@ -587,14 +576,35 @@ class MountImpl implements Mount {
     }
   }
 
+  /** The `-o` list for `mount(8)`: everything the kernel needs, spelled out. */
   #mountOptions(rootMode: number, uid: number, gid: number): string {
-    const parts = [
+    return [
       `fd=${this.#fd}`,
       // Parsed as octal by the kernel (`fsparam_u32oct`).
       `rootmode=${rootMode.toString(8)}`,
       `user_id=${uid}`,
       `group_id=${gid}`,
-    ];
+      ...this.#sharedOptions(),
+    ].join(",");
+  }
+
+  /**
+   * The `-o` list for `fusermount3`.
+   *
+   * Four options are missing and none of them by accident. `fd`, `rootmode`,
+   * `user_id` and `group_id` are supplied by the helper itself — it opened the
+   * device, it took `rootmode` from the mountpoint's own file type, and the ids
+   * are the calling user's by definition. (It would ignore them if they were
+   * here; leaving them out says why.) The source, which is an *argument* to
+   * `mount(8)`, is an option here: `fsname`.
+   */
+  #fusermountOptions(): string {
+    return [`fsname=${this.source}`, ...this.#sharedOptions()].join(",");
+  }
+
+  /** The options that mean the same thing on both paths. */
+  #sharedOptions(): string[] {
+    const parts: string[] = [];
     if (this.#options.defaultPermissions !== false) {
       parts.push("default_permissions");
     }
@@ -611,7 +621,7 @@ class MountImpl implements Mount {
       parts.push(`subtype=${this.#options.subtype}`);
     }
     parts.push(...(this.#options.mountOptions ?? []));
-    return parts.join(",");
+    return parts;
   }
 
   /** Wait for the handshake, and tear the half-built mount down if it never comes. */
@@ -899,26 +909,46 @@ class MountImpl implements Mount {
     await this.closed;
   }
 
+  /**
+   * Ask the mount to go away, whichever way this process is allowed to ask.
+   *
+   * Root uses plain `umount(8)` even though `fusermount3` may be installed: as
+   * root the helper is strictly worse, because it refuses mounts that are
+   * missing from its own mtab. Unprivileged has only the helper.
+   */
   async #runUnmount(): Promise<void> {
-    // Plain `umount(8)`: this is root-only for now, and root's `umount` is the
-    // reliable path. (`fusermount3 -u` belongs to the unprivileged milestone,
-    // which will have to introduce it along with the mount side — as root it is
-    // strictly worse, because it refuses mounts missing from its own mtab.)
-    let result: SpawnResult;
-    try {
-      result = await run("umount", [this.mountpoint], ["ignore", "ignore", "pipe"]);
-    } catch (error) {
-      throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
+    let failure: unknown;
+    if (this.#rootless) {
+      await unmountViaFusermount(this.mountpoint).catch((error: unknown) => {
+        failure = error;
+      });
+    } else {
+      let result: SpawnResult;
+      try {
+        result = await run("umount", [this.mountpoint], { stdio: ["ignore", "ignore", "pipe"] });
+      } catch (error) {
+        throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
+      }
+      if (result.status !== 0) {
+        failure = new Error(describe("umount", result));
+      }
     }
     // A failure that raced an external unmount is not a failure.
-    if (result.status === 0 || !isMounted(this.mountpoint)) {
+    if (failure === undefined || !isMounted(this.mountpoint)) {
       return;
     }
     throw new Error(
-      `mountx: could not unmount ${this.mountpoint} (${describe("umount", result)}). ` +
+      `mountx: could not unmount ${this.mountpoint} (${errorMessage(failure)}). ` +
         `The mount is still live. If a process is holding it, \`fuser -m ${this.mountpoint}\` ` +
-        `will say which; \`sudo umount -l ${this.mountpoint}\` detaches it regardless.`,
+        `will say which; \`${this.#detachCommand()}\` detaches it regardless.`,
     );
+  }
+
+  /** The command that always detaches a mountpoint, for whoever is asking. */
+  #detachCommand(): string {
+    return this.#rootless
+      ? `fusermount3 -u -z ${this.mountpoint}`
+      : `sudo umount -l ${this.mountpoint}`;
   }
 
   /**
@@ -937,25 +967,41 @@ class MountImpl implements Mount {
    * status 32, mount gone anyway), so the mount table is what gets believed.
    *
    * `umount -l` then covers the case where the entry outlives the abort.
+   *
+   * **Unprivileged teardown is weaker, and honestly so.** Both routes to
+   * `fuse_abort_conn` — `MNT_FORCE` and `/sys/fs/fuse/connections/<n>/abort` —
+   * belong to root, so all a user can do is `fusermount3 -u -z`: detach the
+   * mount and let the connection die when the last reference to the superblock
+   * goes. That usually amounts to the same thing a moment later, but it is a
+   * consequence rather than a request, so a driver that has genuinely stopped
+   * answering can leave reads parked here where root would not.
    */
   async #force(timeout: number): Promise<void> {
     const error = new Error(
       `mountx: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
         `driver has probably stopped answering. The connection has been aborted, so anything ` +
         `in flight was lost. If the mountpoint is somehow still listed: ` +
-        `sudo umount -l ${this.mountpoint}`,
+        this.#detachCommand(),
     );
     this.#report(error);
-    for (const args of [
-      ["-f", this.mountpoint],
-      ["-l", this.mountpoint],
-    ]) {
-      if (!isMounted(this.mountpoint)) {
-        break;
+    if (this.#rootless) {
+      if (isMounted(this.mountpoint)) {
+        await unmountViaFusermount(this.mountpoint, { lazy: true }).catch(() => {
+          // Nothing to add: the next check of the mount table is the verdict.
+        });
       }
-      await run("umount", args, ["ignore", "ignore", "pipe"]).catch(() => {
-        // Nothing to add: the next check of the mount table is the verdict.
-      });
+    } else {
+      for (const args of [
+        ["-f", this.mountpoint],
+        ["-l", this.mountpoint],
+      ]) {
+        if (!isMounted(this.mountpoint)) {
+          break;
+        }
+        await run("umount", args, { stdio: ["ignore", "ignore", "pipe"] }).catch(() => {
+          // Nothing to add: the next check of the mount table is the verdict.
+        });
+      }
     }
     // The abort should have ended the loop by itself. Give it a moment to do
     // so, then stop waiting and tear down from this side regardless.
