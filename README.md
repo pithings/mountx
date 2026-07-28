@@ -164,7 +164,7 @@ One suite (`test/conformance.ts`), written once against the driver interface,
 run three ways — loopback, over a real FUSE mount, over a real NFSv3 socket —
 so any test that passes in one column and fails in another is, by
 construction, a transport bug rather than a driver bug. Full tables:
-[`.agents/conformance-matrix.md`](https://github.com/pi0x/unimount/blob/main/.agents/conformance-matrix.md).
+[`.agents/conformance-matrix.md`](https://github.com/pithings/unimount/blob/main/.agents/conformance-matrix.md).
 
 The honest summary: **FUSE loses nothing** either bundled driver has (126/126
 passing, no skips). **NFSv3 loses exactly one capability**, `handles` — an
@@ -178,7 +178,7 @@ suite, over a real mount: **59.1% passing** (5179/8770 assertions), and **every
 one of the 45 remaining failing files** exercises `mkfifo`/`mknod`/UNIX-socket
 creation — a driver-interface gap (`node:fs/promises` has no way to create a
 special file either), not a session bug. Full breakdown and bug list:
-[`.agents/pjdfstest-results.md`](https://github.com/pi0x/unimount/blob/main/.agents/pjdfstest-results.md).
+[`.agents/pjdfstest-results.md`](https://github.com/pithings/unimount/blob/main/.agents/pjdfstest-results.md).
 
 The validation arsenal behind both reports:
 
@@ -196,7 +196,7 @@ The validation arsenal behind both reports:
 ## Performance
 
 All numbers below are from
-[`.agents/benchmarks.md`](https://github.com/pi0x/unimount/blob/main/.agents/benchmarks.md),
+[`.agents/benchmarks.md`](https://github.com/pithings/unimount/blob/main/.agents/benchmarks.md),
 taken on one host, one day (Linux 6.12, Node v24.18.0, in-memory driver) —
 they are not portable, and the file has the full tables and caveats.
 
@@ -313,4 +313,4 @@ benchmarks in this file.
 
 ## License
 
-Published under the [MIT](https://github.com/unjs/unimount/blob/main/LICENSE) license 💛.
+Published under the [MIT](https://github.com/pithings/unimount/blob/main/LICENSE) license 💛.
