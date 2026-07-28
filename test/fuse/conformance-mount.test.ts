@@ -37,7 +37,9 @@ import { conformance } from "../conformance.ts";
 import { rootedNodeFs } from "../rooted-node-fs.ts";
 import { removeAll } from "./differential.ts";
 
-const isRoot = (process.getuid?.() ?? -1) === 0;
+// FUSE needs Linux as well as root: on macOS `mount()` refuses outright
+// (macFUSE is a different protocol), so the suite skips rather than errors.
+const isRoot = (process.getuid?.() ?? -1) === 0 && process.platform === "linux";
 
 /**
  * What survives the trip through FUSE.

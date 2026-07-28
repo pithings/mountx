@@ -37,5 +37,13 @@ sudo env TMPDIR="$TMP" UV_THREADPOOL_SIZE=32 $forward "$(command -v node)" \
   node_modules/vitest/vitest.mjs run --no-file-parallelism "$@"
 status=$?
 
-grep -q " $TMP" /proc/self/mounts || sudo rm -rf "$TMP"
+# Do not delete the scratch directory while something is still mounted under
+# it. macOS has no `/proc`, so the table comes from `mount(8)` there — and a
+# table that cannot be read at all means "leave it alone", not "clean it up".
+if [ -r /proc/self/mounts ]; then
+  table=$(cat /proc/self/mounts)
+else
+  table=$(mount) || table=" $TMP"
+fi
+printf '%s\n' "$table" | grep -q " $TMP" || sudo rm -rf "$TMP"
 exit $status

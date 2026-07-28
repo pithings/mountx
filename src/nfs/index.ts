@@ -24,7 +24,21 @@
 
 export * from "./constants.ts";
 export * from "./handles.ts";
-export * from "./mount.ts";
+// Everything from `mount.ts` **except** `parseMountTable`/`MountEntry`, which
+// are the platform's mount-table format rather than anything a consumer of
+// this package composes with. Same treatment, and same reason, as the
+// sub-struct helpers below: still exported from `mount.ts` for the tests.
+export {
+  liveNfsMounts,
+  mountNfs,
+  type MountNfsOptions,
+  nfsClientProbe,
+  type NfsClientProbe,
+  type NfsMount,
+  nfsMountOptions,
+  type NfsPlatform,
+  unmountAllNfs,
+} from "./mount.ts";
 // Everything from `protocol.ts` **except** the sub-struct helpers
 // (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, the `post_op_*` and
 // `wcc_data` pairs, `nfstime3`, `specdata3`). Those are the pieces the

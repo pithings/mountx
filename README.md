@@ -32,7 +32,7 @@ await using mounted = await mount(driver, "/mnt/point", {
   attrTimeout: 10, // seconds the kernel may cache attributes
 });
 
-// or mount the driver where FUSE is not available using over NFSv3
+// or, where FUSE is not available (macOS, say), mount it over NFSv3:
 // await using served = await mountNfs(driver, "/mnt/point")
 
 /**
@@ -130,6 +130,16 @@ frozen — `ls` says `ENOTCONN` instead of hanging. Clean it up with:
 ```sh
 sudo umount -l /mnt/point
 ```
+
+**Want to poke at one without writing it?** The repository ships a playground —
+a seeded in-memory filesystem, mounted, with every request the kernel makes
+printed as it happens:
+
+```sh
+sudo "$(command -v node)" playground/index.ts   # mounts /tmp/mountx-playground
+```
+
+Source: [`playground/index.ts`](https://github.com/pithings/mountx/blob/main/playground/index.ts).
 
 ## Step 3 — serve a real folder
 
@@ -296,7 +306,13 @@ await using mounted = await mountNfs(createMemoryDriver(), "/mnt/point");
 ```
 
 `mountNfs()` also needs root, and needs the host to have an NFS client.
-`nfsClientProbe()` tells you before it tries.
+`nfsClientProbe()` tells you before it tries, and names the missing piece.
+
+It mounts on **Linux and macOS**. macOS is the reason this matters: it has no
+usable FUSE (macFUSE is a third-party kernel extension speaking its own
+protocol), but it does ship an NFSv3 client, so NFSv3 is the transport there.
+The option-string differences between the two hosts are handled for you —
+`nfsMountOptions()` returns the exact `-o` string if you want to see it.
 
 Serving does **not** need root, though. You can start just the server, then
 mount it yourself with whatever NFSv3 client you have:
@@ -310,7 +326,11 @@ console.log(server.port); // an ephemeral port unless you set one
 ```
 
 ```sh
+# Linux
 sudo mount -t nfs -o vers=3,tcp,port=<p>,mountport=<p>,nolock 127.0.0.1:/ /mnt
+
+# macOS — `nolocks`, and no `hard` option (hard is the default there)
+sudo mount -t nfs -o vers=3,tcp,port=<p>,mountport=<p>,nolocks,nobrowse 127.0.0.1:/ /mnt
 ```
 
 `<p>` is `server.port` above, or `mounted.port` if you used `mountNfs()`.
@@ -322,18 +342,20 @@ name, so that exports your driver to anything that can reach the port.
 
 ### Which one should I use?
 
-| transport | runs on                       | native code | root to mount | what you lose         |
-| --------- | ----------------------------- | ----------- | ------------- | --------------------- |
-| **FUSE**  | Linux                         | none        | yes           | nothing               |
-| **NFSv3** | anywhere with an NFSv3 client | none        | yes           | `handles` (see below) |
+| transport | `mount…()` runs on | serves to                     | native code | root to mount | what you lose         |
+| --------- | ------------------ | ----------------------------- | ----------- | ------------- | --------------------- |
+| **FUSE**  | Linux              | the local kernel              | none        | yes           | nothing               |
+| **NFSv3** | Linux, macOS       | anything with an NFSv3 client | none        | yes           | `handles` (see below) |
 
-Neither needs native code — that is a design rule of this project.
+Neither needs native code — that is a design rule of this project. And
+`createNfsServer()` runs anywhere Node does, including Windows: only putting a
+_client_ in front of it is platform-specific.
 
 **Use FUSE** when you are on Linux and have root: you get real `open`/`release`
 state, control over kernel caching, and every errno passes through untouched.
 
 **Use NFSv3** when you need a mount from something that is not
-Linux-with-`/dev/fuse`, or when FUSE is unavailable. The trade-off is that
+Linux-with-`/dev/fuse` — macOS, most obviously — or when FUSE is unavailable. The trade-off is that
 NFSv3 is stateless: there is no `open`/`release`, so every request carries a
 handle built from the driver's `(dev, ino)` identity. In practice this costs one
 behaviour — a file that is deleted while still open stays readable over FUSE,
@@ -390,7 +412,8 @@ await mount(driver, "/mnt/point", {
 ```
 
 `mountNfs()` has its own set: `exportPath`, `readOnly`, `hard`, `timeo`,
-`retrans`, `mountOptions`.
+`retrans`, `mountOptions`, and `nobrowse` (macOS only — on by default, which
+keeps Finder and Spotlight from crawling your driver).
 
 ### Telling the kernel something changed
 
@@ -473,6 +496,8 @@ portable, and that file has the full tables and caveats.
 - Enable [Corepack](https://github.com/nodejs/corepack) with `corepack enable`
 - Install dependencies with `pnpm install`
 - Run tests in watch mode with `pnpm dev`
+- `sudo "$(command -v node)" playground/index.ts` mounts the playground
+  (`playground/index.ts`) and logs every driver call it serves
 - `pnpm test` runs lint, typecheck and the suites that need no root;
   `pnpm test:root` adds the real-mount suites under `sudo`.
 - `pnpm matrix` and `pnpm bench` / `pnpm bench:root` regenerate the two

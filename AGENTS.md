@@ -35,7 +35,7 @@ NFS (`src/nfs/`, exported as `mountx/nfs`):
 - `constants.ts` + `protocol.ts` — RFC 1813 transcribed; every struct encoded **and** decoded.
 - `handles.ts` — `FileHandleTable` and the readdir cookie scheme.
 - `session.ts` — `NfsSession(driver, options)`: `handleCall(bytes)` → `Promise<Uint8Array | null>`, answering both MOUNT and NFS programs.
-- `server.ts` — `createNfsServer(driver, options)`, the only file here that opens a socket. `mount.ts` — `mountNfs()`/`nfsClientProbe()`.
+- `server.ts` — `createNfsServer(driver, options)`, the only file here that opens a socket. `mount.ts` — `mountNfs()`/`nfsClientProbe()`, and the only platform-aware file in the project: it mounts on **Linux and macOS**, and keeps the difference in three pure, tested pieces (`nfsMountOptions()`, `parseMountTable()`, the probe's helper paths) plus a `-f`-only escalation ladder on macOS. macOS is NFS-only by necessity — macFUSE is a third-party kext with its own protocol dialect, so `src/fuse/` cannot serve it.
 - `index.ts` — re-exports `protocol.ts` by name, minus the sub-struct helpers (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, ...).
 
 Tests (`test/`):
@@ -43,7 +43,7 @@ Tests (`test/`):
 - `conformance.ts` — the one Tier-0 suite, written against the driver interface; `drivers.test.ts` runs it against memory, node-fs and raw `node:fs/promises` (loopback column).
 - `rooted-node-fs.ts` — `node:fs/promises` rooted at a directory; the oracle shared by `drivers.test.ts` and the FUSE conformance column.
 - `fuse/` — protocol/session Tier 0 (`random.ts`, `protocol.test.ts`, `golden.test.ts`, `dirent.test.ts`, `init.test.ts`, `session.test.ts`, `inodes.test.ts`, `session-fuzz.test.ts`, `synthetic-kernel.ts`, `fuzz.test.ts`), Tier 2 `mount.test.ts`, the differential oracle (`differential.ts`+`differential.test.ts`), record/replay (`record-fixtures.ts`+`replay.test.ts`), the FUSE conformance column (`conformance-mount.test.ts`).
-- `nfs/` — Tier 0 (`xdr.test.ts`, `protocol.test.ts`, `handles.test.ts`, `golden.test.ts`, `fuzz.test.ts`), the Tier-1 JS client (`client.ts`) and its conformance column (`conformance.test.ts`, `session.test.ts`), Tier 2 `mount.test.ts` (gated on `nfsClientProbe()`).
+- `nfs/` — Tier 0 (`xdr.test.ts`, `protocol.test.ts`, `handles.test.ts`, `golden.test.ts`, `fuzz.test.ts`, `mount-options.test.ts` — the platform difference, checked from either host), the Tier-1 JS client (`client.ts`) and its conformance column (`conformance.test.ts`, `session.test.ts`), Tier 2 `mount.test.ts` (gated on `nfsClientProbe()`, runs on Linux and macOS).
 - `pjdfstest/` — `run.sh`+`run.ts` drive the pinned pjdfstest clone (gitignored) against a real mount and write the committed analysis.
 - `matrix.ts` — generates `.agents/conformance-matrix.md`. `root.sh` — runs any Tier-2 vitest file under sudo with the environment fixed up (raised `UV_THREADPOOL_SIZE`, redirected `TMPDIR`, forwarded `MOUNTX_*`); every Tier-2 file skips itself when not root.
 
@@ -60,6 +60,7 @@ Tests (`test/`):
 - **Wire constants are transcribed, never guessed or borrowed from host `node:fs`.** FUSE constants come from the kernel's `include/uapi/linux/fuse.h`; NFS constants come from RFC 1813/5531/4506.
 - **A `-t fuse` mount never receives `FUSE_DESTROY`.** The transport must detect unmount itself (read EOF/`ENODEV` on `/dev/fuse`) and call `session.destroy()`; it is idempotent and safe with requests in flight.
 - **No mount stacking.** Mounting over a live mountpoint — this process's own, or any FUSE mount already in `/proc/self/mounts` — is refused, in both directions.
+- **An unreadable mount table means "still mounted", never "gone".** NFS teardown treats "is it mounted" as a tri-state (`src/nfs/mount.ts`'s `isMounted`): forcing down a mount that turns out to be gone is harmless, whereas reporting a successful unmount on a guess shuts the server down under a live mount. This is why the table read is async — macOS has no `/proc/self/mounts` and the table comes from spawning `mount(8)`.
 - **Teardown has a deadline** (`unmountTimeout`, default 10 s) and escalates to `umount -f` on expiry. Closing the `/dev/fuse` fd only aborts the connection when no read is parked on it.
 - **Self-client threadpool hazard.** Serving a mount and using it (any sync `fs` call, or enough concurrent async ones) from the same process parks threadpool threads the read loop also needs, and wedges. Documented at the top of `src/fuse/mount.ts`.
 - **`process.exit()` does not work with a mount up.** Node's exit path joins the threadpool the reads are parked in. `await unmount()` and set `process.exitCode`; this is also why the signal handlers re-raise the signal instead of exiting directly.

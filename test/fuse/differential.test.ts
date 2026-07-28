@@ -34,7 +34,9 @@ import {
   snapshot,
 } from "./differential.ts";
 
-const isRoot = (process.getuid?.() ?? -1) === 0;
+// FUSE needs Linux as well as root: on macOS `mount()` refuses outright
+// (macFUSE is a different protocol), so the suite skips rather than errors.
+const isRoot = (process.getuid?.() ?? -1) === 0 && process.platform === "linux";
 /** The scripted pass writes a 3 MiB file and 300 directory entries, twice. */
 const SLOW = 300_000;
 

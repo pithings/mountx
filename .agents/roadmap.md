@@ -42,8 +42,23 @@ rather than by accident.
   libuv threadpool entirely (removing the self-client hazard); sync-worker
   is the mode `IDEA.md` expects to scale with worker count. Both are
   unmeasured — see the "known gaps" in `.agents/benchmarks.md`.
+- **macOS NFS mounting is written but not yet witnessed.** `src/nfs/mount.ts`
+  handles darwin — helper path, `nolocks`, no `hard`, `nobrowse`, `mount(8)`
+  as the mount table, `-f`-only escalation, realpath'd mountpoints — and each
+  option is transcribed from Apple's `mount_nfs(8)`/`mount(8)`, not guessed.
+  What is missing is a run on a real Mac: the pure half has Tier-0 coverage
+  (`test/nfs/mount-options.test.ts`) and `test/nfs/mount.test.ts` is written to
+  run there, but this dev host cannot execute the Tier-2 column. The fix is a
+  `macos-latest` CI job — GitHub's runners have passwordless sudo — and until
+  it exists, treat darwin as unproven.
+- **`mountx/auto`.** The transport chooser `src/index.ts` predicts: probe, then
+  FUSE on Linux / NFS on macOS, with a narrow shared `Mount` supertype and a
+  dynamic `import()` so neither transport's bytes reach a caller who does not
+  use it. Blocked on nothing except the macOS verification above.
 - **WebDAV and Windows support.** Not designed against; WebDAV is the
   unprivileged, zero-native-code path for macOS/Windows per `IDEA.md`.
+  Windows also has no `mount(8)`, so it stays out of the NFS transport's
+  platform switch.
 - **`mknod` / FIFOs / device nodes / UNIX sockets.** `FsDriver` has no way
   to create a special file (neither does `node:fs/promises`). This is the
   entire remaining pjdfstest gap (45 failing files, all one missing

@@ -6,11 +6,17 @@
  * ```
  *
  * Skips itself unless the host can actually mount NFS — root, plus a kernel
- * NFS *client* and the `/sbin/mount.nfs` helper from `nfs-utils`. Neither of
- * those is something this project can provide, and the dev container it was
- * written in has neither (see `.agents/environment.md`), which is exactly why
- * the Tier-1 column exists: `test/nfs/conformance.test.ts` runs the same
- * protocol end to end with a JavaScript client and needs nothing at all.
+ * NFS *client* and its mount helper (`/sbin/mount.nfs` from `nfs-utils` on
+ * Linux, `/sbin/mount_nfs` on macOS). Neither of those is something this
+ * project can provide, and the dev container it was written in has neither
+ * (see `.agents/environment.md`), which is exactly why the Tier-1 column
+ * exists: `test/nfs/conformance.test.ts` runs the same protocol end to end
+ * with a JavaScript client and needs nothing at all.
+ *
+ * Written to run on both hosts. The pure half of the platform difference —
+ * option strings, mount-table formats, the probe — is covered from either host
+ * by `test/nfs/mount-options.test.ts`; this file is the half that needs a real
+ * kernel client on the other end.
  *
  * **Serving a mount and using it from the same process** is much safer here
  * than it is under FUSE, and it is worth knowing why: the NFS server answers
@@ -29,15 +35,30 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
-import { mountNfs, nfsClientProbe, type NfsMount } from "../../src/nfs/mount.ts";
+import {
+  mountNfs,
+  nfsClientProbe,
+  type NfsMount,
+  type NfsPlatform,
+  parseMountTable,
+} from "../../src/nfs/mount.ts";
 
 const probe = nfsClientProbe();
+const platform = (probe.platform ?? "linux") satisfies NfsPlatform;
 
-/** Is anything mounted at `target`, according to the only source that knows? */
-function isMounted(target: string): boolean {
-  return readFileSync("/proc/self/mounts", "utf8")
-    .split("\n")
-    .some((line) => line.split(" ")[1] === target);
+/**
+ * Is anything mounted at `target`, according to the only source that knows?
+ *
+ * Deliberately *not* `src/nfs/mount.ts`'s own reader — the assertions would
+ * pass on a table this suite and the transport agreed to misread together.
+ * Only the format parsing is shared; where the table comes from is not.
+ */
+async function isMounted(target: string): Promise<boolean> {
+  const table =
+    platform === "darwin"
+      ? (await run("mount", [])).out
+      : readFileSync("/proc/self/mounts", "utf8");
+  return parseMountTable(platform, table).some((entry) => entry.target === target);
 }
 
 /** Run a command with no `cwd` inside the mountpoint — see the module docs. */
@@ -72,7 +93,9 @@ describe.skipIf(!probe.usable)("a real NFS mount", () => {
   async function mountpoint(): Promise<string> {
     const path = await fs.mkdtemp(join(tmpdir(), "mountx-nfs-mnt-"));
     directories.push(path);
-    return path;
+    // The mount table lists the resolved path, and on macOS `tmpdir()` is
+    // under `/var`, which is a symlink to `/private/var`.
+    return fs.realpath(path);
   }
 
   async function mount(): Promise<{ at: string; mounted: NfsMount }> {
@@ -82,14 +105,14 @@ describe.skipIf(!probe.usable)("a real NFS mount", () => {
     return { at, mounted };
   }
 
-  it("mounts, appears in /proc/self/mounts, and unmounts clean", async () => {
+  it("mounts, appears in the mount table, and unmounts clean", async () => {
     const { at, mounted } = await mount();
-    expect(isMounted(at)).toBe(true);
+    expect(await isMounted(at)).toBe(true);
     expect(mounted.source).toBe("127.0.0.1:/");
     expect(mounted.port).toBeGreaterThan(0);
 
     await mounted.unmount();
-    expect(isMounted(at)).toBe(false);
+    expect(await isMounted(at)).toBe(false);
     expect(mounted.active).toBe(false);
     // Idempotent, and the server went down with it.
     await mounted.unmount();

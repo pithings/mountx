@@ -71,7 +71,9 @@ import type { FsDriver } from "../../src/types.ts";
 import { SyntheticKernel } from "./synthetic-kernel.ts";
 
 const exec = promisify(execFile);
-const isRoot = (process.getuid?.() ?? -1) === 0;
+// FUSE needs Linux as well as root: on macOS `mount()` refuses outright
+// (macFUSE is a different protocol), so the suite skips rather than errors.
+const isRoot = (process.getuid?.() ?? -1) === 0 && process.platform === "linux";
 /** Real mounts are slow enough that vitest's 5s default is a coin flip. */
 const SLOW = 60_000;
 
