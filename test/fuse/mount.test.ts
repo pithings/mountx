@@ -657,7 +657,7 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
       ].join("\n"),
     );
 
-    const child = spawn(process.execPath, ["", script], {
+    const child = spawn(process.execPath, [script], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     daemons.push(child);
