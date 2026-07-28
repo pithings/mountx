@@ -13,7 +13,7 @@ in-memory store, a zip file, an S3 bucket, a database, or a plain folder served 
 
 ```ts
 import { mount } from "mountx/fuse";
-import { mountNfs } from "mountx/nfs"
+import { mountNfs } from "mountx/nfs";
 import { createLoopback } from "mountx";
 import { createMemoryDriver } from "mountx/drivers/memory";
 
@@ -29,7 +29,7 @@ new TextDecoder().decode(await fs.readFile("/notes/hello.txt")); // "hi"
 
 // Mount the driver to the kernel (Linux):
 await using mounted = await mount(driver, "/mnt/point", {
-  attrTimeout: 10, // seconds the kernel may cache attributes — the main dial
+  attrTimeout: 10, // seconds the kernel may cache attributes
 });
 
 // or mount the driver where FUSE is not available using over NFSv3
