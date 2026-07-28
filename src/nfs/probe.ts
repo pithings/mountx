@@ -30,7 +30,7 @@ export interface NfsClientProbe {
   helper: string | undefined;
   /** Does the kernel have an NFS client? See the weakness note below. */
   kernel: boolean;
-  /** Are we root? */
+  /** Are we root? Required on Linux, and deliberately not on macOS — see below. */
   root: boolean;
   /** Everything that is missing, in a sentence. */
   reason: string | undefined;
@@ -61,6 +61,19 @@ const MOUNT_NFS_PATHS: Record<NfsPlatform, readonly string[]> = {
  * equivalent list to read, and the client is not separable from the OS, so the
  * helper's presence is the whole answer.
  *
+ * **Root is a Linux requirement, not an NFS one** (verified on macOS 26.6,
+ * 2026-07-28). `/sbin/mount_nfs` is not setuid and holds no entitlement: macOS
+ * is a BSD, and a BSD lets an ordinary user mount onto a directory that user
+ * owns. So an unprivileged process there mounts with the same `mount(8)` spawn
+ * root uses, and the kernel simply forces `MNT_NOSUID|MNT_NODEV` on the result.
+ *
+ * That leaves a precondition this function cannot answer: *ownership of the
+ * mountpoint*, which is a fact about a path nobody has passed yet. It belongs
+ * at mount time, and `mountNfs` checks it there (`ownershipRefusal`). Linux has
+ * no equivalent — an unprivileged `mount(8)` needs an `fstab` entry marked
+ * `user`, which is not something this library can arrange — so the root
+ * requirement stays exactly where it is true.
+ *
  * `platform` exists to be overridden in tests; leave it alone otherwise.
  */
 export function nfsClientProbe(platform: NodeJS.Platform = process.platform): NfsClientProbe {
@@ -86,8 +99,8 @@ export function nfsClientProbe(platform: NodeJS.Platform = process.platform): Nf
   if (host === undefined) {
     missing.push(`this is ${platform}; the NFS transport mounts on Linux and macOS only`);
   }
-  if (!root) {
-    missing.push("mounting NFS needs root and this process is not root");
+  if (!root && host === "linux") {
+    missing.push("mounting NFS needs root on Linux and this process is not root");
   }
   if (host !== undefined && helper === undefined && !kernel) {
     missing.push(

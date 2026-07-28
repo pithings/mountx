@@ -18,6 +18,7 @@ import {
   isConsentDenial,
   nfsClientProbe,
   nfsMountOptions,
+  ownershipRefusal,
   parseMountTable,
 } from "../../src/nfs/mount.ts";
 
@@ -207,13 +208,37 @@ describe("nfsClientProbe", () => {
     expect(probe.reason).toContain(elsewhere === "darwin" ? "/sbin/mount_nfs" : "/sbin/mount.nfs");
   });
 
-  it("says root is missing when it is", () => {
-    const probe = nfsClientProbe();
+  it("asks for root on Linux and not on macOS", () => {
+    // `/sbin/mount_nfs` is not setuid and needs none: macOS is a BSD, and a BSD
+    // lets an ordinary user mount onto a directory that user owns. Asking for
+    // root there would refuse a mount the host would have allowed.
+    expect(nfsClientProbe("darwin").reason ?? "").not.toContain("needs root");
+    const linux = nfsClientProbe("linux").reason ?? "";
     if ((process.getuid?.() ?? -1) === 0) {
-      expect(probe.reason ?? "").not.toContain("needs root");
-      return;
+      expect(linux).not.toContain("needs root");
+    } else {
+      // Linux's unprivileged mount needs an `fstab` entry marked `user`, which
+      // is not something a library can arrange, so the requirement is real.
+      expect(linux).toContain("needs root");
     }
-    expect(probe.usable).toBe(false);
-    expect(probe.reason).toContain("needs root");
+  });
+});
+
+describe("ownershipRefusal", () => {
+  it("refuses a mountpoint an unprivileged macOS caller does not own", () => {
+    const refusal = ownershipRefusal("darwin", "/private/tmp/theirs", 0, 501);
+    expect(refusal).toContain("/private/tmp/theirs");
+    // Both uids, because "permission denied" without them is the message the
+    // host already gave and the reason this function exists.
+    expect(refusal).toContain("uid 0");
+    expect(refusal).toContain("uid 501");
+  });
+
+  it("allows what the host allows", () => {
+    // Owned by the caller, root (who may mount anywhere), and Linux — where an
+    // unprivileged caller never gets this far, the probe having refused first.
+    expect(ownershipRefusal("darwin", "/mine", 501, 501)).toBeUndefined();
+    expect(ownershipRefusal("darwin", "/theirs", 501, 0)).toBeUndefined();
+    expect(ownershipRefusal("linux", "/theirs", 0, 501)).toBeUndefined();
   });
 });

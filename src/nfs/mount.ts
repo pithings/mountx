@@ -10,12 +10,21 @@
  * await using mounted = await mountNfs(createMemoryDriver(), "/mnt/point");
  * ```
  *
- * **Root, and a client.** `mount(2)` is not a syscall Node can issue, and there
- * is no setuid helper for NFS the way `fusermount3` is one for FUSE — so this
- * needs root, and it needs the host to have an NFS *client*: the `nfs` module
- * in the kernel and the `/sbin/mount.nfs` helper from `nfs-utils`. Neither is
- * something the server can provide, so {@link nfsClientProbe} exists to say
- * which is missing before anything is spawned.
+ * **A client, and — on Linux — root.** `mount(2)` is not a syscall Node can
+ * issue, and there is no setuid helper for NFS the way `fusermount3` is one for
+ * FUSE, so this spawns `mount(8)` and needs the host to have an NFS *client*:
+ * the `nfs` module in the kernel and the `/sbin/mount.nfs` helper from
+ * `nfs-utils`. Neither is something the server can provide, so
+ * {@link nfsClientProbe} exists to say which is missing before anything is
+ * spawned.
+ *
+ * Root is the Linux half of that and **not** the macOS half. `/sbin/mount_nfs`
+ * is not setuid and needs no privilege: macOS is a BSD, and a BSD lets an
+ * ordinary user mount onto a directory that user owns. The same spawn works
+ * either way, so the unprivileged path here is not a second implementation —
+ * it is the same one with a different precondition, checked by
+ * {@link ownershipRefusal} because it is a fact about the mountpoint rather
+ * than about the host.
  *
  * **Linux and macOS.** Everything above `server.ts` is portable; this file is
  * where the two hosts differ, and the differences are small enough to name in
@@ -214,6 +223,17 @@ export async function mountNfs(
   });
   if (!targetStat.isDirectory()) {
     throw new Error(`mountx: mountpoint ${resolved} is not a directory`);
+  }
+  // The one precondition the probe cannot answer, because it is about this
+  // path rather than about this host. Checked before anything is listening.
+  const refusal = ownershipRefusal(
+    platform,
+    resolved,
+    targetStat.uid,
+    process.getuid?.() ?? targetStat.uid,
+  );
+  if (refusal !== undefined) {
+    throw new Error(refusal);
   }
   // The mount table records the path with every symlink resolved, and matching
   // against it is how teardown knows whether the mount is still there. macOS
@@ -453,6 +473,33 @@ function describe(command: string, result: SpawnResult): string {
  */
 export function isConsentDenial(platform: NfsPlatform, stderr: string): boolean {
   return platform === "darwin" && /operation not permitted/i.test(stderr);
+}
+
+/**
+ * Why macOS will refuse this mountpoint to this user, if it will.
+ *
+ * The BSD rule an unprivileged mount lives under: the caller must own the
+ * directory. Verified on macOS 26.6 — a mountpoint owned by root refuses with
+ * `mount_nfs: … Operation not permitted` even though the very same command
+ * succeeds one directory over. Root is exempt, and Linux never reaches here
+ * (the probe already refused), so this is a darwin-and-not-root question.
+ *
+ * Pure and exported so a Tier-0 test can hold both answers from either host.
+ */
+export function ownershipRefusal(
+  platform: NfsPlatform,
+  mountpoint: string,
+  ownerUid: number,
+  callerUid: number,
+): string | undefined {
+  if (platform !== "darwin" || callerUid === 0 || ownerUid === callerUid) {
+    return undefined;
+  }
+  return (
+    `mountx: macOS lets an ordinary user mount only onto a directory that user owns, and ` +
+    `${mountpoint} belongs to uid ${ownerUid} while this process is uid ${callerUid}. Mount ` +
+    `somewhere you own — a directory you created yourself — or run as root.`
+  );
 }
 
 /** What to do about a mount macOS will not let this process take down. */
