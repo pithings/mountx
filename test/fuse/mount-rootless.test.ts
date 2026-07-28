@@ -107,25 +107,37 @@ describe.skipIf(!asUser || !probe.usable || !roomToRun)(
       for (const dir of sandboxes.splice(0)) {
         // Never recurse into something still mounted: `rm -r` is concurrent,
         // and a live mountpoint would take the whole threadpool with it.
-        if (mountEntries().some(([, path]) => path === dir || path.startsWith(`${dir}/`))) {
+        if (
+          mountEntries().some((entry) => entry.target === dir || entry.target.startsWith(`${dir}/`))
+        ) {
           continue;
         }
         await rm(dir, { recursive: true, force: true });
       }
-      expect(mountEntries().filter(([, path]) => path.includes("mountx-rootless"))).toEqual([]);
+      expect(mountEntries().filter((entry) => entry.target.includes("mountx-rootless"))).toEqual(
+        [],
+      );
       expect(liveMounts()).toEqual([]);
     });
 
-    /** `/proc/self/mounts` as `[source, target, type, options]` rows. */
-    function mountEntries(): string[][] {
+    /** `/proc/self/mounts`, parsed. */
+    function mountEntries(): Array<{
+      source: string;
+      target: string;
+      type: string;
+      options: string;
+    }> {
       return readFileSync("/proc/self/mounts", "utf8")
         .split("\n")
         .filter((line) => line !== "")
-        .map((line) => line.split(" "));
+        .map((line) => {
+          const [source = "", target = "", type = "", options = ""] = line.split(" ");
+          return { source, target, type, options };
+        });
     }
 
-    function entryAt(path: string): string[] | undefined {
-      return mountEntries().find(([, target]) => target === path);
+    function entryAt(path: string): ReturnType<typeof mountEntries>[number] | undefined {
+      return mountEntries().find((entry) => entry.target === path);
     }
 
     it(
@@ -134,7 +146,7 @@ describe.skipIf(!asUser || !probe.usable || !roomToRun)(
         const { path } = await openMount(createMemoryDriver(), { fsname: "rootless-demo" });
         const entry = entryAt(path);
         expect(entry).toBeDefined();
-        const [source, , type, options] = entry!;
+        const { source, type, options } = entry!;
 
         // `fsname=` is how the source is named when `fusermount3` does the
         // mounting; there is no source argument to give it.
@@ -222,8 +234,7 @@ describe.skipIf(!asUser || !probe.usable || !roomToRun)(
       // exists for. The message is its own; what matters here is that it
       // arrives as a rejection rather than a half-built mount.
       await expect(mount(createMemoryDriver(), "/proc")).rejects.toThrow(/mounting \/proc failed/);
-      expect(entryAt("/proc")).toBeDefined();
-      expect(entryAt("/proc")![2]).toBe("proc");
+      expect(entryAt("/proc")?.type).toBe("proc");
     });
 
     it("rejects the root-only `device` option rather than ignoring it", async () => {
