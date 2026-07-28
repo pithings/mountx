@@ -95,7 +95,7 @@ above that the step touches, and the commands to run.
       named in the file header like `src/fuse/constants.ts` does.
       Tests `test/9p/wire.test.ts`: round-trips, bounds, golden byte fixtures
       with all-distinct values, truncation → throws. Commit.
-- [ ] **2. Message codecs** — `src/9p/protocol.ts`: every 9P2000.L message
+- [x] **2. Message codecs** — `src/9p/protocol.ts`: every 9P2000.L message
       encoded **and** decoded (both directions — the JS test client needs the
       T-encoders/R-decoders, the session the inverse): version, auth, attach,
       flush, walk, read, write, clunk, remove, statfs, lopen, lcreate, symlink,
@@ -230,3 +230,18 @@ deferred)
 - 2026-07-28: host loaded the 9p modules mid-run (`9p`/`9pnet`/`9pnet_virtio`,
   no `9pnet_fd` yet) — Tier-2 decision and step 10 rewritten from QEMU-TCG to
   local real-mount witnessing; step 13 now also opens the PR (user request).
+- 2026-07-28: host confirmed `9pnet_fd` loaded (lsmod) and persisted in
+  `/etc/modules-load.d/9p.conf` — `trans=fd`/`tcp`/`unix` all available with
+  no autoload doubt. Step 10's stop-and-ask branch should now be unreachable.
+- 2026-07-28 step 2: `protocol.ts` (29 message families both directions,
+  framing, dirent packer, latching frame assembler) + 166 tests in 4 files.
+  Verifier round 1 FAILED with three real defects — packer wrote 22 bytes
+  before throwing on an over-long name (block corrupted), assembler threw
+  without latching (desynced stream parsed as garbage), 17 messages lacked
+  goldens incl. one a comment claimed existed. Fixed (throw-before-write →
+  `ENAMETOOLONG`-able; poison latch + `reset()`-for-next-connection; all
+  families byte-pinned) → round 2 PASS with 400k packer / 470k assembler
+  fuzz calls and six goldens independently re-derived. Learned: kernel v6.12
+  has no `p9_client_auth` — Tauth layout rests on diod alone; decoded anyway
+  so the session can refuse it politely. Nits carried: wire.ts scalar writers
+  mask silently; assembler O(n²) vs byte-dribblers (same shape as rpc.ts).
