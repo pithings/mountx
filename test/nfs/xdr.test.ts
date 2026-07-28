@@ -257,7 +257,7 @@ describe("the writer", () => {
 
 describe("auth", () => {
   it("round-trips AUTH_SYS parameters", () => {
-    const params = { stamp: 42, machineName: "unimount", uid: 1000, gid: 100, gids: [1, 2, 3] };
+    const params = { stamp: 42, machineName: "mountx", uid: 1000, gid: 100, gids: [1, 2, 3] };
     expect(decodeAuthSys(encodeAuthSys(params))).toEqual(params);
   });
 

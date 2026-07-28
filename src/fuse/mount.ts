@@ -6,8 +6,8 @@
  * bytes out, which is why all of it is testable with no root and no kernel.
  *
  * ```ts
- * import { mount } from "unimount/fuse";
- * import { createMemoryDriver } from "unimount/drivers/memory";
+ * import { mount } from "mountx/fuse";
+ * import { createMemoryDriver } from "mountx/drivers/memory";
  *
  * await using mounted = await mount(createMemoryDriver(), "/mnt/point");
  * // ... /mnt/point is live until unmount() or the process exits ...
@@ -122,7 +122,7 @@ export interface MountOptions extends FuseSessionOptions {
    * Neither is v1.
    */
   readers?: number;
-  /** What `/proc/mounts` shows as the device. Default `"unimount"`. */
+  /** What `/proc/mounts` shows as the device. Default `"mountx"`. */
   fsname?: string;
   /** Makes the mount type read `fuse.<subtype>`. Default: none. */
   subtype?: string;
@@ -242,7 +242,7 @@ async function onTeardownSignal(signal: NodeJS.Signals): Promise<void> {
   // unmount is the one that says how to recover. Losing it to a signal
   // handler's silence is how a wedged mountpoint becomes a mystery.
   for (const failure of await unmountAll()) {
-    console.error(`unimount: unmount on ${signal} failed: ${errorMessage(failure)}`);
+    console.error(`mountx: unmount on ${signal} failed: ${errorMessage(failure)}`);
   }
   // Nobody else is listening, so nothing will exit the process: re-raise, and
   // let the default action produce the conventional 128+n status. Note that
@@ -308,22 +308,22 @@ export async function mount(
   options: MountOptions = {},
 ): Promise<Mount> {
   if (process.platform !== "linux") {
-    throw new Error(`unimount: FUSE mounts need Linux, this is ${process.platform}`);
+    throw new Error(`mountx: FUSE mounts need Linux, this is ${process.platform}`);
   }
   const uid = process.getuid?.() ?? -1;
   if (uid !== 0) {
     throw new Error(
-      "unimount: mounting FUSE needs root. Without `fusermount3` (this host has none) " +
+      "mountx: mounting FUSE needs root. Without `fusermount3` (this host has none) " +
         "there is no unprivileged path, so run the process as root — under `sudo`, note " +
         'that root\'s PATH may lack node: sudo "$(which node)" script.mjs',
     );
   }
   const target = resolveNative(mountpoint);
   const targetStat = await statPath(target).catch((error: unknown) => {
-    throw new Error(`unimount: mountpoint ${target} is not usable: ${errorMessage(error)}`);
+    throw new Error(`mountx: mountpoint ${target} is not usable: ${errorMessage(error)}`);
   });
   if (!targetStat.isDirectory()) {
-    throw new Error(`unimount: mountpoint ${target} is not a directory`);
+    throw new Error(`mountx: mountpoint ${target} is not a directory`);
   }
   // Linux stacks mounts: mounting over a live mountpoint succeeds and hides the
   // one underneath, and then `umount` detaches whichever is on *top*. That is a
@@ -334,14 +334,14 @@ export async function mount(
   for (const existing of live) {
     if (existing.mountpoint === target) {
       throw new Error(
-        `unimount: ${target} is already mounted by this process. Unmount it before mounting again.`,
+        `mountx: ${target} is already mounted by this process. Unmount it before mounting again.`,
       );
     }
   }
   const occupant = mountEntryAt(target);
   if (occupant !== undefined && occupant.type.startsWith("fuse")) {
     throw new Error(
-      `unimount: ${target} already has a FUSE filesystem on it (${occupant.source}, type ` +
+      `mountx: ${target} already has a FUSE filesystem on it (${occupant.source}, type ` +
         `${occupant.type}). Mounting over it would stack a second mount and make either ` +
         `unmount detach the wrong one. Clear it first: umount ${target}`,
     );
@@ -352,12 +352,12 @@ export async function mount(
   // spoken to us, and it is parsed as octal. It must agree with what `GETATTR`
   // on nodeid 1 will say, or the VFS refuses to descend into the mount.
   const rootStat = await session.driver.stat("/").catch((error: unknown) => {
-    throw new Error(`unimount: the driver cannot stat its own root: ${errorMessage(error)}`);
+    throw new Error(`mountx: the driver cannot stat its own root: ${errorMessage(error)}`);
   });
   const rootMode = Number(rootStat.mode);
   if ((rootMode & S_IFMT) !== S_IFDIR) {
     throw new Error(
-      `unimount: the driver's root must be a directory, its mode is 0o${rootMode.toString(8)}`,
+      `mountx: the driver's root must be a directory, its mode is 0o${rootMode.toString(8)}`,
     );
   }
 
@@ -430,7 +430,7 @@ function isMounted(target: string): boolean {
 function checkMountToken(name: string, value: string | undefined): string | undefined {
   if (value !== undefined && /[,=\s]/.test(value)) {
     throw new Error(
-      `unimount: \`${name}\` may not contain a comma, an equals sign or whitespace — ` +
+      `mountx: \`${name}\` may not contain a comma, an equals sign or whitespace — ` +
         `it is joined into the mount option list, where those separate options ` +
         `(got ${JSON.stringify(value)})`,
     );
@@ -500,7 +500,7 @@ class MountImpl implements Mount {
     this.session = session;
     this.mountpoint = mountpoint;
     this.#options = options;
-    this.source = checkMountToken("fsname", options.fsname) ?? "unimount";
+    this.source = checkMountToken("fsname", options.fsname) ?? "mountx";
     checkMountToken("subtype", options.subtype);
     const readers = options.readers ?? 2;
     // `NaN` would floor to zero readers, which is a mount that answers nothing
@@ -575,11 +575,11 @@ class MountImpl implements Mount {
     try {
       result = await run("mount", args, stdio);
     } catch (error) {
-      throw new Error(`unimount: could not run mount(8): ${errorMessage(error)}`);
+      throw new Error(`mountx: could not run mount(8): ${errorMessage(error)}`);
     }
     if (result.status !== 0) {
       throw new Error(
-        `unimount: mounting ${this.mountpoint} failed — ${describe(
+        `mountx: mounting ${this.mountpoint} failed — ${describe(
           `mount -t ${type} -o ${options}`,
           result,
         )}`,
@@ -625,7 +625,7 @@ class MountImpl implements Mount {
         this.#ready = undefined;
         resolvePromise(
           new Error(
-            `unimount: the kernel sent no FUSE_INIT within ${timeout}ms — ` +
+            `mountx: the kernel sent no FUSE_INIT within ${timeout}ms — ` +
               `${this.mountpoint} was mounted but never came up`,
           ),
         );
@@ -908,14 +908,14 @@ class MountImpl implements Mount {
     try {
       result = await run("umount", [this.mountpoint], ["ignore", "ignore", "pipe"]);
     } catch (error) {
-      throw new Error(`unimount: could not run umount(8): ${errorMessage(error)}`);
+      throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
     }
     // A failure that raced an external unmount is not a failure.
     if (result.status === 0 || !isMounted(this.mountpoint)) {
       return;
     }
     throw new Error(
-      `unimount: could not unmount ${this.mountpoint} (${describe("umount", result)}). ` +
+      `mountx: could not unmount ${this.mountpoint} (${describe("umount", result)}). ` +
         `The mount is still live. If a process is holding it, \`fuser -m ${this.mountpoint}\` ` +
         `will say which; \`sudo umount -l ${this.mountpoint}\` detaches it regardless.`,
     );
@@ -940,7 +940,7 @@ class MountImpl implements Mount {
    */
   async #force(timeout: number): Promise<void> {
     const error = new Error(
-      `unimount: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
+      `mountx: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
         `driver has probably stopped answering. The connection has been aborted, so anything ` +
         `in flight was lost. If the mountpoint is somehow still listed: ` +
         `sudo umount -l ${this.mountpoint}`,
@@ -982,7 +982,7 @@ class MountImpl implements Mount {
     this.#stopping = true;
     // A connection that dies before the handshake unblocks `start`, which then
     // unwinds the half-built mount.
-    this.#ready?.(new Error(`unimount: ${this.mountpoint} lost its connection before FUSE_INIT`));
+    this.#ready?.(new Error(`mountx: ${this.mountpoint} lost its connection before FUSE_INIT`));
     live.delete(this);
     if (live.size === 0) {
       removeSignalHandlers();

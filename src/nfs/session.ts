@@ -1119,7 +1119,7 @@ export class NfsSession {
   }
 
   /**
-   * `MKNOD` — `NFS3ERR_NOTSUPP` unless the driver has the `unimount.mknod`
+   * `MKNOD` — `NFS3ERR_NOTSUPP` unless the driver has the `mountx.mknod`
    * extension, which nothing implements yet.
    *
    * Device nodes, FIFOs and sockets are outside what `node:fs/promises` can
@@ -1136,13 +1136,13 @@ export class NfsSession {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "mknod"));
       before = await this.#preOp(dir);
-      const mknod = this.driver.unimount?.mknod;
+      const mknod = this.driver.mountx?.mknod;
       if (mknod === undefined) {
-        throw new NfsStatusError(NFS3ERR_NOTSUPP, "MKNOD needs the unimount.mknod extension");
+        throw new NfsStatusError(NFS3ERR_NOTSUPP, "MKNOD needs the mountx.mknod extension");
       }
       const mode = (request.attributes?.mode ?? 0o666) & 0o7777;
       const rdev = ((request.spec?.major ?? 0) << 8) | (request.spec?.minor ?? 0);
-      await mknod.call(this.driver.unimount, path, mode | modeBitsOfFtype(request.type), rdev);
+      await mknod.call(this.driver.mountx, path, mode | modeBitsOfFtype(request.type), rdev);
       await this.#claim(path, creds);
       await this.#created(writer, dir, before, path);
     } catch (error) {

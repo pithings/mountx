@@ -81,7 +81,7 @@ export function decodeAuthSys(body: Uint8Array): AuthSysParams {
 export function authSys(
   uid = process.getuid?.() ?? 0,
   gid = process.getgid?.() ?? 0,
-  machineName = "unimount",
+  machineName = "mountx",
 ): OpaqueAuth {
   return {
     flavor: AUTH_SYS,

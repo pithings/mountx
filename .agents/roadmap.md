@@ -1,4 +1,4 @@
-# unimount v1 roadmap
+# mountx v1 roadmap
 
 Design source of truth: `IDEA.md`. Environment facts: `.agents/environment.md`.
 
@@ -15,9 +15,9 @@ results.
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
-- **Layout:** single `unimount` package with subpath exports (`unimount`,
-  `unimount/fuse`, `unimount/nfs`, `unimount/drivers/memory`,
-  `unimount/drivers/node-fs`). pnpm workspace kept for future splitting.
+- **Layout:** single `mountx` package with subpath exports (`mountx`,
+  `mountx/fuse`, `mountx/nfs`, `mountx/drivers/memory`,
+  `mountx/drivers/node-fs`). pnpm workspace kept for future splitting.
 - **Drivers in v1:** in-memory driver + `node:fs` passthrough (the
   differential-test oracle). unstorage adapter deferred.
 - **Git flow:** small conventional commits directly to `main`.
@@ -48,8 +48,8 @@ rather than by accident.
   to create a special file (neither does `node:fs/promises`). This is the
   entire remaining pjdfstest gap (45 failing files, all one missing
   feature) — see `.agents/pjdfstest-results.md`. Needs an `FsDriver.mknod`
-  or `unimount.mknod` extension plus matching storage in the memory driver.
-- **xattr and the rest of the `unimount.*` extension namespace** (byte-range
+  or `mountx.mknod` extension plus matching storage in the memory driver.
+- **xattr and the rest of the `mountx.*` extension namespace** (byte-range
   locks, `fallocate`/`lseek`, cache-invalidation `notify`) — `ENOTSUP` until
   a real user needs one.
 - **NFS `CREATE` with `EXCLUSIVE`** — currently `NFS3ERR_NOTSUPP`; the

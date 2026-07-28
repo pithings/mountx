@@ -53,7 +53,7 @@
   nfs-ls/nfs-cp are userspace NFSv3 clients usable as independent oracles
   (caveat: getlogin() segfaults in this container — LD_PRELOAD a shim
   returning a name). `rpcbind` and
-  `nfsstat` are absent too. The NFS _server_ (`unimount/nfs`) is unaffected: it
+  `nfsstat` are absent too. The NFS _server_ (`mountx/nfs`) is unaffected: it
   is pure JS over a TCP socket and its Tier-0/Tier-1 suites need nothing. Only
   `pnpm test:nfs:mount` (Tier 2) is affected, and it skips itself on
   `nfsClientProbe()`. On a host with `nfs-common`/`nfs-utils` installed it

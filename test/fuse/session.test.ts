@@ -225,7 +225,7 @@ describe("the full mount sequence", () => {
     const { session, kernel } = await mount();
     const entry = await kernel.mknod(FUSE_ROOT_ID, "node", S_IFREG | 0o600);
     expect(entry.attr.mode & S_IFMT).toBe(S_IFREG);
-    // A FIFO needs the `unimount.mknod` extension, and says so.
+    // A FIFO needs the `mountx.mknod` extension, and says so.
     await expect(kernel.mknod(FUSE_ROOT_ID, "fifo", 0o010_600)).rejects.toMatchObject({
       code: "ENOSYS",
     });
@@ -840,7 +840,7 @@ describe("node:fs passthrough smoke test", () => {
   });
 
   it("runs the same sequence against a real directory", async () => {
-    root = await mkdtemp(join(tmpdir(), "unimount-session-"));
+    root = await mkdtemp(join(tmpdir(), "mountx-session-"));
     const { session, kernel } = await mount(createNodeFsDriver(root), { attrTimeout: 1 });
 
     const dir = await kernel.mkdir(FUSE_ROOT_ID, "sub", 0o755);
@@ -1027,12 +1027,12 @@ describe("driver quirks", () => {
     expectHealthy(session);
   });
 
-  it("uses unimount.utimens when the driver has it", async () => {
+  it("uses mountx.utimens when the driver has it", async () => {
     const base = createMemoryDriver();
     const seen: bigint[] = [];
     const driver: FsDriver = {
       ...base,
-      unimount: {
+      mountx: {
         async utimens(_path, atimeNs, mtimeNs) {
           seen.push(atimeNs, mtimeNs);
         },
@@ -1053,12 +1053,12 @@ describe("driver quirks", () => {
     expectHealthy(session);
   });
 
-  it("uses unimount.mknod when the driver has it", async () => {
+  it("uses mountx.mknod when the driver has it", async () => {
     const base = createMemoryDriver();
     const calls: [string, number, number][] = [];
     const driver: FsDriver = {
       ...base,
-      unimount: {
+      mountx: {
         async mknod(path, mode, dev) {
           calls.push([path, mode, dev]);
           await base.open(path, "wx", mode & 0o7777).then((handle) => handle.close());

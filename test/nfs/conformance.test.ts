@@ -44,7 +44,7 @@ import { check, NfsClient, nfsDriver } from "./client.ts";
  *   does not, and the server is right either way. The conformance suite's
  *   "keeps an open handle readable after unlink" case is therefore skipped.
  * - **`extensions: []`**, for the same reason as the FUSE column: the
- *   `unimount.*` namespace is a driver-to-session channel with no wire
+ *   `mountx.*` namespace is a driver-to-session channel with no wire
  *   representation.
  *
  * Everything else — hardlinks, symlinks, permissions, times, truncate, atomic
@@ -94,7 +94,7 @@ describe("over an NFSv3 server", () => {
     name: "node-fs driver, over NFS",
     capabilities: THROUGH_NFS,
     setup: async () => {
-      const backing = await mkdtemp(join(tmpdir(), "unimount-nfs-"));
+      const backing = await mkdtemp(join(tmpdir(), "mountx-nfs-"));
       const served = await serve(createNodeFsDriver(backing));
       return {
         fs: served.fs,

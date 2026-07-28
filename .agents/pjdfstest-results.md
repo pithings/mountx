@@ -1,4 +1,4 @@
-# pjdfstest against a unimount FUSE mount
+# pjdfstest against a mountx FUSE mount
 
 Measured 2026-07-28 on the dev host (Linux 6.12, FUSE protocol 7.41, Node
 v24.18.0). Reproduce with `pnpm test:pjdfstest`; the harness is
@@ -130,7 +130,7 @@ same seven types.
   A FUSE server creates a special file by inventing an inode with the right
   `S_IF*` in `mode` (and `rdev` for devices) and reporting it in `getattr` —
   the VFS supplies the pipe, socket and device semantics itself. It needs an
-  `FsDriver.mknod` (or an `unimount.mknod` extension) and matching storage in
+  `FsDriver.mknod` (or an `mountx.mknod` extension) and matching storage in
   the in-memory driver, and it would take the suite from 45 failing files to
   a handful. It is a milestone-1 interface change, so it is not one this
   milestone made.

@@ -1,45 +1,36 @@
-# unimount
+# mountx
 
 <!-- automd:badges color=yellow -->
 
-[![npm version](https://img.shields.io/npm/v/unimount?color=yellow)](https://npmjs.com/package/unimount)
-[![npm downloads](https://img.shields.io/npm/dm/unimount?color=yellow)](https://npm.chart.dev/unimount)
+[![npm version](https://img.shields.io/npm/v/mountx?color=yellow)](https://npmjs.com/package/mountx)
+[![npm downloads](https://img.shields.io/npm/dm/mountx?color=yellow)](https://npm.chart.dev/mountx)
 
 <!-- /automd -->
 
-**Write a filesystem in TypeScript, mount it as a real kernel filesystem.**
+**Write a filesystem in JavaScript, mount it as a real kernel filesystem.**
 
-A driver is a subset of `node:fs/promises` — `stat`, `readdir`, `open`,
-`mkdir`, `rename`, and so on, thrown errors included. `unimount` carries that
-interface into the kernel two ways: as a FUSE mount on Linux, or as an NFSv3
-share any NFSv3 client can mount. The driver never learns which. There is no
-adapter to write, because `node:fs/promises` already _is_ the interface, and
-`node:fs`'s errors already _are_ the error contract — a driver that throws
-`ENOENT` the way Node does needs no translation table to reach the wire.
+A driver is an object with the `node:fs/promises` methods (`stat`, `readdir`, `open`, `mkdir`, `rename`).
 
-This gets you a mountpoint for anything you can express as a filesystem: an
-in-memory store, a content-addressed blob store, a zip file, an S3 bucket, a
-`node:fs` directory served back out. Two drivers ship in v1 — an in-memory one
-and a `node:fs` passthrough — and any existing `node:fs/promises`-shaped
-library (`memfs`, `@zenfs/core`, `unfs`, ...) should work unchanged, though the
-acid test below is only proven against `node:fs/promises` itself.
+Mountx takes that object and mounts it, either as a [FUSE mount](https://en.wikipedia.org/wiki/Filesystem_in_Userspace) on Linux or as an NFSv3 share. The driver never learns which. There is nothing to adapt: `node:fs/promises` already _is_ the interface, and its errors already _are_ the error contract.
+
+So anything you can describe as a filesystem gets a real mountpoint — an in-memory store, a zip file, an S3 bucket, a content-addressed blob store, a `node:fs` directory served back out.
 
 ## Installation
 
 ```sh
-npx nypm install unimount
+npx nypm install mountx
 ```
 
-Subpath exports: `unimount` (driver interface, loopback harness), `unimount/fuse`,
-`unimount/nfs`, `unimount/drivers/memory`, `unimount/drivers/node-fs`.
+Subpath exports: `mountx` (driver interface, loopback harness), `mountx/fuse`,
+`mountx/nfs`, `mountx/drivers/memory`, `mountx/drivers/node-fs`.
 
 ## Quickstart
 
 ### FUSE (Linux, needs root)
 
 ```ts
-import { mount } from "unimount/fuse";
-import { createMemoryDriver } from "unimount/drivers/memory";
+import { mount } from "mountx/fuse";
+import { createMemoryDriver } from "mountx/drivers/memory";
 
 await using mounted = await mount(createMemoryDriver(), "/mnt/point");
 // /mnt/point is a real mountpoint until unmount() or the process exits.
@@ -62,8 +53,8 @@ sudo umount -l /mnt/point
 ### NFSv3 (no root to serve, root to mount)
 
 ```ts
-import { mountNfs } from "unimount/nfs";
-import { createMemoryDriver } from "unimount/drivers/memory";
+import { mountNfs } from "mountx/nfs";
+import { createMemoryDriver } from "mountx/drivers/memory";
 
 await using mounted = await mountNfs(createMemoryDriver(), "/mnt/point");
 ```
@@ -86,7 +77,7 @@ ephemeral port unless you set one.
 test is that the real thing satisfies it with no wrapper:
 
 ```ts
-import type { FsDriver } from "unimount";
+import type { FsDriver } from "mountx";
 
 const driver: FsDriver = await import("node:fs/promises"); // compiles as-is
 ```
@@ -119,8 +110,8 @@ Node's own.
 Test a driver with **no mount at all** using the loopback harness:
 
 ```ts
-import { createLoopback } from "unimount";
-import { createMemoryDriver } from "unimount/drivers/memory";
+import { createLoopback } from "mountx";
+import { createMemoryDriver } from "mountx/drivers/memory";
 
 const fs = createLoopback(createMemoryDriver());
 await fs.writeFile("/hello.txt", "hi");
@@ -164,7 +155,7 @@ One suite (`test/conformance.ts`), written once against the driver interface,
 run three ways — loopback, over a real FUSE mount, over a real NFSv3 socket —
 so any test that passes in one column and fails in another is, by
 construction, a transport bug rather than a driver bug. Full tables:
-[`.agents/conformance-matrix.md`](https://github.com/pithings/unimount/blob/main/.agents/conformance-matrix.md).
+[`.agents/conformance-matrix.md`](https://github.com/pithings/mountx/blob/main/.agents/conformance-matrix.md).
 
 The honest summary: **FUSE loses nothing** either bundled driver has (126/126
 passing, no skips). **NFSv3 loses exactly one capability**, `handles` — an
@@ -178,7 +169,7 @@ suite, over a real mount: **59.1% passing** (5179/8770 assertions), and **every
 one of the 45 remaining failing files** exercises `mkfifo`/`mknod`/UNIX-socket
 creation — a driver-interface gap (`node:fs/promises` has no way to create a
 special file either), not a session bug. Full breakdown and bug list:
-[`.agents/pjdfstest-results.md`](https://github.com/pithings/unimount/blob/main/.agents/pjdfstest-results.md).
+[`.agents/pjdfstest-results.md`](https://github.com/pithings/mountx/blob/main/.agents/pjdfstest-results.md).
 
 The validation arsenal behind both reports:
 
@@ -196,7 +187,7 @@ The validation arsenal behind both reports:
 ## Performance
 
 All numbers below are from
-[`.agents/benchmarks.md`](https://github.com/pithings/unimount/blob/main/.agents/benchmarks.md),
+[`.agents/benchmarks.md`](https://github.com/pithings/mountx/blob/main/.agents/benchmarks.md),
 taken on one host, one day (Linux 6.12, Node v24.18.0, in-memory driver) —
 they are not portable, and the file has the full tables and caveats.
 
@@ -244,8 +235,8 @@ async main-thread mode only, and no claim is made about the other two beyond
 
 The must-knows; each is documented in full where the code lives.
 
-- **Root, in v1.** Both `mount()` (`unimount/fuse`) and `mountNfs()`
-  (`unimount/nfs`) need to run as root. Neither has an unprivileged path yet.
+- **Root, in v1.** Both `mount()` (`mountx/fuse`) and `mountNfs()`
+  (`mountx/nfs`) need to run as root. Neither has an unprivileged path yet.
 - **Don't be your own client.** Serving a mount and using it from the same
   process is the sharp edge: any synchronous `fs` call against your own
   mountpoint deadlocks outright, and enough concurrent _async_ calls against it
@@ -266,9 +257,9 @@ The must-knows; each is documented in full where the code lives.
 
 ## Status / roadmap
 
-**Shipped in v1:** the driver interface (`unimount`), the FUSE protocol,
-session and root-mode transport (`unimount/fuse`), NFSv3 loopback
-(`unimount/nfs`), the in-memory and `node:fs` passthrough drivers, the
+**Shipped in v1:** the driver interface (`mountx`), the FUSE protocol,
+session and root-mode transport (`mountx/fuse`), NFSv3 loopback
+(`mountx/nfs`), the in-memory and `node:fs` passthrough drivers, the
 loopback test harness, and the conformance + benchmark suites this README is
 drawn from.
 
@@ -313,4 +304,4 @@ benchmarks in this file.
 
 ## License
 
-Published under the [MIT](https://github.com/pithings/unimount/blob/main/LICENSE) license 💛.
+Published under the [MIT](https://github.com/pithings/mountx/blob/main/LICENSE) license 💛.

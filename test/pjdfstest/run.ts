@@ -198,7 +198,7 @@ async function main(): Promise<void> {
   // `defaultPermissions` stays on for the same reason — it is what makes the
   // mode bits the tests set actually enforce anything.
   const mounted = await mount(createMemoryDriver(), mountpoint, {
-    fsname: "unimount-pjdfstest",
+    fsname: "mountx-pjdfstest",
     allowOther: true,
     attrTimeout: 0,
     entryTimeout: 0,

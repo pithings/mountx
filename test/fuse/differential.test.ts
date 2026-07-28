@@ -43,17 +43,17 @@ const SLOW = 300_000;
  *
  * Fixed in the file, because a differential failure has to be reproducible from
  * the repository rather than from the run that happened to find it. The two
- * environment variables are for *hunting*: `UNIMOUNT_DIFF_SEED=7
- * UNIMOUNT_DIFF_OPS=5000 pnpm test:differential` explores further, and anything
+ * environment variables are for *hunting*: `MOUNTX_DIFF_SEED=7
+ * MOUNTX_DIFF_OPS=5000 pnpm test:differential` explores further, and anything
  * it finds gets pinned back here.
  */
-const SEED = Number(process.env.UNIMOUNT_DIFF_SEED ?? 0xc0_ff_ee);
-const RANDOM_OPS = Number(process.env.UNIMOUNT_DIFF_OPS ?? 400);
+const SEED = Number(process.env.MOUNTX_DIFF_SEED ?? 0xc0_ff_ee);
+const RANDOM_OPS = Number(process.env.MOUNTX_DIFF_OPS ?? 400);
 
 const sandboxes: string[] = [];
 
 async function sandbox(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "unimount-diff-"));
+  const dir = await mkdtemp(join(tmpdir(), "mountx-diff-"));
   sandboxes.push(dir);
   return dir;
 }
@@ -116,7 +116,7 @@ describe.skipIf(!isRoot)("a FUSE mount against node:fs", () => {
     await mkdir(backing);
     await mkdir(disk);
     const mounted = await mount(createNodeFsDriver(backing), mnt, {
-      fsname: "unimount-differential",
+      fsname: "mountx-differential",
       attrTimeout: 0,
       entryTimeout: 0,
       readers: 4,

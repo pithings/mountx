@@ -115,7 +115,7 @@ describe("golden: FUSE_INIT", () => {
     expect(decodeInitIn(request.subarray(40))).toEqual(initIn);
   });
 
-  // The reply for the unimount defaults: 1 MiB max_write via 256 max_pages,
+  // The reply for the mountx defaults: 1 MiB max_write via 256 max_pages,
   // 1 ns time granularity, 64 background requests.
   const reply = fixture(
     ["out.len = 80 (16 + 64)", "50000000"],

@@ -1,9 +1,9 @@
 {
-  "name": "unimount",
+  "name": "mountx",
   "version": "0.0.0",
   "description": "",
   "license": "MIT",
-  "repository": "pithings/unimount",
+  "repository": "pithings/mountx",
   "files": [
     "dist"
   ],

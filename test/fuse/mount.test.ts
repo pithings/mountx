@@ -173,7 +173,7 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
   const daemons: ChildProcess[] = [];
 
   async function sandbox(): Promise<string> {
-    const dir = await mkdtemp(join(tmpdir(), "unimount-"));
+    const dir = await mkdtemp(join(tmpdir(), "mountx-"));
     sandboxes.push(dir);
     return dir;
   }
@@ -209,7 +209,7 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
       }
       await rm(dir, { recursive: true, force: true });
     }
-    expect(mountedPaths().filter((path) => path.includes("unimount-"))).toEqual([]);
+    expect(mountedPaths().filter((path) => path.includes("mountx-"))).toEqual([]);
     expect(liveMounts()).toEqual([]);
   });
 
@@ -406,7 +406,7 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
       // exercised too — safe here only because `test:mount` raises
       // `UV_THREADPOOL_SIZE`, which is the whole point of that variable.
       const mounted = await openMount(createNodeFsDriver(root), {
-        fsname: "unimount-passthrough",
+        fsname: "mountx-passthrough",
         readers: 4,
       });
       await workload(mounted.path);
@@ -424,7 +424,7 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
 
   it("shows up in the mount table with the fsname and subtype it was given", async () => {
     const mounted = await openMount(createMemoryDriver(), {
-      fsname: "unimount-memory",
+      fsname: "mountx-memory",
       subtype: "memfs",
     });
     const table = readFileSync("/proc/self/mounts", "utf8")
@@ -432,7 +432,7 @@ describe.skipIf(!isRoot)("mount(driver, mountpoint)", () => {
       .find((line) => line.split(" ")[1] === mounted.path);
     expect(table).toBeDefined();
     const [source, , type] = table!.split(" ");
-    expect(source).toBe("unimount-memory");
+    expect(source).toBe("mountx-memory");
     expect(type).toBe("fuse.memfs");
     // `default_permissions` is on unless asked otherwise: the kernel enforces
     // mode bits, so drivers never make access decisions.

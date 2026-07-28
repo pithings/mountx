@@ -1,6 +1,6 @@
 Keep important information about project in AGENTS.md. For more detailed info, progressively document them in .agents/*.md and reference from this file.
 
-# unimount
+# mountx
 
 Mount a JavaScript filesystem: one driver interface (a subset of `node:fs/promises`), multiple transports (FUSE first, then NFSv3). Design source of truth: `IDEA.md`; user-facing docs: `README.md`.
 
@@ -10,14 +10,14 @@ Conventions: pure JS/TS, zero runtime deps, pure-JS-first (no native code in v1)
 
 Core (`src/`):
 
-- `types.ts` — `FsDriver` (a subset of `node:fs/promises`; `node:fs/promises` itself is assignable to it), `FsCapabilities`, the typed-only `unimount.*` extension namespace, `StatsLike`/`DirentLike`/`FileHandleLike`.
+- `types.ts` — `FsDriver` (a subset of `node:fs/promises`; `node:fs/promises` itself is assignable to it), `FsCapabilities`, the typed-only `mountx.*` extension namespace, `StatsLike`/`DirentLike`/`FileHandleLike`.
 - `errors.ts` — `ERRNO_CODES` (Linux values), `fsError()` producing errors byte-identical to `node:fs`'s, `errnoOf()` for transports.
 - `path.ts` — absolute POSIX path helpers; `..` clamps at the root.
 - `harness.ts` — `createLoopback(driver)`: normalizes paths, fills missing methods with `ENOSYS`, resolves capabilities. What driver authors test against.
 - `lock.ts` — `PathLock`, the writer lock over the path map, shared by the FUSE and NFS sessions (`RENAME` takes it; `READ`/`WRITE` run outside it).
 - `drivers/memory.ts`, `drivers/node-fs.ts` — the two v1 drivers; the passthrough resolves every path component itself so nothing escapes its root.
 
-FUSE (`src/fuse/`, exported as `unimount/fuse`):
+FUSE (`src/fuse/`, exported as `mountx/fuse`):
 
 - `constants.ts` — opcodes and `FUSE_*`/`FOPEN_*`/`FATTR_*`/`DT_*`, transcribed from the kernel's `include/uapi/linux/fuse.h` (tag v6.12, protocol 7.41).
 - `protocol.ts` — every struct encoded **and** decoded, opcode dispatch table (`OPCODES`), message framing, errno-on-the-wire helpers, dirent packing (`DirentPacker`).
@@ -28,7 +28,7 @@ FUSE (`src/fuse/`, exported as `unimount/fuse`):
 - `mount.ts` — the only file that opens a device or spawns a process: `mount(driver, mountpoint, options)` → `Mount`, plus `unmountAll()`/`liveMounts()`.
 - `record.ts` — tees `/dev/fuse` traffic (`mount({ tap })`) into a transcript; `replayTranscript()` feeds one back through a fresh session.
 
-NFS (`src/nfs/`, exported as `unimount/nfs`):
+NFS (`src/nfs/`, exported as `mountx/nfs`):
 
 - `xdr.ts` — XDR (RFC 4506): `XdrReader`/`XdrWriter`, bounds-checked, big-endian, 64-bit fields as `bigint`.
 - `rpc.ts` — ONC RPC v2 (RFC 5531): call/reply, `AUTH_NONE`/`AUTH_SYS`, TCP record marking.
@@ -45,7 +45,7 @@ Tests (`test/`):
 - `fuse/` — protocol/session Tier 0 (`random.ts`, `protocol.test.ts`, `golden.test.ts`, `dirent.test.ts`, `init.test.ts`, `session.test.ts`, `inodes.test.ts`, `session-fuzz.test.ts`, `synthetic-kernel.ts`, `fuzz.test.ts`), Tier 2 `mount.test.ts`, the differential oracle (`differential.ts`+`differential.test.ts`), record/replay (`record-fixtures.ts`+`replay.test.ts`), the FUSE conformance column (`conformance-mount.test.ts`).
 - `nfs/` — Tier 0 (`xdr.test.ts`, `protocol.test.ts`, `handles.test.ts`, `golden.test.ts`, `fuzz.test.ts`), the Tier-1 JS client (`client.ts`) and its conformance column (`conformance.test.ts`, `session.test.ts`), Tier 2 `mount.test.ts` (gated on `nfsClientProbe()`).
 - `pjdfstest/` — `run.sh`+`run.ts` drive the pinned pjdfstest clone (gitignored) against a real mount and write the committed analysis.
-- `matrix.ts` — generates `.agents/conformance-matrix.md`. `root.sh` — runs any Tier-2 vitest file under sudo with the environment fixed up (raised `UV_THREADPOOL_SIZE`, redirected `TMPDIR`, forwarded `UNIMOUNT_*`); every Tier-2 file skips itself when not root.
+- `matrix.ts` — generates `.agents/conformance-matrix.md`. `root.sh` — runs any Tier-2 vitest file under sudo with the environment fixed up (raised `UV_THREADPOOL_SIZE`, redirected `TMPDIR`, forwarded `MOUNTX_*`); every Tier-2 file skips itself when not root.
 
 `bench/` — `harness.ts` (warmup, adaptive loop, percentiles), `scenarios.ts` (written once against the driver interface), `index.ts` (loopback + NFS columns), `fuse.ts`+`fuse-client.ts` (the FUSE column, client in a child process); generates `.agents/benchmarks.md`.
 

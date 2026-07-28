@@ -119,7 +119,7 @@ const SCENARIOS: Scenario[] = [
 ];
 
 async function record(scenario: Scenario): Promise<void> {
-  const scratch = await mkdtemp(join(tmpdir(), "unimount-record-"));
+  const scratch = await mkdtemp(join(tmpdir(), "mountx-record-"));
   const mnt = join(scratch, "mnt");
   await mkdir(mnt);
   const driver = createMemoryDriver();
@@ -129,7 +129,7 @@ async function record(scenario: Scenario): Promise<void> {
   // Zero timeouts: kernel caching is right for a production mount and wrong for
   // a fixture, where the whole value is in the requests the workload makes.
   const mounted = await mount(driver, mnt, {
-    fsname: `unimount-record`,
+    fsname: `mountx-record`,
     tap: recorder.tap,
     attrTimeout: 0,
     entryTimeout: 0,

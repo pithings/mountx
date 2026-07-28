@@ -1062,7 +1062,7 @@ export function flagsOf(flags: string): number {
       return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
     }
     default: {
-      throw new Error(`unimount test client: unsupported open flags ${JSON.stringify(flags)}`);
+      throw new Error(`mountx test client: unsupported open flags ${JSON.stringify(flags)}`);
     }
   }
 }

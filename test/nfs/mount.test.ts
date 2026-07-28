@@ -70,7 +70,7 @@ describe.skipIf(!probe.usable)("a real NFS mount", () => {
   });
 
   async function mountpoint(): Promise<string> {
-    const path = await fs.mkdtemp(join(tmpdir(), "unimount-nfs-mnt-"));
+    const path = await fs.mkdtemp(join(tmpdir(), "mountx-nfs-mnt-"));
     directories.push(path);
     return path;
   }

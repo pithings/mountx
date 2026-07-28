@@ -20,7 +20,7 @@ const nodeFsPromises: FsDriver = fsPromises;
 const nodeFsPromisesIsComplete: FullFsDriver = fsPromises;
 
 async function temporaryRoot(): Promise<{ root: string; cleanup: () => Promise<void> }> {
-  const root = await mkdtemp(join(tmpdir(), "unimount-"));
+  const root = await mkdtemp(join(tmpdir(), "mountx-"));
   return { root, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
 

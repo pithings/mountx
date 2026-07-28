@@ -1,7 +1,7 @@
 /**
  * Minimal POSIX path helpers.
  *
- * unimount paths are always absolute, POSIX-style and platform independent —
+ * mountx paths are always absolute, POSIX-style and platform independent —
  * transports speak kernel paths, and a driver must never have to care what the
  * host platform's separator is. `..` is resolved lexically and clamped at the
  * root, so no normalized path can ever escape it.

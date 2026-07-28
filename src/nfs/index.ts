@@ -1,5 +1,5 @@
 /**
- * The NFSv3 loopback transport: `unimount/nfs`.
+ * The NFSv3 loopback transport: `mountx/nfs`.
  *
  * The second transport over the same `FsDriver`, and the one that needs no
  * `/dev/fuse` and no native code — just a TCP socket (IDEA.md, "NFSv3
@@ -29,7 +29,7 @@ export * from "./mount.ts";
 // (`readFattr`/`writeFattr`, `readSattr`/`writeSattr`, the `post_op_*` and
 // `wcc_data` pairs, `nfstime3`, `specdata3`). Those are the pieces the
 // procedure codecs are built from, not something a consumer composes with —
-// they are still exported from `unimount/nfs`'s own `protocol.ts` for the
+// they are still exported from `mountx/nfs`'s own `protocol.ts` for the
 // tests, they just do not belong on the package's public surface.
 export {
   FATTR3_SIZE,

@@ -991,7 +991,7 @@ export class FuseSession {
    *
    * `utimes` sets both stamps at once, so a request that names only one has to
    * read the other back first. Nanoseconds survive only if the driver has the
-   * `unimount.utimens` extension; `fs.utimes` takes float seconds and loses
+   * `mountx.utimens` extension; `fs.utimes` takes float seconds and loses
    * them (IDEA.md).
    */
   async #setTimes(path: string, body: FuseSetattrIn): Promise<void> {
@@ -1015,9 +1015,9 @@ export class FuseSession {
           ? body.mtime * 1_000_000_000n + BigInt(body.mtimensec)
           : BigInt(Math.round(current!.mtimeMs * 1e6));
 
-    const utimens = this.driver.unimount?.utimens;
+    const utimens = this.driver.mountx?.utimens;
     if (utimens !== undefined) {
-      await utimens.call(this.driver.unimount, path, atimeNs, mtimeNs);
+      await utimens.call(this.driver.mountx, path, atimeNs, mtimeNs);
       return;
     }
     const [atime, mtime] = [Number(atimeNs) / 1e9, Number(mtimeNs) / 1e9];
@@ -1068,15 +1068,15 @@ export class FuseSession {
   /**
    * `MKNOD` — which the kernel also uses for plain files when the filesystem
    * has answered `CREATE` with `-ENOSYS`, so the regular-file case is worth
-   * synthesizing from `open`. Anything else needs the `unimount.mknod`
+   * synthesizing from `open`. Anything else needs the `mountx.mknod`
    * extension.
    */
   async #mknod(request: FuseRequest): Promise<Uint8Array> {
     const body = request.body as FuseMknodIn;
     const path = this.#childOf(request.header.nodeid, body.name, "mknod");
-    const mknod = this.driver.unimount?.mknod;
+    const mknod = this.driver.mountx?.mknod;
     if (mknod !== undefined) {
-      await mknod.call(this.driver.unimount, path, body.mode, body.rdev);
+      await mknod.call(this.driver.mountx, path, body.mode, body.rdev);
     } else if ((body.mode & S_IFMT) === S_IFREG || (body.mode & S_IFMT) === 0) {
       // Flags this server *originates*, so they are the host's: the driver
       // resolves them against `node:fs`, not against the FUSE wire.

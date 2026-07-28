@@ -18,16 +18,16 @@
 # question nobody should have to think about.
 #
 # `sudo` resets the environment, so anything a suite reads from it has to be
-# carried across explicitly. Every `UNIMOUNT_*` variable is forwarded — that is
-# the namespace the suites use for knobs like `UNIMOUNT_DIFF_SEED`. (Values
+# carried across explicitly. Every `MOUNTX_*` variable is forwarded — that is
+# the namespace the suites use for knobs like `MOUNTX_DIFF_SEED`. (Values
 # containing whitespace are not supported, and none of the knobs have any.)
 set -u
 
-TMP=/tmp/unimount-vitest
+TMP=/tmp/mountx-vitest
 mkdir -p "$TMP"
 
 forward=""
-for name in $(env | sed -n 's/^\(UNIMOUNT_[A-Za-z0-9_]*\)=.*/\1/p'); do
+for name in $(env | sed -n 's/^\(MOUNTX_[A-Za-z0-9_]*\)=.*/\1/p'); do
   eval "value=\$$name"
   forward="$forward $name=$value"
 done

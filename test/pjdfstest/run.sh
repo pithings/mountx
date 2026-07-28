@@ -1,5 +1,5 @@
 #!/bin/sh
-# Clone, build and run pjdfstest against a real unimount FUSE mount.
+# Clone, build and run pjdfstest against a real mountx FUSE mount.
 #
 #   sh test/pjdfstest/run.sh            # everything
 #   sh test/pjdfstest/run.sh chmod      # one category (any path fragment)
@@ -31,7 +31,7 @@ if [ ! -x "$suite/pjdfstest" ]; then
   (cd "$suite" && autoreconf -ifs >/dev/null && ./configure >/dev/null && make pjdfstest >/dev/null)
 fi
 
-echo "pjdfstest $(git -C "$suite" rev-parse --short HEAD) against a unimount memory-driver mount"
+echo "pjdfstest $(git -C "$suite" rev-parse --short HEAD) against a mountx memory-driver mount"
 status=0
 sudo env UV_THREADPOOL_SIZE=32 "$(command -v node)" "$here/run.ts" "$@" || status=$?
 

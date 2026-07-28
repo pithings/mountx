@@ -9,11 +9,11 @@
 
 import { fsError } from "./errors.ts";
 import { normalizePath } from "./path.ts";
-import type { FsCapabilities, FsDriver, FsDriverMethod, UnimountExtensions } from "./types.ts";
+import type { FsCapabilities, FsDriver, FsDriverMethod, MountxExtensions } from "./types.ts";
 
 /** Capabilities with every member decided (declared, or inferred from the driver). */
 export type ResolvedCapabilities = Required<Omit<FsCapabilities, "extensions">> & {
-  extensions: readonly (keyof UnimountExtensions)[];
+  extensions: readonly (keyof MountxExtensions)[];
 };
 
 /** Decide what a driver supports: declarations win, presence of a method is the fallback. */
@@ -35,7 +35,7 @@ export function resolveCapabilities(driver: FsDriver): ResolvedCapabilities {
     statfs: declared.statfs ?? has("statfs"),
     readOnly: declared.readOnly ?? !(has("unlink") || has("mkdir") || has("rename")),
     extensions:
-      declared.extensions ?? (Object.keys(driver.unimount ?? {}) as (keyof UnimountExtensions)[]),
+      declared.extensions ?? (Object.keys(driver.mountx ?? {}) as (keyof MountxExtensions)[]),
   };
 }
 
@@ -43,10 +43,10 @@ export function resolveCapabilities(driver: FsDriver): ResolvedCapabilities {
  * A driver with every optional method present: missing ones throw `ENOSYS`,
  * and every path is normalized before it reaches the driver.
  */
-export interface Loopback extends Required<Omit<FsDriver, "capabilities" | "unimount">> {
+export interface Loopback extends Required<Omit<FsDriver, "capabilities" | "mountx">> {
   readonly driver: FsDriver;
   readonly capabilities: ResolvedCapabilities;
-  readonly unimount: UnimountExtensions | undefined;
+  readonly mountx: MountxExtensions | undefined;
   /** Whole-file read, for drivers and tests that do not want a handle dance. */
   readFile(path: string): Promise<Uint8Array>;
   /** Whole-file write (create + truncate). */
@@ -68,7 +68,7 @@ export function createLoopback(driver: FsDriver): Loopback {
   const loopback: Loopback = {
     driver,
     capabilities: resolveCapabilities(driver),
-    unimount: driver.unimount,
+    mountx: driver.mountx,
 
     // Every wrapper is `async` so that a missing method rejects rather than
     // throwing synchronously: callers only ever have to handle one of the two.

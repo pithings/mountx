@@ -14,7 +14,7 @@ describe("node-fs driver", () => {
   let fs: Loopback;
 
   beforeEach(async () => {
-    sandbox = await mkdtemp(join(tmpdir(), "unimount-sandbox-"));
+    sandbox = await mkdtemp(join(tmpdir(), "mountx-sandbox-"));
     root = join(sandbox, "root");
     outside = join(sandbox, "outside");
     await mkdir(root);

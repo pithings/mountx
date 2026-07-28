@@ -49,7 +49,7 @@ const isRoot = (process.getuid?.() ?? -1) === 0;
  * report, which is the honest way to say so (IDEA.md: "reports honestly which
  * capabilities each transport actually loses").
  *
- * `extensions` is empty on purpose: the `unimount.*` namespace is a
+ * `extensions` is empty on purpose: the `mountx.*` namespace is a
  * driver-to-session channel and has no wire representation, so nothing that
  * uses it can cross a mount. Nothing in the suite needs it.
  */
@@ -75,7 +75,7 @@ describe.skipIf(!isRoot)("over a real FUSE mount", () => {
   let cases = 0;
 
   beforeAll(async () => {
-    sandbox = await mkdtemp(join(tmpdir(), "unimount-conformance-"));
+    sandbox = await mkdtemp(join(tmpdir(), "mountx-conformance-"));
     for (const [name, driver] of [
       ["memory", createMemoryDriver()],
       ["node-fs", createNodeFsDriver(await freshDirectory("backing"))],
@@ -86,7 +86,7 @@ describe.skipIf(!isRoot)("over a real FUSE mount", () => {
       // conformance column that agrees with a cache proves nothing.
       mounts.push(
         await mount(driver, mountpoint, {
-          fsname: `unimount-${name}`,
+          fsname: `mountx-${name}`,
           attrTimeout: 0,
           entryTimeout: 0,
           readers: 4,

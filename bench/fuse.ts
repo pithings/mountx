@@ -189,7 +189,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const sandbox = await mkdtemp(join(tmpdir(), "unimount-bench-"));
+  const sandbox = await mkdtemp(join(tmpdir(), "mountx-bench-"));
   const results: Measurement[] = [];
   try {
     for (const [index, variant] of VARIANTS.entries()) {
@@ -203,7 +203,7 @@ async function main(): Promise<void> {
         await populateCold(createLoopback(driver));
       }
       const mounted = await mount(driver, mountpoint, {
-        fsname: "unimount-bench",
+        fsname: "mountx-bench",
         ...variant.options,
       });
       const negotiated = mounted.session.negotiated;

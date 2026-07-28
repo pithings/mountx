@@ -1,5 +1,5 @@
 /**
- * The unimount driver interface.
+ * The mountx driver interface.
  *
  * `FsDriver` is deliberately **a subset of `node:fs/promises`**, not a bespoke
  * interface: `node:fs/promises` itself is assignable to `FsDriver`, and so is
@@ -135,8 +135,8 @@ export interface FsCapabilities {
   statfs?: boolean;
   /** Every mutating operation answers `EROFS`. */
   readOnly?: boolean;
-  /** Optional `unimount.*` extensions the driver implements. */
-  extensions?: readonly (keyof UnimountExtensions)[];
+  /** Optional `mountx.*` extensions the driver implements. */
+  extensions?: readonly (keyof MountxExtensions)[];
 }
 
 /**
@@ -148,7 +148,7 @@ export interface FsCapabilities {
  * notifies are per-open-file or session-scoped, so they get designed with the
  * session layer rather than guessed at here.
  */
-export interface UnimountExtensions {
+export interface MountxExtensions {
   /** Nanosecond timestamps; `fs.utimes` takes float seconds and loses them. */
   utimens?(
     path: string,
@@ -180,7 +180,7 @@ export interface FsDriver {
   /** What this driver supports. Omitted members are inferred. */
   readonly capabilities?: FsCapabilities;
   /** Optional non-`node:fs` extensions. */
-  readonly unimount?: UnimountExtensions;
+  readonly mountx?: MountxExtensions;
 
   // --- core ---
   stat(path: string): Promise<StatsLike>;
@@ -209,8 +209,8 @@ export interface FsDriver {
  * A driver that implements every method (both bundled drivers do, and so does
  * `node:fs/promises`). Declaring capabilities stays optional.
  */
-export type FullFsDriver = Required<Omit<FsDriver, "capabilities" | "unimount">> &
-  Pick<FsDriver, "capabilities" | "unimount">;
+export type FullFsDriver = Required<Omit<FsDriver, "capabilities" | "mountx">> &
+  Pick<FsDriver, "capabilities" | "mountx">;
 
 /** Names of the optional `FsDriver` methods. */
 export type FsDriverMethod = keyof {

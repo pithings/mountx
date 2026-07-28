@@ -6,7 +6,7 @@
  * that spawns a process.
  *
  * ```ts
- * import { mountNfs } from "unimount/nfs";
+ * import { mountNfs } from "mountx/nfs";
  * await using mounted = await mountNfs(createMemoryDriver(), "/mnt/point");
  * ```
  *
@@ -161,7 +161,7 @@ let signalsInstalled = false;
 async function onTeardownSignal(signal: NodeJS.Signals): Promise<void> {
   removeSignalHandlers();
   for (const failure of await unmountAllNfs()) {
-    console.error(`unimount: NFS unmount on ${signal} failed: ${errorMessage(failure)}`);
+    console.error(`mountx: NFS unmount on ${signal} failed: ${errorMessage(failure)}`);
   }
   if (process.listenerCount(signal) === 0) {
     process.kill(process.pid, signal);
@@ -219,28 +219,28 @@ export async function mountNfs(
 ): Promise<NfsMount> {
   const probe = nfsClientProbe();
   if (!probe.usable) {
-    throw new Error(`unimount: cannot mount NFS here — ${probe.reason}`);
+    throw new Error(`mountx: cannot mount NFS here — ${probe.reason}`);
   }
   const target = resolveNative(mountpoint);
   const targetStat = await statPath(target).catch((error: unknown) => {
-    throw new Error(`unimount: mountpoint ${target} is not usable: ${errorMessage(error)}`);
+    throw new Error(`mountx: mountpoint ${target} is not usable: ${errorMessage(error)}`);
   });
   if (!targetStat.isDirectory()) {
-    throw new Error(`unimount: mountpoint ${target} is not a directory`);
+    throw new Error(`mountx: mountpoint ${target} is not a directory`);
   }
   // Same trap as the FUSE transport: Linux stacks mounts, and then `umount`
   // detaches the *top* one.
   for (const existing of live) {
     if (existing.mountpoint === target) {
       throw new Error(
-        `unimount: ${target} is already mounted by this process. Unmount it before mounting again.`,
+        `mountx: ${target} is already mounted by this process. Unmount it before mounting again.`,
       );
     }
   }
   const occupant = mountEntryAt(target);
   if (occupant !== undefined) {
     throw new Error(
-      `unimount: ${target} already has a filesystem on it (${occupant.source}, type ` +
+      `mountx: ${target} already has a filesystem on it (${occupant.source}, type ` +
         `${occupant.type}). Clear it first: umount ${target}`,
     );
   }
@@ -350,7 +350,7 @@ class NfsMountImpl implements NfsMount {
     const exported = options.exportPath ?? "/";
     if (/[\s,]/.test(exported)) {
       throw new Error(
-        `unimount: \`exportPath\` may not contain whitespace or a comma — it is the source ` +
+        `mountx: \`exportPath\` may not contain whitespace or a comma — it is the source ` +
           `argument of mount(8) (got ${JSON.stringify(exported)})`,
       );
     }
@@ -374,11 +374,11 @@ class NfsMountImpl implements NfsMount {
       // `addr=` the kernel needs and negotiates the version.
       result = await run("mount", ["-t", "nfs", "-o", options, this.source, this.mountpoint]);
     } catch (error) {
-      throw new Error(`unimount: could not run mount(8): ${errorMessage(error)}`);
+      throw new Error(`mountx: could not run mount(8): ${errorMessage(error)}`);
     }
     if (result.status !== 0) {
       throw new Error(
-        `unimount: mounting ${this.mountpoint} failed — ` +
+        `mountx: mounting ${this.mountpoint} failed — ` +
           `${describe(`mount -t nfs -o ${options}`, result)}`,
       );
     }
@@ -481,14 +481,14 @@ class NfsMountImpl implements NfsMount {
     try {
       result = await run("umount", [this.mountpoint]);
     } catch (error) {
-      throw new Error(`unimount: could not run umount(8): ${errorMessage(error)}`);
+      throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
     }
     // A failure that raced an external unmount is not a failure.
     if (result.status === 0 || !isMounted(this.mountpoint)) {
       return;
     }
     throw new Error(
-      `unimount: could not unmount ${this.mountpoint} (${describe("umount", result)}). ` +
+      `mountx: could not unmount ${this.mountpoint} (${describe("umount", result)}). ` +
         `The mount is still live. If a process is holding it, \`fuser -m ${this.mountpoint}\` ` +
         `will say which; \`sudo umount -l ${this.mountpoint}\` detaches it regardless.`,
     );
@@ -503,7 +503,7 @@ class NfsMountImpl implements NfsMount {
    */
   async #force(timeout: number): Promise<void> {
     const error = new Error(
-      `unimount: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
+      `mountx: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
         `driver has probably stopped answering. The mount has been forced down, so anything ` +
         `in flight was lost. If the mountpoint is somehow still listed: ` +
         `sudo umount -l ${this.mountpoint}`,

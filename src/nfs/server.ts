@@ -6,8 +6,8 @@
  * kernel and no root. This is the only part that opens a socket.
  *
  * ```ts
- * import { createNfsServer } from "unimount/nfs";
- * import { createMemoryDriver } from "unimount/drivers/memory";
+ * import { createNfsServer } from "mountx/nfs";
+ * import { createMemoryDriver } from "mountx/drivers/memory";
  *
  * await using server = await createNfsServer(createMemoryDriver()).listen();
  * // sudo mount -t nfs -o vers=3,tcp,port=<p>,mountport=<p>,nolock 127.0.0.1:/ /mnt
@@ -170,7 +170,7 @@ class NfsServerImpl implements NfsServer {
     if (this.#options.allowRemote !== true && !isLoopback(peer)) {
       this.#report(
         new Error(
-          `unimount: refused an NFS connection from ${peer ?? "an unknown address"} — ` +
+          `mountx: refused an NFS connection from ${peer ?? "an unknown address"} — ` +
             `this server is loopback-only. Pass \`allowRemote: true\` if something in front ` +
             `of it is doing the access control.`,
         ),

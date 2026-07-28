@@ -25,7 +25,7 @@ export const FUSE_MIN_READ_BUFFER = 8192;
 
 /**
  * Page size the `max_pages` negotiation is denominated in. The kernel uses its
- * own `PAGE_SIZE`; 4 KiB on every architecture unimount targets.
+ * own `PAGE_SIZE`; 4 KiB on every architecture mountx targets.
  */
 export const FUSE_PAGE_SIZE = 4096;
 
@@ -257,7 +257,7 @@ export const DT_SOCK = 12;
  * host's values, and they disagree: macOS's `O_TRUNC` is `0o2000`, which is
  * Linux's `O_APPEND`, so a Tier-0 test run on macOS would read an append-open
  * as a truncating one. The converse also holds — flags this server *originates*
- * for a driver (`unimount.mknod`'s fallback, say) must use `node:fs`'s
+ * for a driver (`mountx.mknod`'s fallback, say) must use `node:fs`'s
  * constants, because the driver resolves them against the host.
  *
  * Only the bits the session actually inspects are listed.
