@@ -1,21 +1,24 @@
 /**
- * SPIKE C — `execSeccomp()`: run a command whose filesystem syscalls are
- * answered by an `FsDriver`, with no kernel mount and no libc involvement.
+ * `execSeccomp()` — run a command whose filesystem syscalls are answered by an
+ * `FsDriver`, with no kernel mount and no libc involvement.
  *
- * The parent side is identical to spike B's — `createP9Server()` on a private
- * unix socket — which is the point worth noticing: two completely different
- * interception mechanisms are two different *clients* of one unchanged server.
- * Everything that decides what the filesystem does still lives in
- * `src/9p/session.ts`.
+ * The parent side is `createP9Server()` on a private unix socket, which is the
+ * point worth noticing: the supervisor is a *client* of the same unchanged
+ * server `mount9p()` points the kernel's v9fs client at. Everything that
+ * decides what the filesystem does still lives in `src/9p/session.ts`, and this
+ * side is a socket and a process.
  *
- * What differs is the boundary. Spike B interposes glibc symbols and therefore
- * serves only what dynamically links glibc. This traps syscalls, so it serves
- * a static binary, a Go binary and a `cat` identically — nothing about the
- * traced program's linkage is visible to a seccomp filter.
+ * What makes the mechanism worth having is where the boundary sits. An
+ * `LD_PRELOAD` interposer sees glibc's exported symbols and therefore serves
+ * only what dynamically links glibc; a seccomp filter sees the syscall ABI, so
+ * a static musl binary, a Go binary and `cat` are indistinguishable to it.
+ * `src/exec/seccomp/trace.zig` is the supervisor, and its header is where the
+ * mechanism, and every gap it still has, is written down.
  *
- * Needs no privileges (`no_new_privs` is enough for an unprivileged filter) and
- * no namespace. Linux only, and x86-64 only as spiked, since the filter
- * compares against a specific syscall table.
+ * Needs no privileges — `no_new_privs` is all an unprivileged filter requires —
+ * and no namespace, no device node and no filesystem driver. Linux only, and
+ * x86-64 only, since the filter compares against one syscall table and refuses
+ * to interpret any other.
  */
 
 import { type ChildProcess, spawn, type StdioOptions } from "node:child_process";
