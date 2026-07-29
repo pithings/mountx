@@ -487,14 +487,29 @@ class Slot {
 export interface SlotTicket {
   readonly slotid: number;
   readonly sequenceid: number;
+  /**
+   * The session's negotiated `ca_maxresponsesize_cached` (§18.36.3).
+   *
+   * Published because the caller has to know it *before* it finishes the
+   * reply: §2.10.6.4 makes an over-sized reply the client asked to have cached
+   * an error rather than a silent omission — "If the reply exceeds
+   * ca_maxresponsesize_cached (and sa_cachethis ... is TRUE), then the server
+   * MUST return NFS4ERR_REP_TOO_BIG_TO_CACHE" — and the reply that carries that
+   * status is a *different*, shorter reply, which only the encoder can build.
+   */
+  readonly maxCachedBytes: number;
 }
 
 class Ticket implements SlotTicket {
+  readonly maxCachedBytes: number;
+
   constructor(
     readonly slot: Slot,
     readonly slotid: number,
     readonly sequenceid: number,
-  ) {}
+  ) {
+    this.maxCachedBytes = slot.maxCachedBytes;
+  }
 }
 
 interface SessionRecord {
@@ -705,6 +720,19 @@ export interface StateidResult {
   fileKey?: string | undefined;
   /** The stateid with its current seqid, for an operation that echoes one back. */
   stateid?: Stateid4 | undefined;
+  /**
+   * The open state the access above belongs to: this stateid itself when it is
+   * an open, and the open a lock stateid was derived from when it is a lock
+   * (§9.1.1, §9.1.2's "for stateids returned by byte-range LOCK operations, the
+   * appropriate mode is the access mode for the OPEN stateid associated with
+   * the lock set represented by the stateid").
+   *
+   * Named rather than merely accounted for because a caller that keeps
+   * per-open resources — a session holding one file handle per open — has to be
+   * able to get from a lock stateid to the open without a second lookup it has
+   * no key for.
+   */
+  openStateid?: Stateid4 | undefined;
 }
 
 export interface LockRequest {
@@ -774,6 +802,21 @@ export interface Nfs4StateOptions {
   maxLocksPerFile?: number | undefined;
   /** Enforce §18.51.3's "RECLAIM_COMPLETE before the first lock". Default `true`. */
   requireReclaimComplete?: boolean | undefined;
+  /**
+   * An open stateid has stopped existing, whatever ended it.
+   *
+   * Called with the state's own `other` bytes — the caller must copy them if it
+   * keeps them — from every path that drops an open: CLOSE, the lease-expiry
+   * revocation of §8.4.3, {@link Nfs4State.sweep}, DESTROY_CLIENTID, and the
+   * EXCHANGE_ID that replaces an unconfirmed record. It exists because a
+   * session holds one driver file handle per open state and there is otherwise
+   * no event for "this open went away without a CLOSE"; this table stays
+   * driver-free and hands the fact out instead of acting on it.
+   *
+   * Synchronous, like everything here, and must not throw: it is called in the
+   * middle of a table walk. A caller with asynchronous work to do queues it.
+   */
+  onOpenReleased?: ((other: Uint8Array) => void) | undefined;
 }
 
 const DEFAULT_LEASE_SECONDS = 90;
@@ -870,6 +913,7 @@ export class Nfs4State {
   readonly #maxOpensPerFile: number;
   readonly #maxLocksPerFile: number;
   readonly #requireReclaimComplete: boolean;
+  readonly #onOpenReleased: ((other: Uint8Array) => void) | undefined;
 
   /** `co_ownerid` → the confirmed and unconfirmed records that ownerid has (§18.35.4 case 5). */
   readonly #byOwner = new Map<string, { confirmed?: ClientRecord; unconfirmed?: ClientRecord }>();
@@ -897,6 +941,7 @@ export class Nfs4State {
     this.#maxOpensPerFile = Math.max(1, options.maxOpensPerFile ?? 256);
     this.#maxLocksPerFile = Math.max(1, options.maxLocksPerFile ?? 1024);
     this.#requireReclaimComplete = options.requireReclaimComplete ?? true;
+    this.#onOpenReleased = options.onOpenReleased;
   }
 
   /** The lease length, in seconds — the `lease_time` attribute the session reports. */
@@ -1325,8 +1370,13 @@ export class Nfs4State {
    *
    * Throws a `TypeError` for a ticket this table did not issue: that is a
    * programmer error, not a protocol outcome.
+   *
+   * Answers whether the bytes were stored, so a caller that owes the client
+   * `NFS4ERR_REP_TOO_BIG_TO_CACHE` (§2.10.6.4) can tell "too big" from "not
+   * asked for" without measuring the reply against
+   * {@link SlotTicket.maxCachedBytes} a second time.
    */
-  cacheReply(ticket: SlotTicket, bytes?: Uint8Array | undefined): void {
+  cacheReply(ticket: SlotTicket, bytes?: Uint8Array | undefined): boolean {
     if (!(ticket instanceof Ticket)) {
       throw new TypeError("cacheReply: ticket did not come from Nfs4State.sequence()");
     }
@@ -1335,10 +1385,11 @@ export class Nfs4State {
       // The slot has moved on, so this reply belongs to a request the client
       // has already had an answer for. Caching it would answer the *next*
       // retransmission with the previous request's bytes.
-      return;
+      return false;
     }
-    slot.bytes =
-      bytes === undefined || bytes.byteLength > slot.maxCachedBytes ? undefined : copyOf(bytes);
+    const stored = bytes !== undefined && bytes.byteLength <= slot.maxCachedBytes;
+    slot.bytes = stored ? copyOf(bytes) : undefined;
+    return stored;
   }
 
   // -------------------------------------------------------------------------
@@ -1555,6 +1606,8 @@ export class Nfs4State {
       deny: open?.deny ?? 0,
       fileKey: state.fileKey,
       stateid: { seqid: state.seqid, other: copyOf(state.other) },
+      openStateid:
+        open === undefined ? undefined : { seqid: open.seqid, other: copyOf(open.other) },
     };
   }
 
@@ -1892,6 +1945,7 @@ export class Nfs4State {
       client.revoked.add(open.key);
     }
     this.#forgetFileIfEmpty(open.fileKey);
+    this.#onOpenReleased?.(open.other);
   }
 
   // -------------------------------------------------------------------------

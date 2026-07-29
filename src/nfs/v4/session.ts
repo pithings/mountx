@@ -21,18 +21,31 @@
  *   sets `atomic: FALSE`, because it samples the two with separate driver
  *   calls and saying otherwise would be a claim it cannot keep (§3.3.8).
  *
- * ## What this step implements
+ * ## Open state, and who owns the driver's file handles
  *
- * Everything in the namespace: the filehandle cursor, LOOKUP/LOOKUPP, GETATTR,
- * SETATTR, ACCESS, READLINK, READDIR, CREATE, REMOVE, RENAME, LINK, COMMIT,
- * VERIFY/NVERIFY, SECINFO/SECINFO_NO_NAME, and the session and client-ID
- * operations that `./state.ts` answers.
+ * `./state.ts` decides what the protocol permits and holds no file: it knows an
+ * open by an opaque `fileKey`, which here is the identity `../handles.ts`
+ * assigned the object. What an open *is* on the driver side — one
+ * `FileHandleLike`, opened with the union of the access bits the open state
+ * carries — is this file's, and the two are kept in step from one direction
+ * only: a driver handle exists exactly while the open state that named it does.
+ * CLOSE is the ordinary end of one; the others (lease expiry, DESTROY_CLIENTID,
+ * a swept client) never reach an operation handler at all, so
+ * `Nfs4StateOptions.onOpenReleased` hands them over and
+ * {@link Nfs4Session.destroy} sweeps whatever is still open when the server
+ * stops. I/O carrying an anonymous or bypass stateid names no open state and so
+ * opens and closes its own handle per request, which is what `../v3/session.ts`
+ * does for every request it answers.
  *
- * **OPEN, OPEN_DOWNGRADE, CLOSE, READ, WRITE, LOCK, LOCKT and LOCKU answer
- * `NFS4ERR_NOTSUPP`** and halt the compound. Their codecs exist — their
- * arguments are decoded in full, so the operations after them stay reachable in
- * principle — and only the handlers are pending; they arrive with the open and
- * lock state wiring. Every such site says so.
+ * ## The current stateid
+ *
+ * A COMPOUND's cursor carries a stateid beside the two filehandles
+ * (§16.2.3.1.2). An operation that returns one sets it, an operation that sets
+ * the current filehandle without returning one clears it to the all-zeros
+ * value, SAVEFH and RESTOREFH move both halves together, and the special
+ * stateid `(seqid 1, other 0)` in an argument means "whatever that is now".
+ * `./state.ts` classifies the special values and leaves this substitution to
+ * this file, because it is the COMPOUND that knows the answer.
  *
  * ## Errno discipline, amended for COMPOUND
  *
@@ -54,12 +67,13 @@
  * has to be wrappable in a fresh one.
  */
 
+import { constants } from "node:fs";
 import { ERRNO_CODES, fsError } from "../../errors.ts";
 import { createLoopback, type Loopback } from "../../harness.ts";
 import { PathLock } from "../../lock.ts";
 import { dirname, joinPath } from "../../path.ts";
-import type { FsDriver, StatsLike, TimeLike } from "../../types.ts";
-import { S_IFDIR, S_IFMT } from "../../types.ts";
+import type { FileHandleLike, FsDriver, StatsLike, TimeLike } from "../../types.ts";
+import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../types.ts";
 import {
   cookieVerifier,
   DirectorySnapshots,
@@ -93,6 +107,7 @@ import {
   modeBitsOfFtype,
   NAME_MAX,
   newSessionStats,
+  type Nfs4IdMap,
   type NfsRequestContext,
   type NfsSessionOptions,
   type NfsSessionStats,
@@ -112,6 +127,7 @@ import {
   fattr4FsOf,
   fattr4Of,
   fromTime4,
+  numericOwner,
   parseNumericOwner,
   SET_ONLY_ATTRS,
   SETTABLE_ATTRS,
@@ -129,6 +145,15 @@ import {
   CDFC4_FORE,
   CDFC4_FORE_OR_BOTH,
   CDFS4_FORE,
+  CLAIM_DELEG_CUR_FH,
+  CLAIM_DELEG_PREV_FH,
+  CLAIM_DELEGATE_CUR,
+  CLAIM_DELEGATE_PREV,
+  CLAIM_FH,
+  CLAIM_NULL,
+  CLAIM_PREVIOUS,
+  EXCLUSIVE4,
+  EXCLUSIVE4_1,
   FATTR4_FILES_AVAIL,
   FATTR4_FILES_FREE,
   FATTR4_FILES_TOTAL,
@@ -143,6 +168,8 @@ import {
   FATTR4_TIME_ACCESS_SET,
   FATTR4_TIME_MODIFY_SET,
   FH4_PERSISTENT,
+  FILE_SYNC4,
+  GUARDED4,
   NF4ATTRDIR,
   NF4BLK,
   NF4CHR,
@@ -154,16 +181,20 @@ import {
   NF4SOCK,
   NFS4_MINOR_VERSION_1,
   NFS4_OK,
+  NFS4_OTHER_SIZE,
   NFS4_PROGRAM,
   NFS4_VERIFIER_SIZE,
   NFS4ERR_ATTRNOTSUPP,
   NFS4ERR_BAD_COOKIE,
+  NFS4ERR_BAD_STATEID,
   NFS4ERR_BADNAME,
   NFS4ERR_BADOWNER,
   NFS4ERR_BADSESSION,
   NFS4ERR_BADTYPE,
   NFS4ERR_BADXDR,
+  NFS4ERR_EXIST,
   NFS4ERR_INVAL,
+  NFS4ERR_ISDIR,
   NFS4ERR_MINOR_VERS_MISMATCH,
   NFS4ERR_NOENT,
   NFS4ERR_NOFILEHANDLE,
@@ -173,11 +204,15 @@ import {
   NFS4ERR_NOTSUPP,
   NFS4ERR_OP_ILLEGAL,
   NFS4ERR_OP_NOT_IN_SESSION,
+  NFS4ERR_OPENMODE,
+  NFS4ERR_REP_TOO_BIG_TO_CACHE,
   NFS4ERR_SAME,
   NFS4ERR_SEQUENCE_POS,
   NFS4ERR_SERVERFAULT,
+  NFS4ERR_SYMLINK,
   NFS4ERR_TOO_MANY_OPS,
   NFS4ERR_TOOSMALL,
+  NFS4ERR_WRONG_TYPE,
   NFS_V4,
   NFSPROC4_COMPOUND,
   NFSPROC4_NULL,
@@ -225,12 +260,26 @@ import {
   OP_TEST_STATEID,
   OP_VERIFY,
   OP_WRITE,
+  OPEN_DELEGATE_NONE,
+  OPEN_DELEGATE_NONE_EXT,
+  OPEN4_CREATE,
+  OPEN4_RESULT_LOCKTYPE_POSIX,
+  OPEN4_SHARE_ACCESS_READ,
+  OPEN4_SHARE_ACCESS_WANT_CANCEL,
+  OPEN4_SHARE_ACCESS_WANT_DELEG_MASK,
+  OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
+  OPEN4_SHARE_ACCESS_WANT_PUSH_DELEG_WHEN_UNCONTENDED,
+  OPEN4_SHARE_ACCESS_WANT_SIGNAL_DELEG_WHEN_RESRC_AVAIL,
+  OPEN4_SHARE_ACCESS_WRITE,
   opName4,
   SECINFO_STYLE4_CURRENT_FH,
   SECINFO_STYLE4_PARENT,
   SET_TO_CLIENT_TIME4,
   SET_TO_SERVER_TIME4,
   SP4_NONE,
+  WND4_CANCELLED,
+  WND4_NOT_WANTED,
+  WND4_RESOURCE,
 } from "./constants.ts";
 import {
   type Access4args,
@@ -240,6 +289,8 @@ import {
   type BindConnToSession4args,
   type BindConnToSession4res,
   type ChangeInfo4,
+  type Close4args,
+  type Close4res,
   type Commit4res,
   type Compound4res,
   type Create4args,
@@ -258,11 +309,24 @@ import {
   type Getfh4res,
   type Link4args,
   type Link4res,
+  type Lock4args,
+  type Lock4res,
+  type Lockt4args,
+  type Lockt4res,
+  type Locku4args,
+  type Locku4res,
   type Lookup4args,
   NFS4_MAX_COMPOUND_OPS,
   NFS4_MAX_TAG,
   OP_CODECS,
+  type Open4args,
+  type Open4res,
+  type OpenDelegation4,
+  type OpenDowngrade4args,
+  type OpenDowngrade4res,
   type Putfh4args,
+  type Read4args,
+  type Read4res,
   type Readdir4args,
   type Readdir4res,
   type Readlink4res,
@@ -279,12 +343,15 @@ import {
   type Sequence4args,
   type Setattr4args,
   type Setattr4res,
+  type Stateid4,
   type Status4res,
   type TestStateid4args,
   type TestStateid4res,
   type Verify4args,
+  type Write4args,
+  type Write4res,
 } from "./protocol.ts";
-import { Nfs4State } from "./state.ts";
+import { type LockRequest, Nfs4State, type SlotTicket, specialStateid } from "./state.ts";
 
 /** Largest `READ` this server will answer, and the `maxread` attribute. */
 export const DEFAULT_MAXREAD = 1024 * 1024;
@@ -366,22 +433,78 @@ const SESSIONLESS_OPS: ReadonlySet<number> = new Set([
 ]);
 
 /**
- * The eight operations whose handlers arrive with the open and lock state.
+ * Every `OPEN4_SHARE_ACCESS_WANT_*` bit a `share_access` may carry.
  *
- * Their codecs are complete, so their arguments *are* decoded and the compound
- * could go on; they answer `NFS4ERR_NOTSUPP` and halt, which is the same shape
- * a client sees for an optional operation this server does not implement.
+ * The five mutually exclusive delegation wishes named by
+ * `OPEN4_SHARE_ACCESS_WANT_DELEG_MASK`, plus the two standalone flags
+ * §18.16.3 lists beside them, which live outside it. Same set `./state.ts`
+ * masks off before reading the access mode, for the same reason.
  */
-const PENDING_STATE_OPS: ReadonlySet<number> = new Set([
-  OP_CLOSE,
-  OP_LOCK,
-  OP_LOCKT,
-  OP_LOCKU,
-  OP_OPEN,
-  OP_OPEN_DOWNGRADE,
-  OP_READ,
-  OP_WRITE,
-]);
+const SHARE_ACCESS_WANT_MASK =
+  OPEN4_SHARE_ACCESS_WANT_DELEG_MASK |
+  OPEN4_SHARE_ACCESS_WANT_PUSH_DELEG_WHEN_UNCONTENDED |
+  OPEN4_SHARE_ACCESS_WANT_SIGNAL_DELEG_WHEN_RESRC_AVAIL;
+
+/**
+ * The all-zero stateid: "no current stateid", and the anonymous stateid a
+ * client may send (RFC 8881 §8.2.3).
+ *
+ * A fresh object each time, because a `Cursor` hands it out and a caller could
+ * otherwise be handed something another compound is holding.
+ */
+function zeroStateid(): Stateid4 {
+  return { seqid: 0, other: new Uint8Array(NFS4_OTHER_SIZE) };
+}
+
+/**
+ * The `open_delegation4` for an OPEN this server will not delegate — which is
+ * every OPEN (RFC 8881 §18.16.3).
+ *
+ * Two shapes, and which one is owed depends on what the client asked for. "If
+ * the server supports the new _WANT_ flags and the client sends one or more of
+ * the new flags, then in the event the server does not return a delegation, it
+ * MUST return a delegation type of OPEN_DELEGATE_NONE_EXT" with an `ond_why`;
+ * a client that set none of them is answered with the plain
+ * `OPEN_DELEGATE_NONE`, which is four bytes and no body.
+ *
+ * "One or more of the new flags" is read as *any* of the seven, including the
+ * two standalone ones that sit outside `OPEN4_SHARE_ACCESS_WANT_DELEG_MASK` —
+ * a client that sent one of those and got a bare `OPEN_DELEGATE_NONE` would
+ * have to guess.
+ *
+ * The three reasons this server can honestly give are the three the client's
+ * own request selects:
+ *
+ * - `OPEN4_SHARE_ACCESS_WANT_NO_DELEG` → `WND4_NOT_WANTED`, which §18.16.3
+ *   defines as exactly that: "The client specified
+ *   OPEN4_SHARE_ACCESS_WANT_NO_DELEG."
+ * - `OPEN4_SHARE_ACCESS_WANT_CANCEL` → `WND4_CANCELLED`, "the client specified
+ *   OPEN4_SHARE_ACCESS_WANT_CANCEL and now any 'want' for this file object is
+ *   cancelled" — true here in the vacuous way, since this server registers no
+ *   wants to cancel.
+ * - a wish for a read, write or any delegation → `WND4_RESOURCE`, "resource
+ *   limitations prevent the server from granting a delegation", with
+ *   `ond_server_will_signal_avail` FALSE because a TRUE there is a promise to
+ *   send `CB_RECALLABLE_OBJ_AVAIL` later and there is no back channel to send
+ *   it on.
+ */
+function noDelegation(shareAccess: number): OpenDelegation4 {
+  if ((shareAccess & SHARE_ACCESS_WANT_MASK) === 0) {
+    return { delegationType: OPEN_DELEGATE_NONE };
+  }
+  const want = shareAccess & OPEN4_SHARE_ACCESS_WANT_DELEG_MASK;
+  const why =
+    want === OPEN4_SHARE_ACCESS_WANT_NO_DELEG
+      ? WND4_NOT_WANTED
+      : want === OPEN4_SHARE_ACCESS_WANT_CANCEL
+        ? WND4_CANCELLED
+        : WND4_RESOURCE;
+  return {
+    delegationType: OPEN_DELEGATE_NONE_EXT,
+    // Written only on the `WND4_RESOURCE` arm; the others are void.
+    whynone: { why, serverWillSignalAvail: false },
+  };
+}
 
 /** An `nfsstat4` carried out of a handler. */
 class Nfs4StatusError extends Error {
@@ -469,6 +592,79 @@ function encodeCompoundRes(res: Compound4res): Uint8Array {
   return writer.bytes();
 }
 
+/** One `nfs_resop4` as bytes, so a reply can be measured before it is built. */
+function resopSize(resop: Resop4): number {
+  const writer = new XdrWriter(64);
+  writer.u32(resop.op);
+  const codec = OP_CODECS.get(resop.op);
+  if (codec === undefined) {
+    writer.u32((resop.res as Status4res).status);
+  } else {
+    codec.writeRes(writer, resop.res);
+  }
+  return writer.length;
+}
+
+/**
+ * The `resarray` for a reply too big to cache, or `undefined` when there is no
+ * such reply to build (RFC 8881 §2.10.6.4).
+ *
+ * The result at the chosen index is replaced by the bare
+ * `NFS4ERR_REP_TOO_BIG_TO_CACHE` status and the ones after it are dropped,
+ * which is the reply §2.10.6.4 describes ("the server may return
+ * NFS4ERR_REP_TOO_BIG_TO_CACHE on the tenth operation ... the server will have
+ * cached a reply that contains results for ten of the eleven requested
+ * operations").
+ *
+ * The index is the first result that overruns `cap` — but only if the *rebuilt*
+ * reply then fits, which is not the same test: the replacement is itself four
+ * or twelve bytes (SETATTR's `attrsset` is on every arm), so a prefix that ends
+ * within a few bytes of the cap has to give up a result that did fit. Failing
+ * to check that is how the status meant to make the reply cacheable produces
+ * one that is still too big, and the MUST in the same paragraph — "then the
+ * reply MUST be cached if sa_cachethis or csa_cachethis is TRUE" — is missed by
+ * a handful of bytes. Dropping further back is sound because the reply carrying
+ * this status *is* cached: a retransmission gets these same bytes rather than
+ * re-running the operations whose results went.
+ *
+ * `undefined` when no index works — the leading SEQUENCE plus one status word
+ * already exceeds `cap`. The status cannot go on the SEQUENCE itself
+ * (§2.10.6.1.2: "The replier MUST NOT modify the reply cache entry for the slot
+ * whenever an error is returned from SEQUENCE"), so there is nowhere to put it;
+ * the whole reply goes out uncached and the retry answers
+ * `NFS4ERR_RETRY_UNCACHED_REP`.
+ */
+function trimForCache(tag: string, resarray: readonly Resop4[], cap: number): Resop4[] | undefined {
+  // `COMPOUND4res` overhead: the status, the counted tag, and the result count.
+  const base = 4 + 4 + xdrAlign(stringByteLength(tag)) + 4;
+  // `before[index]` is the size of everything preceding that result.
+  const before: number[] = [];
+  let used = base;
+  for (const resop of resarray) {
+    before.push(used);
+    used += resopSize(resop);
+  }
+  let over = -1;
+  for (let index = 0; index < resarray.length; index++) {
+    if (before[index]! + resopSize(resarray[index]!) > cap) {
+      over = index;
+      break;
+    }
+  }
+  /* v8 ignore next 3 -- unreachable: the caller measured the same encoding and
+     found it over the cap, so some result must cross it here too. */
+  if (over < 0) {
+    return undefined;
+  }
+  for (let index = over; index >= 1; index--) {
+    const replacement = statusResop(resarray[index]!.op, NFS4ERR_REP_TOO_BIG_TO_CACHE);
+    if (before[index]! + resopSize(replacement) <= cap) {
+      return [...resarray.slice(0, index), replacement];
+    }
+  }
+  return undefined;
+}
+
 /** Are two byte strings the same bytes? */
 function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   if (left.byteLength !== right.byteLength) {
@@ -482,13 +678,29 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
-/** A `sessionid4` as a Map key. */
-function sessionKey(sessionid: Uint8Array): string {
+/** An opaque as a Map key: lowercase hex, the same shape `./state.ts` uses. */
+function hexOf(bytes: Uint8Array): string {
   let key = "";
-  for (const byte of sessionid) {
+  for (const byte of bytes) {
     key += byte.toString(16).padStart(2, "0");
   }
   return key;
+}
+
+/** A `sessionid4` as a Map key. */
+function sessionKey(sessionid: Uint8Array): string {
+  return hexOf(sessionid);
+}
+
+/**
+ * A stateid's `other` as a Map key.
+ *
+ * The one string this file and `./state.ts` have to agree on, and they agree by
+ * both hexing the same twelve bytes rather than by passing a key across: the
+ * `onOpenReleased` hook hands over `other` itself.
+ */
+function stateKey(other: Uint8Array): string {
+  return hexOf(other);
 }
 
 /** {@link allowedAccess}'s answer as `ACCESS4_*` bits (RFC 8881 §18.1.1). */
@@ -532,11 +744,30 @@ interface DecodedCompound {
   halt: DecodeHalt | undefined;
 }
 
+/**
+ * One driver file handle, held open for as long as the open state that named
+ * it (RFC 8881 §9.1.1).
+ *
+ * `flags` is what it was opened with — the host's `O_*`, not the wire's: this
+ * server *originates* them from `share_access`, so there is no namespace
+ * crossing here and nothing to translate.
+ */
+interface OpenHandle {
+  handle: FileHandleLike;
+  /** Host `open(2)` flags. Widened by re-opening when an OPEN upgrades the access. */
+  flags: number;
+  /** The path it was opened on, for the re-open an upgrade needs. */
+  path: string;
+}
+
 /** The cursor a COMPOUND is executed against (RFC 8881 §16.2.3.1.1), plus its context. */
 interface Cursor {
   /** The current filehandle, as wire bytes. `undefined` is `NFS4ERR_NOFILEHANDLE`. */
   currentFh: Uint8Array | undefined;
   savedFh: Uint8Array | undefined;
+  /** The current stateid (§16.2.3.1.2). All-zeros until an operation sets one. */
+  currentStateid: Stateid4;
+  savedStateid: Stateid4;
   creds: RpcCredentials;
   /** The client ID the enclosing SEQUENCE belongs to, when there is one. */
   clientid: bigint | undefined;
@@ -584,6 +815,26 @@ export class Nfs4Session {
    */
   readonly #maxOpsBySession = new Map<string, number>();
   readonly #maxOperations: number;
+  readonly #idmap: Nfs4IdMap | undefined;
+  /**
+   * One driver handle per live open state, keyed by the stateid's `other`.
+   *
+   * The key is the hex of the twelve `other` bytes, which is also how
+   * `./state.ts` keys its own table — the two never exchange the string, they
+   * exchange the bytes, so the only thing that has to agree is that hex of the
+   * same bytes is the same key.
+   */
+  readonly #openHandles = new Map<string, OpenHandle>();
+  /**
+   * Open states `./state.ts` has dropped whose driver handle is still open.
+   *
+   * Filled synchronously by the `onOpenReleased` hook — which fires in the
+   * middle of a table walk and cannot await anything — and drained after every
+   * operation. CLOSE therefore has no special path: it drops the state, the
+   * hook queues the handle, and the drain closes it before the reply is
+   * encoded.
+   */
+  readonly #released: string[] = [];
   #destroyed = false;
 
   /**
@@ -603,7 +854,13 @@ export class Nfs4Session {
       });
     this.writeVerifier = this.handles.verifier.slice(0, NFS4_VERIFIER_SIZE);
     this.#snapshots = new DirectorySnapshots(options.snapshotCache);
-    this.state = new Nfs4State({ ...options.nfs4 });
+    // The ID map is this file's, not the state table's — see `../util.ts`.
+    const { idmap, ...knobs } = options.nfs4 ?? {};
+    this.#idmap = idmap;
+    this.state = new Nfs4State({
+      ...knobs,
+      onOpenReleased: (other) => this.#released.push(stateKey(other)),
+    });
     this.#maxOperations = Math.max(1, options.nfs4?.maxOperations ?? DEFAULT_MAX_OPERATIONS);
   }
 
@@ -649,12 +906,107 @@ export class Nfs4Session {
     }
   }
 
-  /** Drop every cached listing, and stop. Idempotent. Handles are the router's. */
+  /**
+   * Drop every cached listing, close every driver handle still held open, and
+   * stop. Idempotent. File *handles* (the wire kind) are the router's.
+   *
+   * The driver handles are this session's own: an open state that is still
+   * open when the server stops has nobody left to CLOSE it, and a driver whose
+   * handles hold buffers — `mountx/drivers/unstorage` writes back on the last
+   * `close` — would otherwise lose the writes. A failure to close is reported
+   * and swallowed, exactly as `../v3/session.ts` treats one.
+   */
   async destroy(): Promise<void> {
     this.#destroyed = true;
     this.#snapshots.clear();
     this.#maxOpsBySession.clear();
-    await Promise.resolve();
+    const open = [...this.#openHandles.keys(), ...this.#released];
+    this.#released.length = 0;
+    for (const key of open) {
+      await this.#closeHandle(key);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // driver handles, one per open state
+  // -------------------------------------------------------------------------
+
+  /** Host `open(2)` flags for a `share_access` (RFC 8881 §18.16.3). */
+  #openFlags(access: number): number {
+    const read = (access & OPEN4_SHARE_ACCESS_READ) !== 0;
+    const write = (access & OPEN4_SHARE_ACCESS_WRITE) !== 0;
+    if (read && write) {
+      return constants.O_RDWR;
+    }
+    return write ? constants.O_WRONLY : constants.O_RDONLY;
+  }
+
+  /**
+   * Give an open state the driver handle its access bits call for.
+   *
+   * An OPEN that upgrades an existing open (§9.9 "the result is to 'OR'
+   * together the new share and deny status together with the existing status")
+   * gets a *wider* handle by re-opening: the driver interface has no way to add
+   * an access mode to an open handle, and keeping the narrow one would answer
+   * the client's newly granted WRITE with `EBADF` from the driver.
+   */
+  async #bindHandle(key: string, path: string, access: number): Promise<void> {
+    const flags = this.#openFlags(access);
+    const existing = this.#openHandles.get(key);
+    if (existing !== undefined && existing.flags === flags) {
+      return;
+    }
+    const handle = await this.driver.open(path, flags);
+    this.#openHandles.set(key, { handle, flags, path });
+    if (existing !== undefined) {
+      await this.#close(existing.handle);
+    }
+  }
+
+  /** Close and forget the driver handle an open state was holding. */
+  async #closeHandle(key: string): Promise<void> {
+    const open = this.#openHandles.get(key);
+    if (open === undefined) {
+      return;
+    }
+    this.#openHandles.delete(key);
+    await this.#close(open.handle);
+  }
+
+  /** Close every handle `./state.ts` has released since the last drain. */
+  async #drainReleased(): Promise<void> {
+    while (this.#released.length > 0) {
+      await this.#closeHandle(this.#released.shift()!);
+    }
+  }
+
+  /** `close`, with the failure reported rather than thrown — as in `../v3/session.ts`. */
+  async #close(handle: FileHandleLike): Promise<void> {
+    try {
+      await handle.close();
+    } catch (error) {
+      this.options.onError?.(error, undefined);
+    }
+  }
+
+  /**
+   * Open, act, close — for I/O that names no open state.
+   *
+   * The same shape `../v3/session.ts` uses for every READ and WRITE it answers,
+   * and for the same reason: an anonymous or bypass stateid says there is no
+   * open to borrow a handle from, so this request is the whole lifetime of one.
+   */
+  async #withFile<T>(
+    path: string,
+    flags: number,
+    fn: (handle: FileHandleLike) => Promise<T>,
+  ): Promise<T> {
+    const handle = await this.driver.open(path, flags);
+    try {
+      return await fn(handle);
+    } finally {
+      await this.#close(handle);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -832,7 +1184,9 @@ export class Nfs4Session {
         // the only one in the COMPOUND.
         return this.#halted(call, tag, [statusResop(firstOp, NFS4ERR_NOT_ONLY_OP)]);
       }
-      return (await this.#execute(call, request, 0, [], undefined)).reply;
+      const resarray: Resop4[] = [];
+      const executed = await this.#execute(call, request, 0, resarray, undefined);
+      return this.#reply(call, tag, executed.status, resarray);
     }
 
     const seq = request.ops[0]!.args as Sequence4args;
@@ -845,6 +1199,9 @@ export class Nfs4Session {
     }
 
     const outcome = this.state.sequence(seq);
+    // A SEQUENCE can revoke a lapsed lease before a single operation runs
+    // (§8.4.3), and the driver handles those opens held go with them.
+    await this.#drainReleased();
     switch (outcome.kind) {
       case "error": {
         // §2.10.6.1.2: a SEQUENCE that failed leaves the slot alone, so there
@@ -871,11 +1228,8 @@ export class Nfs4Session {
       }
       case "new": {
         const resarray: Resop4[] = [{ op: OP_SEQUENCE, res: outcome.sequence }];
-        const bytes = await this.#execute(call, request, 1, resarray, outcome.clientid, seq);
-        // The ticket is handed back whether or not there are bytes to store —
-        // `./state.ts` needs to know the request finished either way.
-        this.state.cacheReply(outcome.ticket, outcome.cachethis ? bytes.body : undefined);
-        return bytes.reply;
+        const executed = await this.#execute(call, request, 1, resarray, outcome.clientid, seq);
+        return this.#cachedReply(call, tag, executed.status, resarray, outcome, executed.cacheable);
       }
     }
   }
@@ -896,11 +1250,13 @@ export class Nfs4Session {
   }
 
   /**
-   * Run the operations from `from` onward over one cursor.
+   * Run the operations from `from` onward over one cursor, appending to
+   * `resarray`.
    *
    * Halts at the first non-`NFS4_OK` status (§16.2.3), and then at the decode
-   * halt if the array reached one. Returns both the encoded `COMPOUND4res`
-   * (which is what a slot caches) and the framed reply.
+   * halt if the array reached one. `cacheable` is false when the compound
+   * destroyed the session it rides — there is no slot to cache into any more,
+   * and §18.37.3 warns the client to expect exactly that.
    */
   async #execute(
     call: RpcCall,
@@ -909,10 +1265,12 @@ export class Nfs4Session {
     resarray: Resop4[],
     clientid: bigint | undefined,
     seq?: Sequence4args,
-  ): Promise<{ body: Uint8Array | undefined; reply: Uint8Array }> {
+  ): Promise<{ status: number; cacheable: boolean }> {
     const cursor: Cursor = {
       currentFh: undefined,
       savedFh: undefined,
+      currentStateid: zeroStateid(),
+      savedStateid: zeroStateid(),
       creds: credentialsOf(call.cred),
       clientid,
       ownSession: seq === undefined ? undefined : sessionKey(seq.sessionid),
@@ -922,6 +1280,9 @@ export class Nfs4Session {
     let halted = false;
     for (let index = from; index < request.ops.length; index++) {
       const resop = await this.#operation(request.ops[index]!, cursor);
+      // Whatever that operation ended — a CLOSE, or a lease sweep it triggered
+      // — the driver handles go here, before the next one runs.
+      await this.#drainReleased();
       resarray.push(resop);
       status = (resop.res as Status4res).status;
       if (status !== NFS4_OK) {
@@ -934,13 +1295,47 @@ export class Nfs4Session {
       status = request.halt.status;
     }
     this.#failed(status);
-    const body = encodeCompoundRes({ status, tag: request.tag, resarray });
-    // A compound that destroyed the session it rides has no slot to cache into
-    // any more, and §18.37.3 warns the client to expect exactly that.
-    return {
-      body: cursor.destroyedOwnSession ? undefined : body,
-      reply: encodeAcceptedReply(call.xid, body),
-    };
+    return { status, cacheable: !cursor.destroyedOwnSession };
+  }
+
+  /**
+   * Encode, cache and frame the reply to a COMPOUND that rode a slot.
+   *
+   * The one place `NFS4ERR_REP_TOO_BIG_TO_CACHE` can be decided, because it is
+   * a fact about the *encoded* reply: §2.10.6.4, "If the reply exceeds
+   * ca_maxresponsesize_cached (and sa_cachethis ... is TRUE), then the server
+   * MUST return NFS4ERR_REP_TOO_BIG_TO_CACHE. Even if
+   * NFS4ERR_REP_TOO_BIG_TO_CACHE ... is returned on an operation other than the
+   * first operation (SEQUENCE ...), then the reply MUST be cached if
+   * sa_cachethis ... is TRUE." So the over-sized reply is *replaced* by a
+   * shorter one carrying that status on the operation that overran, everything
+   * already executed is kept — the section's own worked example has a RENAME
+   * five operations back that must not be run twice — and it is that shorter
+   * reply which is both sent and cached.
+   */
+  #cachedReply(
+    call: RpcCall,
+    tag: string,
+    status: number,
+    resarray: Resop4[],
+    outcome: { ticket: SlotTicket; cachethis: boolean },
+    cacheable: boolean,
+  ): Uint8Array {
+    const cache = outcome.cachethis && cacheable;
+    let results = resarray;
+    let body = encodeCompoundRes({ status, tag, resarray: results });
+    if (cache && body.byteLength > outcome.ticket.maxCachedBytes) {
+      const trimmed = trimForCache(tag, results, outcome.ticket.maxCachedBytes);
+      if (trimmed !== undefined) {
+        results = trimmed;
+        status = this.#failed(NFS4ERR_REP_TOO_BIG_TO_CACHE);
+        body = encodeCompoundRes({ status, tag, resarray: results });
+      }
+    }
+    // The ticket is handed back whether or not there are bytes to store —
+    // `./state.ts` needs to know the request finished either way.
+    this.state.cacheReply(outcome.ticket, cache ? body : undefined);
+    return encodeAcceptedReply(call.xid, body);
   }
 
   /**
@@ -979,6 +1374,9 @@ export class Nfs4Session {
       case OP_BIND_CONN_TO_SESSION: {
         return this.#bindConnToSession(entry.args as BindConnToSession4args);
       }
+      case OP_CLOSE: {
+        return this.#closeOp(entry.args as Close4args, cursor);
+      }
       case OP_COMMIT: {
         return this.#commit(cursor);
       }
@@ -1014,6 +1412,15 @@ export class Nfs4Session {
       case OP_LINK: {
         return this.#link(entry.args as Link4args, cursor);
       }
+      case OP_LOCK: {
+        return this.#lockOp(entry.args as Lock4args, cursor);
+      }
+      case OP_LOCKT: {
+        return this.#lockt(entry.args as Lockt4args, cursor);
+      }
+      case OP_LOCKU: {
+        return this.#locku(entry.args as Locku4args, cursor);
+      }
       case OP_LOOKUP: {
         return this.#lookup(entry.args as Lookup4args, cursor);
       }
@@ -1022,6 +1429,12 @@ export class Nfs4Session {
       }
       case OP_NVERIFY: {
         return this.#verify(entry.args as Verify4args, cursor, false);
+      }
+      case OP_OPEN: {
+        return this.#open(entry.args as Open4args, cursor);
+      }
+      case OP_OPEN_DOWNGRADE: {
+        return this.#openDowngrade(entry.args as OpenDowngrade4args, cursor);
       }
       case OP_PUTFH: {
         return this.#putfh(entry.args as Putfh4args, cursor);
@@ -1033,7 +1446,11 @@ export class Nfs4Session {
         // nothing else to point a public filehandle at, so they are the same
         // handle and PUTPUBFH is PUTROOTFH.
         cursor.currentFh = this.handles.encode(this.handles.root);
+        cursor.currentStateid = zeroStateid();
         return { status: NFS4_OK };
+      }
+      case OP_READ: {
+        return this.#read(entry.args as Read4args, cursor);
       }
       case OP_READDIR: {
         return this.#readdir(entry.args as Readdir4args, cursor);
@@ -1057,11 +1474,15 @@ export class Nfs4Session {
         // NFS4ERR_RESTOREFH itself that "in NFSv4.1, this error has been
         // superseded by NFS4ERR_NOFILEHANDLE" — §15.2's RESTOREFH row lists
         // only the latter.
+        // "The SAVEFH and RESTOREFH operations will save and restore both the
+        // current filehandle and the current stateid as a set" (§16.2.3.1.2).
         cursor.currentFh = this.#requireSaved(cursor);
+        cursor.currentStateid = cursor.savedStateid;
         return { status: NFS4_OK };
       }
       case OP_SAVEFH: {
         cursor.savedFh = this.#requireCurrent(cursor);
+        cursor.savedStateid = cursor.currentStateid;
         return { status: NFS4_OK };
       }
       case OP_SECINFO: {
@@ -1086,16 +1507,13 @@ export class Nfs4Session {
       case OP_VERIFY: {
         return this.#verify(entry.args as Verify4args, cursor, true);
       }
+      case OP_WRITE: {
+        return this.#write(entry.args as Write4args, cursor);
+      }
+      /* v8 ignore next 4 -- unreachable: the decoder rejects every opcode that
+         is neither in the codec table nor handled above. */
       default: {
-        // The eight operations whose handlers arrive with the open and lock
-        // state wiring. Their arguments were decoded, so this is a refusal
-        // rather than a desync — see {@link PENDING_STATE_OPS}.
-        /* v8 ignore next 3 -- unreachable: the decoder rejects every opcode
-           that is neither in the codec table nor handled above. */
-        if (!PENDING_STATE_OPS.has(entry.op)) {
-          throw new Nfs4StatusError(NFS4ERR_SERVERFAULT, `no handler for ${opName4(entry.op)}`);
-        }
-        return { status: NFS4ERR_NOTSUPP };
+        throw new Nfs4StatusError(NFS4ERR_SERVERFAULT, `no handler for ${opName4(entry.op)}`);
       }
     }
   }
@@ -1255,6 +1673,8 @@ export class Nfs4Session {
         fileid: this.#fileid(entry, stats),
         filehandle: this.handles.encode(entry),
       }),
+      owner: this.#ownerName(stats.uid, false),
+      ownerGroup: this.#ownerName(stats.gid, true),
     };
     if (
       this.driver.capabilities.statfs &&
@@ -1287,6 +1707,10 @@ export class Nfs4Session {
    */
   #putfh(args: Putfh4args, cursor: Cursor): Status4res {
     cursor.currentFh = this.handles.encode(this.handles.decode(args.object));
+    // "If an operation sets the current filehandle but does not return a
+    // stateid, the current stateid MUST be set to the all-zeros special
+    // stateid" (§16.2.3.1.2).
+    cursor.currentStateid = zeroStateid();
     return { status: NFS4_OK };
   }
 
@@ -1299,6 +1723,7 @@ export class Nfs4Session {
     const path = joinPath(dir, this.#checkName(args.objname));
     const { entry } = await this.#bind(path);
     cursor.currentFh = this.handles.encode(entry);
+    cursor.currentStateid = zeroStateid();
     return { status: NFS4_OK };
   }
 
@@ -1323,6 +1748,7 @@ export class Nfs4Session {
     }
     const { entry } = await this.#bind(dirname(path));
     cursor.currentFh = this.handles.encode(entry);
+    cursor.currentStateid = zeroStateid();
     return { status: NFS4_OK };
   }
 
@@ -1374,9 +1800,21 @@ export class Nfs4Session {
   /**
    * SETATTR (§18.30).
    *
-   * The stateid is decoded and **not yet validated**: it exists to carry the
-   * byte-range locking context a `size` change needs (§18.30.3), and there is
-   * no open or lock state to check it against until that wiring lands.
+   * The stateid is validated **only when the request sets `size`**, which is
+   * the shape §18.30.3 gives it: "The stateid argument for SETATTR is used to
+   * provide byte-range locking context that is necessary for SETATTR requests
+   * that set the size attribute. Since setting the size attribute modifies the
+   * file's data, it has the same locking requirements as a corresponding
+   * WRITE." So a size change goes through the same check a WRITE does —
+   * `NFS4ERR_OPENMODE` for an open that does not allow writing, `NFS4ERR_LOCKED`
+   * for an anonymous or bypass stateid against a `OPEN4_SHARE_DENY_WRITE`
+   * reservation, which the same paragraph calls out ("Any SETATTR that sets the
+   * size attribute is incompatible with a share reservation that specifies
+   * OPEN4_SHARE_DENY_WRITE") — and everything else ignores it, on the same
+   * section's "when the file size attribute is not set, the special stateid
+   * consisting of all bits equal to zero MAY be passed". The truncate itself
+   * goes through the path rather than an open handle, so what the check buys is
+   * the permission, not a descriptor.
    *
    * `attrsset` is the mask of what was actually applied, on success *and* on
    * failure — §18.30.3: "On either success or failure of the operation, the
@@ -1393,9 +1831,12 @@ export class Nfs4Session {
    * SETATTR may partially change a file's attributes").
    */
   async #setattr(args: Setattr4args, cursor: Cursor): Promise<Setattr4res> {
-    const path = this.#pathOfCurrent(cursor);
+    const { path, fileKey } = this.#target(cursor);
     try {
       this.#settableOrRefuse(args.objAttributes);
+      if (args.objAttributes.values.size !== undefined) {
+        this.#ioStateid(args.stateid, cursor, fileKey, true);
+      }
     } catch (error) {
       return { status: statusOf(error), attrsset: [] };
     }
@@ -1425,10 +1866,9 @@ export class Nfs4Session {
         bits.push(FATTR4_MODE);
       }
       if (values.owner !== undefined || values.ownerGroup !== undefined) {
-        // The numeric-string fast path of §5.9; a `name@domain` owner needs an
-        // ID map, which arrives with the open and lock wiring.
-        const uid = values.owner === undefined ? -1 : this.#ownerId(values.owner);
-        const gid = values.ownerGroup === undefined ? -1 : this.#ownerId(values.ownerGroup);
+        // §5.9's numeric fast path, then whatever ID map was configured.
+        const uid = values.owner === undefined ? -1 : this.#ownerId(values.owner, false);
+        const gid = values.ownerGroup === undefined ? -1 : this.#ownerId(values.ownerGroup, true);
         await this.#nofollow(
           () => this.driver.lchown(path, uid, gid),
           () => this.driver.chown(path, uid, gid),
@@ -1500,18 +1940,74 @@ export class Nfs4Session {
   }
 
   /**
-   * A `utf8str_mixed` owner as a uid or gid.
+   * A uid or gid as the `owner`/`owner_group` string to put on the wire (§5.9).
    *
-   * Only §5.9's numeric form for now — "owner and group strings that consist of
-   * decimal numeric values with no leading zeros can be given a special
-   * interpretation" — and anything else is `NFS4ERR_BADOWNER`, which §15.2
-   * lists for SETATTR and which is the honest answer from a server with no name
-   * service. A real `name@domain` map arrives with the ID-mapping step.
+   * Without an ID map this is the numeric form and nothing else — "owner and
+   * group strings that consist of decimal numeric values with no leading zeros
+   * can be given a special interpretation" — which is also what a map that has
+   * no answer for this id falls back to, since §5.9 defines the unqualified
+   * string as meaning exactly "no translation was available at the sender".
+   * A name that came back without an `@` is qualified with the configured
+   * domain, because a bare name is that "no translation" signal and would be
+   * read as one by the client.
    */
-  #ownerId(owner: string): number {
-    const id = parseNumericOwner(owner);
+  #ownerName(id: number, group: boolean): string {
+    const name = this.#idmap?.nameOf?.(id, group);
+    if (name === undefined || name.length === 0) {
+      return numericOwner(id);
+    }
+    const domain = this.#idmap?.domain;
+    return name.includes("@") || domain === undefined || domain.length === 0
+      ? name
+      : `${name}@${domain}`;
+  }
+
+  /**
+   * A `utf8str_mixed` owner as a uid or gid (§5.9).
+   *
+   * §5.9's numeric form first, then the ID map, then `NFS4ERR_BADOWNER` —
+   * "servers that do not provide support for all possible values of the owner
+   * and owner_group attributes SHOULD return an error (NFS4ERR_BADOWNER) when a
+   * string is presented that has no translation". §15.2 lists that status for
+   * all three operations that can carry an owner in: SETATTR, CREATE and OPEN.
+   *
+   * With a domain configured, the string must be qualified with *that* domain
+   * and nothing else, and the suffix is stripped before the map is asked — so a
+   * map is written against local names. Both halves of that are §5.9's: "a
+   * server may treat other domains as having no valid translations", and an
+   * unqualified string is by definition untranslatable, since "the absence of
+   * the @ from the owner or owner_group attribute signifies that no translation
+   * was available at the sender and that the receiver of the attribute should
+   * not use that string as a basis for translation into its own internal
+   * format". With no domain configured there is nothing to check a suffix
+   * against, so the string goes to the map exactly as it arrived and the map is
+   * the whole policy.
+   *
+   * The numeric form is accepted even when the map could name the same id,
+   * where §5.9 has a SHOULD the other way ("a server SHOULD return an
+   * NFS4ERR_BADOWNER error when there is a valid translation for the user or
+   * owner designated in this way", so that a client cannot bypass translation
+   * by sending numbers). That is deliberate: this server's own GETATTR answers
+   * with numbers whenever the map has nothing to say, so refusing them coming
+   * back would refuse a client that is echoing what it was told.
+   */
+  #ownerId(owner: string, group: boolean): number {
+    const numeric = parseNumericOwner(owner);
+    if (numeric !== undefined) {
+      return numeric;
+    }
+    const domain = this.#idmap?.domain;
+    let name = owner;
+    if (domain !== undefined && domain.length > 0) {
+      const at = owner.lastIndexOf("@");
+      if (at < 0 || owner.slice(at + 1) !== domain) {
+        throw new Nfs4StatusError(NFS4ERR_BADOWNER, `owner '${owner}' is not in the served domain`);
+      }
+      name = owner.slice(0, at);
+    }
+    const id = this.#idmap?.idOf?.(name, group);
     if (id === undefined) {
-      throw new Nfs4StatusError(NFS4ERR_BADOWNER, `owner '${owner}' is not a numeric id`);
+      throw new Nfs4StatusError(NFS4ERR_BADOWNER, `owner '${owner}' has no translation`);
     }
     return id;
   }
@@ -1776,6 +2272,7 @@ export class Nfs4Session {
         : applied.bits;
     const { entry } = await this.#bind(path);
     cursor.currentFh = this.handles.encode(entry);
+    cursor.currentStateid = zeroStateid();
     return {
       status: applied.status,
       cinfo: this.#cinfo(before, await this.#changeOf(dir)),
@@ -2039,6 +2536,626 @@ export class Nfs4Session {
   }
 
   // -------------------------------------------------------------------------
+  // stateids, and the open state behind them (RFC 8881 §8.2, §9.1.2)
+  // -------------------------------------------------------------------------
+
+  /** The client ID the enclosing SEQUENCE belongs to. */
+  #clientid(cursor: Cursor): bigint {
+    /* v8 ignore next 4 -- unreachable: every operation that asks is one that
+       needs a session, and a COMPOUND whose first operation is not SEQUENCE has
+       already been answered with NFS4ERR_OP_NOT_IN_SESSION. */
+    if (cursor.clientid === undefined) {
+      throw new Nfs4StatusError(NFS4ERR_OP_NOT_IN_SESSION, "no SEQUENCE, so no client ID");
+    }
+    return cursor.clientid;
+  }
+
+  /**
+   * The opaque `./state.ts` knows an object by.
+   *
+   * The handle table's identity, so two names for one file — a hard link, a
+   * path reached twice — are one key, which is what §9.9's share reservations
+   * need in order to coalesce at all.
+   */
+  #fileKey(entry: HandleEntry): string {
+    return entry.id.toString(16);
+  }
+
+  /** The current filehandle as the pair a stateful operation needs. */
+  #target(cursor: Cursor): { path: string; fileKey: string; entry: HandleEntry } {
+    const entry = this.handles.decode(this.#requireCurrent(cursor));
+    return { path: this.handles.pathOf(entry), fileKey: this.#fileKey(entry), entry };
+  }
+
+  /**
+   * The type check READ, WRITE, LOCK, LOCKT and LOCKU all owe.
+   *
+   * Five sections say it in the same three sentences (§18.22.3, §18.32.3,
+   * §18.10.3, §18.11.3, §18.12.3), and OPEN — "OPEN - Open a Regular File" —
+   * owes it too, on §15.2's row for it rather than on a sentence of its own:
+   * "If the current filehandle is not an
+   * ordinary file, an error will be returned to the client. In the case that
+   * the current filehandle represents an object of type NF4DIR, NFS4ERR_ISDIR
+   * is returned. If the current filehandle designates a symbolic link,
+   * NFS4ERR_SYMLINK is returned. In all other cases, NFS4ERR_WRONG_TYPE is
+   * returned."
+   */
+  #requireRegular(stats: StatsLike): void {
+    const type = stats.mode & S_IFMT;
+    if (type === S_IFREG) {
+      return;
+    }
+    if (type === S_IFDIR) {
+      throw new Nfs4StatusError(NFS4ERR_ISDIR, "the current filehandle is a directory");
+    }
+    if (type === S_IFLNK) {
+      throw new Nfs4StatusError(NFS4ERR_SYMLINK, "the current filehandle is a symbolic link");
+    }
+    throw new Nfs4StatusError(NFS4ERR_WRONG_TYPE, "the current filehandle is not an ordinary file");
+  }
+
+  /**
+   * Substitute the current stateid for `(seqid 1, other 0)` (§8.2.3,
+   * §16.2.3.1.2).
+   *
+   * "The stateid passed to the operation in place of the special value has its
+   * 'seqid' value set to zero, except when the current stateid is used by the
+   * operation CLOSE or OPEN_DOWNGRADE" — which is what `keepSeqid` selects. A
+   * COMPOUND that has returned no stateid, or whose last one was itself
+   * special, is `NFS4ERR_BAD_STATEID`: §8.2.3 makes both a MUST, and Figure 6
+   * is the second case drawn out.
+   */
+  #resolveStateid(stateid: Stateid4, cursor: Cursor, keepSeqid = false): Stateid4 {
+    if (specialStateid(stateid) !== "current") {
+      return stateid;
+    }
+    const current = cursor.currentStateid;
+    if (specialStateid(current) !== "normal") {
+      throw new Nfs4StatusError(
+        NFS4ERR_BAD_STATEID,
+        "the current stateid is not one this COMPOUND returned",
+      );
+    }
+    return keepSeqid ? current : { seqid: 0, other: current.other };
+  }
+
+  /**
+   * Validate an I/O stateid, and say which open state's driver handle to use.
+   *
+   * §9.1.2 is the whole rule, and it is not symmetric. For a WRITE — and for a
+   * SETATTR that sets size, which "has the same locking requirements as a
+   * corresponding WRITE" — "the server MUST verify that the access mode allows
+   * writing and MUST return an NFS4ERR_OPENMODE error if it does not". For a
+   * READ the check is a MAY, and this server takes it: enforcing it is what
+   * lets the share-reservation check be skipped for an open stateid, since
+   * "the existence of OPEN for OPEN4_SHARE_ACCESS_READ guarantees that no
+   * conflicting share reservation can exist".
+   *
+   * The two special stateids that reach here name no open, so they are checked
+   * against the reservations instead ({@link Nfs4State.shareDenies}), with one
+   * asymmetry that is §8.2.3's: the all-ones stateid is a **READ** bypass —
+   * "when used in READ, the server MAY grant access, even if access would
+   * normally be denied" — while "when this value is used in WRITE or SETATTR,
+   * it is treated like the anonymous value", which §18.32.3 restates as a MUST
+   * NOT bypass.
+   *
+   * Answers the key of the driver handle to do the I/O through, or `undefined`
+   * when the caller should open one of its own.
+   */
+  #ioStateid(
+    stateid: Stateid4,
+    cursor: Cursor,
+    fileKey: string,
+    write: boolean,
+  ): string | undefined {
+    const clientid = this.#clientid(cursor);
+    const resolved = this.#resolveStateid(stateid, cursor);
+    const checked = this.state.checkStateid({ clientid, stateid: resolved, fileKey });
+    if (checked.status !== NFS4_OK) {
+      throw new Nfs4StatusError(checked.status, "the stateid is not one this file has");
+    }
+    const wanted = write ? OPEN4_SHARE_ACCESS_WRITE : OPEN4_SHARE_ACCESS_READ;
+    if (checked.kind === "open" || checked.kind === "lock") {
+      if (((checked.access ?? 0) & wanted) === 0) {
+        throw new Nfs4StatusError(
+          NFS4ERR_OPENMODE,
+          `the open does not allow ${write ? "writing" : "reading"}`,
+        );
+      }
+      // A lock stateid borrows the handle of the open it was derived from
+      // (§9.1.1): the bytes are the same file and the access mode is the
+      // open's, so a second handle would be a second copy of one open.
+      return checked.openStateid === undefined ? undefined : stateKey(checked.openStateid.other);
+    }
+    if (!(checked.kind === "bypass" && !write)) {
+      const denied = this.state.shareDenies(fileKey, wanted, clientid);
+      if (denied !== NFS4_OK) {
+        throw new Nfs4StatusError(denied, "a share reservation denies this I/O");
+      }
+    }
+    return undefined;
+  }
+
+  /** Do the I/O through the open state's handle, or through one opened for it. */
+  async #io<T>(
+    key: string | undefined,
+    path: string,
+    flags: number,
+    fn: (handle: FileHandleLike) => Promise<T>,
+  ): Promise<T> {
+    const open = key === undefined ? undefined : this.#openHandles.get(key);
+    return open === undefined ? this.#withFile(path, flags, fn) : fn(open.handle);
+  }
+
+  // -------------------------------------------------------------------------
+  // OPEN (RFC 8881 §18.16) / OPEN_DOWNGRADE (§18.18) / CLOSE (§18.2)
+  // -------------------------------------------------------------------------
+
+  /**
+   * OPEN (§18.16): the only way to create a regular file, and the only way to
+   * get a stateid for one.
+   *
+   * Four of the seven claims are refused, and each with the status its own
+   * facts produce rather than a blanket one — §15.2's OPEN row has no
+   * `NFS4ERR_NOTSUPP` to give:
+   *
+   * - `CLAIM_PREVIOUS`, `CLAIM_DELEGATE_PREV` and `CLAIM_DELEG_PREV_FH` are
+   *   reclaims of state from before a restart, and this server keeps none, so
+   *   they go to `./state.ts` as reclaims and come back `NFS4ERR_NO_GRACE`
+   *   (§15.1.9.3's "there is no active grace period" and "the client making the
+   *   request has no current role in reclaiming locks", both true here).
+   * - `CLAIM_DELEGATE_CUR` and `CLAIM_DELEG_CUR_FH` name a delegation stateid,
+   *   and this server has never issued one, so the stateid is checked like any
+   *   other and answers `NFS4ERR_BAD_STATEID`. A stateid that *does* exist but
+   *   is an open rather than a delegation gets the same status, on §8.2.4's
+   *   "valid in general but ... not appropriate to the context in which the
+   *   stateid is used".
+   *
+   * Exclusive create is the one place this file knowingly departs from a
+   * sentence of the RFC, and it is a contradiction inside the RFC: §18.16.4
+   * says "if the server cannot support exclusive create semantics, possibly
+   * because of the requirement to commit the verifier to stable storage, it
+   * should fail the OPEN request with the error NFS4ERR_NOTSUPP", while
+   * §15.2's OPEN row and §15.4's `NFS4ERR_NOTSUPP` row — the two normative
+   * error tables, agreeing from both directions — do not admit that status for
+   * OPEN. `NFS4ERR_INVAL` is what they do admit, and it is the status §18.16.3
+   * itself gives to the two neighbouring cases of "this exclusive-create form
+   * must not be used here" (a named attribute directory: "the server will
+   * return EINVAL"; a persistent session or a pNFS client ID: "the server MUST
+   * return NFS4ERR_INVAL"). There is nowhere in the driver interface to commit
+   * a verifier to, and a side table a restart loses would be a worse answer
+   * than a refusal — the same call `../v3/session.ts` makes about `EXCLUSIVE`.
+   *
+   * On success the opened file becomes the current filehandle ("upon success
+   * ... the current filehandle is replaced by that of the created or existing
+   * object") and the returned stateid becomes the current stateid.
+   */
+  async #open(args: Open4args, cursor: Cursor): Promise<Open4res> {
+    const clientid = this.#clientid(cursor);
+    const refused = (status: number): Open4res => ({
+      status,
+      stateid: undefined,
+      cinfo: undefined,
+      rflags: 0,
+      attrset: undefined,
+      delegation: undefined,
+    });
+    const claim = args.claim.claim;
+    const create = args.openhow.opentype === OPEN4_CREATE;
+    if (
+      create &&
+      claim !== CLAIM_NULL &&
+      claim !== CLAIM_DELEGATE_CUR &&
+      claim !== CLAIM_DELEGATE_PREV
+    ) {
+      // §18.16.3: "If opentype is OPEN4_CREATE, then the claim field ... MUST
+      // be one of CLAIM_NULL, CLAIM_DELEGATE_CUR, or CLAIM_DELEGATE_PREV,
+      // because these claim methods include a component of a file name."
+      return refused(NFS4ERR_INVAL);
+    }
+    if (
+      claim === CLAIM_PREVIOUS ||
+      claim === CLAIM_DELEGATE_PREV ||
+      claim === CLAIM_DELEG_PREV_FH
+    ) {
+      // The file is never resolved: `./state.ts` refuses every reclaim before
+      // it looks at one, so naming it would be work done to be thrown away.
+      return refused(
+        this.state.open({
+          clientid,
+          owner: args.owner.owner,
+          fileKey: "",
+          shareAccess: args.shareAccess,
+          shareDeny: args.shareDeny,
+          reclaim: true,
+        }).status,
+      );
+    }
+    if (claim === CLAIM_DELEGATE_CUR || claim === CLAIM_DELEG_CUR_FH) {
+      const stateid =
+        claim === CLAIM_DELEGATE_CUR
+          ? args.claim.delegateCurInfo!.delegateStateid
+          : args.claim.ocDelegateStateid!;
+      const checked = this.state.checkStateid({ clientid, stateid });
+      return refused(checked.status === NFS4_OK ? NFS4ERR_BAD_STATEID : checked.status);
+    }
+
+    // CLAIM_NULL names the file inside the current directory; CLAIM_FH *is* the
+    // file, which is what a Linux client sends to re-open one it already has.
+    let dir: string | undefined;
+    let before = 0n;
+    let path: string;
+    if (claim === CLAIM_FH) {
+      path = this.#pathOfCurrent(cursor);
+    } else {
+      dir = this.#pathOfCurrent(cursor);
+      const parent = await this.#statOf(dir);
+      if ((parent.mode & S_IFMT) !== S_IFDIR) {
+        return refused(NFS4ERR_NOTDIR);
+      }
+      before = changeOf(parent);
+      path = joinPath(dir, this.#checkName(args.claim.file ?? ""));
+    }
+
+    const attrset: number[] = [];
+    if (create) {
+      const refusal = await this.#openCreate(args, path, cursor, attrset);
+      if (refusal !== undefined) {
+        return refused(refusal);
+      }
+    }
+
+    const { entry, stats } = await this.#bind(path);
+    this.#requireRegular(stats);
+    const result = this.state.open({
+      clientid,
+      // §18.16.3, of the `clientid` inside `open_owner4`: "The client can set
+      // the clientid field to any value and the server MUST ignore it.
+      // Instead, the server MUST derive the client ID from the session ID of
+      // the SEQUENCE operation of the COMPOUND request."
+      owner: args.owner.owner,
+      fileKey: this.#fileKey(entry),
+      shareAccess: args.shareAccess,
+      shareDeny: args.shareDeny,
+    });
+    if (result.status !== NFS4_OK) {
+      return refused(result.status);
+    }
+    const stateid = result.stateid!;
+    // The access the *state* now carries, which after an upgrade is the union
+    // of this OPEN's and the earlier one's (§9.9).
+    const access = this.state.checkStateid({ clientid, stateid, want: "open" }).access ?? 0;
+    try {
+      await this.#bindHandle(stateKey(stateid.other), path, access);
+    } catch (error) {
+      if (result.upgraded !== true) {
+        // A stateid whose file could not be opened is state the client would
+        // only find out about on its first READ. Undo it; an upgrade has no
+        // clean undo (the earlier open's bits are already merged in) and keeps
+        // the handle it had.
+        this.state.close({ clientid, stateid });
+      }
+      throw error;
+    }
+    cursor.currentFh = this.handles.encode(entry);
+    cursor.currentStateid = stateid;
+    return {
+      status: NFS4_OK,
+      stateid,
+      // "For the target directory, the server returns change_info4 information
+      // in cinfo" — and CLAIM_FH has no target directory to describe.
+      cinfo:
+        dir === undefined ? this.#cinfo(0n, 0n) : this.#cinfo(before, await this.#changeOf(dir)),
+      // §18.16.3 rules `OPEN4_RESULT_CONFIRM` out ("deprecated and MUST NOT be
+      // returned by an NFSv4.1 server") and offers three others. Only
+      // `OPEN4_RESULT_LOCKTYPE_POSIX` is true of this server: `./state.ts`
+      // splits, merges, upgrades and downgrades byte ranges POSIX-style and
+      // never answers `NFS4ERR_LOCK_RANGE` or `NFS4ERR_LOCK_NOTSUPP`.
+      // `OPEN4_RESULT_PRESERVE_UNLINKED` would be a lie — a REMOVE here unbinds
+      // the handle and the open file goes with it — and
+      // `OPEN4_RESULT_MAY_NOTIFY_LOCK` promises a callback on a back channel
+      // that does not exist.
+      rflags: OPEN4_RESULT_LOCKTYPE_POSIX,
+      attrset: bitmapOf(attrset),
+      delegation: noDelegation(args.shareAccess),
+    };
+  }
+
+  /**
+   * The create half of an OPEN: `UNCHECKED4` and `GUARDED4` (§18.16.3).
+   *
+   * Answers `undefined` when the file is there to be opened, or the status that
+   * refuses the whole OPEN. `attrset` is filled with what was actually applied,
+   * which is the honest version of "an attribute mask signifying which
+   * attributes were successfully set for the object".
+   *
+   * Whether the file already existed is decided by `O_EXCL` rather than by a
+   * `stat` first, so that GUARDED4's "the server checks for the presence of a
+   * duplicate object by name before performing the create" is one driver call
+   * and not a race. UNCHECKED4 over an existing file then does what §18.16.3
+   * says and no more: "the attributes specified by createattrs are not used,
+   * except that when createattrs specifies the size attribute with a size of
+   * zero, the existing file is truncated".
+   */
+  async #openCreate(
+    args: Open4args,
+    path: string,
+    cursor: Cursor,
+    attrset: number[],
+  ): Promise<number | undefined> {
+    const how = args.openhow.how!;
+    if (how.mode === EXCLUSIVE4 || how.mode === EXCLUSIVE4_1) {
+      return NFS4ERR_INVAL;
+    }
+    const attrs = how.createattrs!;
+    this.#settableOrRefuse(attrs);
+    const mode = (attrs.values.mode ?? 0o666) & 0o7777;
+    const created = await this.#createFile(path, mode);
+    if (!created) {
+      if (how.mode === GUARDED4) {
+        // "If a duplicate exists, NFS4ERR_EXIST is returned."
+        return NFS4ERR_EXIST;
+      }
+      if (attrs.values.size === 0n) {
+        await this.driver.truncate(path, 0);
+        attrset.push(FATTR4_SIZE);
+      }
+      return undefined;
+    }
+    await this.#claim(path, cursor.creds);
+    // The mode went in as `open`'s third argument, so `#applyAttrs` must not
+    // see it — and must see everything else, size included: a create names the
+    // initial state of a file that did not exist a moment ago.
+    const applied = await this.#applyAttrs(path, {
+      ...attrs,
+      values: { ...attrs.values, mode: undefined },
+    });
+    if (applied.status !== NFS4_OK) {
+      // `OPEN4res` has no arm for a partial success, so the bits that did land
+      // cannot be reported alongside a failure the way SETATTR's can. The file
+      // stays created, which is what §18.16.4's warning to client implementors
+      // is about.
+      return applied.status;
+    }
+    if (attrs.values.mode !== undefined) {
+      attrset.push(FATTR4_MODE);
+    }
+    attrset.push(...applied.bits);
+    return undefined;
+  }
+
+  /** Create a file, answering whether it was this call that created it. */
+  async #createFile(path: string, mode: number): Promise<boolean> {
+    try {
+      const handle = await this.driver.open(
+        path,
+        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
+        mode,
+      );
+      await this.#close(handle);
+      return true;
+    } catch (error) {
+      if ((error as { code?: string }).code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * OPEN_DOWNGRADE (§18.18): narrow what an open holds.
+   *
+   * The **state** narrows and the driver handle does not. Keeping the wider
+   * handle open is a server-side detail with no protocol visibility — every
+   * subsequent I/O is checked against the access bits `./state.ts` now carries,
+   * so a downgraded-to-read-only open answers `NFS4ERR_OPENMODE` to a WRITE
+   * whatever the descriptor underneath could do — and re-opening narrower would
+   * spend a driver call to lose the one thing an open handle is for.
+   */
+  #openDowngrade(args: OpenDowngrade4args, cursor: Cursor): OpenDowngrade4res {
+    const clientid = this.#clientid(cursor);
+    const { fileKey } = this.#target(cursor);
+    const stateid = this.#resolveStateid(args.openStateid, cursor, true);
+    // The stateid has to name state on *this* file (§8.2.4); `openDowngrade`
+    // itself takes no filehandle, so the tie is made here.
+    const checked = this.state.checkStateid({ clientid, stateid, fileKey, want: "open" });
+    if (checked.status !== NFS4_OK) {
+      return { status: checked.status, openStateid: undefined };
+    }
+    const result = this.state.openDowngrade({
+      clientid,
+      stateid,
+      shareAccess: args.shareAccess,
+      shareDeny: args.shareDeny,
+    });
+    if (result.status !== NFS4_OK) {
+      return { status: result.status, openStateid: undefined };
+    }
+    cursor.currentStateid = result.stateid!;
+    return { status: NFS4_OK, openStateid: result.stateid };
+  }
+
+  /**
+   * CLOSE (§18.2): release the share reservations one open stateid stands for.
+   *
+   * The driver handle is not closed here. `./state.ts` drops the open state and
+   * the `onOpenReleased` hook queues the handle, which
+   * {@link Nfs4Session.#execute} closes before the next operation runs — so
+   * CLOSE, a revoked lease and a swept client all end a driver handle by the
+   * same path, and there is only one of them to get right.
+   *
+   * `NFS4ERR_LOCKS_HELD` comes from the state table: "the server MUST return
+   * failure if any locks would exist after the CLOSE".
+   */
+  #closeOp(args: Close4args, cursor: Cursor): Close4res {
+    const clientid = this.#clientid(cursor);
+    const { fileKey } = this.#target(cursor);
+    // §18.2.3: "The argument seqid MAY have any value, and the server MUST
+    // ignore seqid" — `args.seqid` is decoded and dropped on the floor.
+    const stateid = this.#resolveStateid(args.openStateid, cursor, true);
+    const checked = this.state.checkStateid({ clientid, stateid, fileKey, want: "open" });
+    if (checked.status !== NFS4_OK) {
+      return { status: checked.status, openStateid: undefined };
+    }
+    const result = this.state.close({ clientid, stateid });
+    if (result.status !== NFS4_OK) {
+      return { status: result.status, openStateid: undefined };
+    }
+    // §18.2.4: the returned stateid is deprecated and is deliberately the
+    // invalid special one, "to help find any uses of this stateid by clients".
+    // It is still a stateid the operation returned, so §16.2.3.1.2 makes it the
+    // current one — and being special, it fails the next `(1, 0)` outright.
+    cursor.currentStateid = result.stateid!;
+    return { status: NFS4_OK, openStateid: result.stateid };
+  }
+
+  // -------------------------------------------------------------------------
+  // READ (RFC 8881 §18.22) / WRITE (§18.32)
+  // -------------------------------------------------------------------------
+
+  /**
+   * READ (§18.22).
+   *
+   * `eof` is computed against the size the file has *after* the read rather
+   * than before it, because that is the question §18.22.3 asks — "if offset +
+   * count is equal to the size of the file ... eof is returned as TRUE" — and a
+   * concurrent truncate between the two would otherwise make the answer a
+   * statement about a file that no longer exists. A read starting at or past
+   * the end is `NFS4_OK` with no data and `eof` TRUE, and so is every read of
+   * an empty file.
+   */
+  async #read(args: Read4args, cursor: Cursor): Promise<Read4res> {
+    const { path, fileKey } = this.#target(cursor);
+    this.#requireRegular(await this.#statOf(path));
+    const key = this.#ioStateid(args.stateid, cursor, fileKey, false);
+    const offset = this.#offset(args.offset);
+    // "The server may choose to return fewer bytes than specified by the
+    // client": the ceiling is the `maxread` this server advertises.
+    const count = Math.min(args.count, this.#maxread());
+    const buffer = new Uint8Array(count);
+    const { bytesRead } = await this.#io(key, path, constants.O_RDONLY, (handle) =>
+      handle.read(buffer, 0, count, offset),
+    );
+    const read = Math.max(0, bytesRead);
+    const size = (await this.#statOf(path)).size;
+    return {
+      status: NFS4_OK,
+      eof: offset + read >= size,
+      data: buffer.subarray(0, read),
+    };
+  }
+
+  /**
+   * WRITE (§18.32).
+   *
+   * `committed` is always `FILE_SYNC4`, which Table 20 makes a legal answer to
+   * all three `stable_how4` values and which this server can honestly give: a
+   * driver's `write` resolves when the bytes are as durable as that driver can
+   * make them, and there is no write cache in front of it. The same claim
+   * `../v3/session.ts` makes, and the reason COMMIT here has nothing to do.
+   */
+  async #write(args: Write4args, cursor: Cursor): Promise<Write4res> {
+    const { path, fileKey } = this.#target(cursor);
+    this.#requireRegular(await this.#statOf(path));
+    const key = this.#ioStateid(args.stateid, cursor, fileKey, true);
+    const offset = this.#offset(args.offset);
+    // "The server MAY write fewer bytes than requested by the client", which is
+    // what a payload past the advertised `maxwrite` gets — the count in the
+    // reply tells the client where to resume.
+    const length = Math.min(args.data.byteLength, this.#maxwrite());
+    const { bytesWritten } = await this.#io(key, path, constants.O_WRONLY, (handle) =>
+      handle.write(args.data, 0, length, offset),
+    );
+    return {
+      status: NFS4_OK,
+      count: bytesWritten,
+      committed: FILE_SYNC4,
+      writeverf: this.writeVerifier,
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // LOCK (RFC 8881 §18.10) / LOCKT (§18.11) / LOCKU (§18.12)
+  // -------------------------------------------------------------------------
+
+  /**
+   * LOCK (§18.10): take a byte range, or learn who holds it.
+   *
+   * Thin over `./state.ts`, which owns the range arithmetic, the conflict rule
+   * and the reclaim refusal. What this file adds is the three things the state
+   * table cannot know: which file the current filehandle is, that it is an
+   * ordinary one, and what the `locker4` union's two arms mean once the fields
+   * §18.10.3 orders the server to ignore have been dropped — the open-owner's
+   * `clientid` and all three v4.0-era seqids.
+   *
+   * A denial carries `LOCK4denied`, whose `owner.clientid` is "the actual
+   * client associated with the conflicting lock, whether this is the client ID
+   * associated with the current session or a different one"; `./state.ts`
+   * fills it in from the holder's own record and it is written out verbatim.
+   */
+  async #lockOp(args: Lock4args, cursor: Cursor): Promise<Lock4res> {
+    const clientid = this.#clientid(cursor);
+    const { path, fileKey } = this.#target(cursor);
+    this.#requireRegular(await this.#statOf(path));
+    const request: LockRequest = {
+      clientid,
+      fileKey,
+      locktype: args.locktype,
+      offset: args.offset,
+      length: args.length,
+      reclaim: args.reclaim,
+    };
+    if (args.locker.newLockOwner) {
+      const arm = args.locker.openOwner!;
+      request.openStateid = this.#resolveStateid(arm.openStateid, cursor);
+      request.lockOwner = arm.lockOwner.owner;
+    } else {
+      request.lockStateid = this.#resolveStateid(args.locker.lockOwner!.lockStateid, cursor);
+    }
+    const result = this.state.lock(request);
+    if (result.status === NFS4_OK) {
+      cursor.currentStateid = result.stateid!;
+    }
+    return { status: result.status, lockStateid: result.stateid, denied: result.denied };
+  }
+
+  /** LOCKT (§18.11): would a lock be granted? Nothing is taken and nothing is returned but the answer. */
+  async #lockt(args: Lockt4args, cursor: Cursor): Promise<Lockt4res> {
+    const clientid = this.#clientid(cursor);
+    const { path, fileKey } = this.#target(cursor);
+    this.#requireRegular(await this.#statOf(path));
+    const result = this.state.lockt({
+      clientid,
+      fileKey,
+      locktype: args.locktype,
+      offset: args.offset,
+      length: args.length,
+      // §18.11.3: the `clientid` beside it "MAY be set to any value by the
+      // client and MUST be ignored by the server".
+      owner: args.owner.owner,
+    });
+    return { status: result.status, denied: result.denied };
+  }
+
+  /** LOCKU (§18.12): release exactly the given range. */
+  async #locku(args: Locku4args, cursor: Cursor): Promise<Locku4res> {
+    const clientid = this.#clientid(cursor);
+    const { path, fileKey } = this.#target(cursor);
+    this.#requireRegular(await this.#statOf(path));
+    const result = this.state.locku({
+      clientid,
+      fileKey,
+      lockStateid: this.#resolveStateid(args.lockStateid, cursor),
+      offset: args.offset,
+      length: args.length,
+    });
+    if (result.status === NFS4_OK) {
+      cursor.currentStateid = result.stateid!;
+    }
+    return { status: result.status, lockStateid: result.stateid };
+  }
+
+  // -------------------------------------------------------------------------
   // SECINFO (RFC 8881 §18.29) / SECINFO_NO_NAME (§18.45)
   // -------------------------------------------------------------------------
 
@@ -2069,6 +3186,7 @@ export class Nfs4Session {
     const dir = this.#pathOfCurrent(cursor);
     await this.#bind(joinPath(dir, this.#checkName(args.name)));
     cursor.currentFh = undefined;
+    cursor.currentStateid = zeroStateid();
     return this.#flavors();
   }
 
@@ -2088,6 +3206,7 @@ export class Nfs4Session {
       return { status: NFS4ERR_INVAL, flavors: [] };
     }
     cursor.currentFh = undefined;
+    cursor.currentStateid = zeroStateid();
     return this.#flavors();
   }
 

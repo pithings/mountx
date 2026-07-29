@@ -1545,7 +1545,9 @@ describe("argument errors, caps and the paths a session leans on", () => {
     const { state } = newState();
     const peer = new Peer(state, "owner-a").register();
 
-    expect(() => state.cacheReply({ slotid: 0, sequenceid: 1 })).toThrow(TypeError);
+    expect(() => state.cacheReply({ slotid: 0, sequenceid: 1, maxCachedBytes: 4096 })).toThrow(
+      TypeError,
+    );
 
     const first = peer.sequence({ sequenceid: 1 });
     expect(first.kind).toBe("new");
@@ -2201,5 +2203,106 @@ describe("verification follow-ups (the six findings, pinned)", () => {
     expect(state.shareDenies(file, OPEN4_SHARE_ACCESS_READ, live.clientid)).toBe(NFS4_OK);
     // The holder's own reservation is not revoked on its own behalf.
     expect(state.shareDenies(file, OPEN4_SHARE_ACCESS_READ, stale.clientid)).toBe(NFS4_OK);
+  });
+});
+
+describe("what a session needs back (RFC 8881 §2.10.6.4, §9.1.1)", () => {
+  it("publishes the slot's ca_maxresponsesize_cached on the ticket", () => {
+    const { state } = newState({ maxCachedResponseSize: 512 });
+    const peer = new Peer(state, "owner-a").register();
+    const outcome = peer.sequence({ sequenceid: 1 });
+    expect(outcome.kind).toBe("new");
+    if (outcome.kind !== "new") {
+      return;
+    }
+    // The negotiated value, not the ceiling: the session has to know what it
+    // is before it finishes the reply, because a reply past it is
+    // NFS4ERR_REP_TOO_BIG_TO_CACHE rather than a silent omission (§2.10.6.4).
+    expect(outcome.ticket.maxCachedBytes).toBe(512);
+  });
+
+  it("says whether the reply was stored", () => {
+    const { state } = newState({ maxCachedResponseSize: 8 });
+    const peer = new Peer(state, "owner-a").register();
+    const first = peer.sequence({ sequenceid: 1 });
+    expect(first.kind).toBe("new");
+    if (first.kind !== "new") {
+      return;
+    }
+    expect(state.cacheReply(first.ticket, new Uint8Array(4))).toBe(true);
+    expect(state.cacheReply(first.ticket, new Uint8Array(64))).toBe(false);
+    expect(state.cacheReply(first.ticket)).toBe(false);
+
+    // And a ticket whose slot has moved on stores nothing, whatever its size.
+    expect(peer.sequence({ sequenceid: 2 }).kind).toBe("new");
+    expect(state.cacheReply(first.ticket, new Uint8Array(4))).toBe(false);
+  });
+
+  it("names the open a lock stateid was derived from", () => {
+    const { state } = newState();
+    const peer = new Peer(state, "owner-a").register();
+    const open = state.open({
+      clientid: peer.clientid,
+      owner: bytes("open-owner"),
+      fileKey: "file-1",
+      shareAccess: OPEN4_SHARE_ACCESS_BOTH,
+      shareDeny: OPEN4_SHARE_DENY_NONE,
+    });
+    expect(open.status).toBe(NFS4_OK);
+    const locked = state.lock({
+      clientid: peer.clientid,
+      fileKey: "file-1",
+      locktype: WRITE_LT,
+      offset: 0n,
+      length: 10n,
+      openStateid: open.stateid,
+      lockOwner: bytes("lock-owner"),
+    });
+    expect(locked.status).toBe(NFS4_OK);
+
+    // §9.1.2: a lock stateid's access mode is the open's — and a caller holding
+    // per-open resources needs to be told *which* open, not just the mode.
+    const checked = state.checkStateid({ clientid: peer.clientid, stateid: locked.stateid! });
+    expect(checked.kind).toBe("lock");
+    expect([...checked.openStateid!.other]).toEqual([...open.stateid!.other]);
+    expect(checked.access).toBe(OPEN4_SHARE_ACCESS_BOTH);
+
+    // An open stateid names itself.
+    const self = state.checkStateid({ clientid: peer.clientid, stateid: open.stateid! });
+    expect([...self.openStateid!.other]).toEqual([...open.stateid!.other]);
+  });
+
+  it("reports every open it releases, whatever ended it", () => {
+    const released: string[] = [];
+    const time = clock();
+    const state = new Nfs4State({
+      now: time.now,
+      leaseSeconds: 1,
+      onOpenReleased: (other) => released.push([...other].join(",")),
+    });
+    const peer = new Peer(state, "owner-a").register();
+    const opens = (fileKey: string): Stateid4 => {
+      const result = state.open({
+        clientid: peer.clientid,
+        owner: bytes(fileKey),
+        fileKey,
+        shareAccess: OPEN4_SHARE_ACCESS_READ,
+        shareDeny: OPEN4_SHARE_DENY_NONE,
+      });
+      expect(result.status).toBe(NFS4_OK);
+      return result.stateid!;
+    };
+
+    const closed = opens("file-1");
+    expect(state.close({ clientid: peer.clientid, stateid: closed }).status).toBe(NFS4_OK);
+    expect(released).toEqual([[...closed.other].join(",")]);
+
+    // The lease lapses: §8.4.3's revocation goes through the same hook, which
+    // is the whole point — a driver handle has no other event to hang off.
+    const revoked = opens("file-2");
+    time.advance(10);
+    expect(state.sweep()).toBe(1);
+    expect(released).toContain([...revoked.other].join(","));
+    expect(released).toHaveLength(2);
   });
 });

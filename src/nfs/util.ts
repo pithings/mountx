@@ -42,13 +42,65 @@ export const NAME_MAX = 255;
 // ---------------------------------------------------------------------------
 
 /**
- * NFSv4.1-only knobs, forwarded verbatim to `v4/state.ts`'s `Nfs4State`.
+ * How a uid or gid becomes an `owner`/`owner_group` string, and back
+ * (RFC 8881 §5.9).
+ *
+ * NFSv4 carries ownership as a `utf8str_mixed` of the form `user@dns_domain`
+ * rather than as a number, and §5.9 leaves the translation entirely to the
+ * implementation: "The translation used to interpret owner and group strings is
+ * not specified as part of the protocol." Configure nothing and the v4 session
+ * speaks only the numeric form §5.9 also allows ("owner and group strings that
+ * consist of decimal numeric values with no leading zeros can be given a
+ * special interpretation"), which is what a Linux client falls back to when its
+ * own idmapper has nothing to say.
+ *
+ * Both hooks are synchronous, because a COMPOUND consults them between two
+ * driver calls; a map that needs a network service should keep its own cache
+ * behind these.
+ */
+export interface Nfs4IdMap {
+  /**
+   * The one DNS domain this server maps names in.
+   *
+   * Used in both directions: a {@link Nfs4IdMap.nameOf} result with no `@` in
+   * it is qualified with this domain on the way out, and an incoming
+   * `user@other.example` — a domain this server does not serve — is
+   * `NFS4ERR_BADOWNER` without {@link Nfs4IdMap.idOf} being asked at all, which
+   * §5.9 permits: "A server may treat other domains as having no valid
+   * translations."
+   */
+  domain?: string | undefined;
+  /**
+   * A uid (or gid, when `group`) as the string to put on the wire.
+   *
+   * `undefined` falls back to the numeric form, which is §5.9's "in the case
+   * where there is no translation available ... the attribute value will be
+   * constructed without the '@'".
+   */
+  nameOf?: ((id: number, group: boolean) => string | undefined) | undefined;
+  /**
+   * The uid (or gid, when `group`) a wire string names, with the domain
+   * suffix already stripped when it matched {@link Nfs4IdMap.domain}.
+   *
+   * `undefined` is `NFS4ERR_BADOWNER`, which §5.9 makes the answer for a string
+   * with no translation.
+   */
+  idOf?: ((name: string, group: boolean) => number | undefined) | undefined;
+}
+
+/**
+ * NFSv4.1-only knobs.
  *
  * Spelled out here rather than imported so the shared layer names nothing from
- * `v4/`; it is structurally a subset of `Nfs4StateOptions`, which is what makes
- * the forward a spread rather than a translation.
+ * `v4/`; everything but {@link Nfs4StateKnobs.idmap} is structurally a subset
+ * of `Nfs4StateOptions` and is forwarded verbatim to `v4/state.ts`'s
+ * `Nfs4State`. The ID map is the session's own — the state table deals in
+ * client IDs and stateids and has no idea what a uid is — so it is destructured
+ * out before the rest is handed on.
  */
 export interface Nfs4StateKnobs {
+  /** How uids and gids become `owner`/`owner_group` strings. Default: numeric only. */
+  idmap?: Nfs4IdMap | undefined;
   /** Milliseconds since an arbitrary epoch. Default `Date.now`. */
   now?: (() => number) | undefined;
   /** Lease length in seconds. Default 90. */

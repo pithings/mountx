@@ -34,7 +34,7 @@ import {
   RPC_SUCCESS,
 } from "../../../src/nfs/rpc.ts";
 import { NfsSession } from "../../../src/nfs/session.ts";
-import type { FsDriver, FullFsDriver } from "../../../src/types.ts";
+import type { FileHandleLike, FsDriver, FullFsDriver } from "../../../src/types.ts";
 import {
   bitmapHas,
   bitmapOf,
@@ -49,6 +49,14 @@ import {
   ACCESS4_LOOKUP,
   ACCESS4_MODIFY,
   ACCESS4_READ,
+  CLAIM_DELEG_CUR_FH,
+  CLAIM_DELEG_PREV_FH,
+  CLAIM_DELEGATE_CUR,
+  CLAIM_FH,
+  CLAIM_NULL,
+  CLAIM_PREVIOUS,
+  EXCLUSIVE4,
+  EXCLUSIVE4_1,
   FATTR4_CHANGE,
   FATTR4_FILEID,
   FATTR4_MODE,
@@ -57,7 +65,10 @@ import {
   FATTR4_RDATTR_ERROR,
   FATTR4_SIZE,
   FATTR4_SPACE_TOTAL,
+  FATTR4_OWNER_GROUP,
   FATTR4_SUPPORTED_ATTRS,
+  FILE_SYNC4,
+  GUARDED4,
   FATTR4_TIME_ACCESS_SET,
   FATTR4_TIME_MODIFY,
   FATTR4_TIME_MODIFY_SET,
@@ -68,8 +79,23 @@ import {
   NFS4_OK,
   NFS4_PROGRAM,
   NFS4ERR_ATTRNOTSUPP,
+  NFS4ERR_BAD_STATEID,
+  NFS4ERR_BADOWNER,
   NFS4ERR_BADTYPE,
+  NFS4ERR_DENIED,
+  NFS4ERR_EXIST,
+  NFS4ERR_GRACE,
   NFS4ERR_INVAL,
+  NFS4ERR_ISDIR,
+  NFS4ERR_LOCKED,
+  NFS4ERR_LOCKS_HELD,
+  NFS4ERR_NO_GRACE,
+  NFS4ERR_OLD_STATEID,
+  NFS4ERR_OPENMODE,
+  NFS4ERR_REP_TOO_BIG_TO_CACHE,
+  NFS4ERR_SHARE_DENIED,
+  NFS4ERR_SYMLINK,
+  NFS4ERR_WRONG_TYPE,
   NFS4ERR_MINOR_VERS_MISMATCH,
   NFS4ERR_NOENT,
   NFS4ERR_NOFILEHANDLE,
@@ -105,9 +131,11 @@ import {
   OP_OPEN_DOWNGRADE,
   OP_PUTFH,
   OP_PUTROOTFH,
+  OP_LOCK,
   OP_READ,
   OP_READDIR,
   OP_READLINK,
+  OP_RECLAIM_COMPLETE,
   OP_REMOVE,
   OP_RENAME,
   OP_RESTOREFH,
@@ -117,8 +145,29 @@ import {
   OP_SETATTR,
   OP_VERIFY,
   OP_WRITE,
+  OPEN_DELEGATE_NONE,
+  OPEN_DELEGATE_NONE_EXT,
+  OPEN4_CREATE,
+  OPEN4_NOCREATE,
+  OPEN4_RESULT_LOCKTYPE_POSIX,
+  OPEN4_SHARE_ACCESS_BOTH,
+  OPEN4_SHARE_ACCESS_READ,
+  OPEN4_SHARE_ACCESS_WANT_CANCEL,
+  OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
+  OPEN4_SHARE_ACCESS_WANT_READ_DELEG,
+  OPEN4_SHARE_ACCESS_WRITE,
+  OPEN4_SHARE_DENY_NONE,
+  OPEN4_SHARE_DENY_READ,
+  OPEN4_SHARE_DENY_WRITE,
+  READ_LT,
   SET_TO_CLIENT_TIME4,
   SP4_NONE,
+  UNCHECKED4,
+  UNSTABLE4,
+  WND4_CANCELLED,
+  WND4_NOT_WANTED,
+  WND4_RESOURCE,
+  WRITE_LT,
 } from "../../../src/nfs/v4/constants.ts";
 import {
   type Access4res,
@@ -129,6 +178,12 @@ import {
   type ExchangeId4res,
   type Getattr4res,
   type Getfh4res,
+  type Lock4res,
+  type Lockt4res,
+  type Locku4res,
+  type Open4res,
+  type OpenDowngrade4res,
+  type Read4res,
   NFS4_MAX_TAG,
   OP_CODECS,
   type Readdir4res,
@@ -138,8 +193,11 @@ import {
   type Resop4,
   type Secinfo4res,
   type Sequence4res,
+  type Close4res,
   type Setattr4res,
+  type Stateid4,
   type Status4res,
+  type Write4res,
 } from "../../../src/nfs/v4/protocol.ts";
 import { Nfs4Session } from "../../../src/nfs/v4/session.ts";
 import { XdrWriter } from "../../../src/nfs/xdr.ts";
@@ -261,6 +319,36 @@ function readReply(bytes: Uint8Array): Reply {
 /** The status of the resop at `index`, whatever its shape. */
 function statusAt(reply: Reply, index: number): number {
   return (reply.compound.resarray[index]!.res as Status4res).status;
+}
+
+/**
+ * The result for an operation, found by opcode rather than by position.
+ *
+ * The compounds below vary in how many operations it takes to reach the file,
+ * and counting them into an index is how a test ends up asserting against the
+ * wrong operation's result and passing.
+ */
+function resFor<T>(reply: Reply, op: number): T {
+  const found = reply.compound.resarray.find((entry) => entry.op === op);
+  expect(found, `no result for opcode ${op}`).toBeDefined();
+  return found!.res as T;
+}
+
+/** {@link resFor}'s status. */
+function statusFor(reply: Reply, op: number): number {
+  return resFor<Status4res>(reply, op).status;
+}
+
+/** The `fattr4` values of the compound's GETATTR. */
+function attrsFor(reply: Reply): Fattr4Values {
+  const res = resFor<Getattr4res>(reply, OP_GETATTR);
+  expect(res.status).toBe(NFS4_OK);
+  return res.objAttributes!.values;
+}
+
+/** UTF-8 bytes, for the READ and WRITE payloads. */
+function b(text: string): Uint8Array {
+  return new TextEncoder().encode(text);
 }
 
 /** Count every driver method call, so "did this run?" is answerable. */
@@ -751,68 +839,6 @@ describe("operations this server does not run", () => {
     expect(counts.get("unlink")).toBeUndefined();
     expect(await driver.stat("/dir/file")).toBeDefined();
   });
-
-  const ANON = { seqid: 0, other: new Uint8Array(12) };
-  for (const [name, entry] of [
-    [
-      "OPEN",
-      {
-        op: OP_OPEN,
-        args: {
-          seqid: 1,
-          shareAccess: 1,
-          shareDeny: 0,
-          owner: { clientid: 0n, owner: Uint8Array.from([1]) },
-          openhow: { opentype: 0 },
-          claim: { claim: 0, file: "file" },
-        },
-      },
-    ],
-    ["READ", { op: OP_READ, args: { stateid: ANON, offset: 0n, count: 4 } }],
-    [
-      "WRITE",
-      { op: OP_WRITE, args: { stateid: ANON, offset: 0n, stable: 2, data: new Uint8Array(1) } },
-    ],
-    ["CLOSE", { op: OP_CLOSE, args: { seqid: 1, openStateid: ANON } }],
-    [
-      "OPEN_DOWNGRADE",
-      {
-        op: OP_OPEN_DOWNGRADE,
-        args: { openStateid: ANON, seqid: 1, shareAccess: 1, shareDeny: 0 },
-      },
-    ],
-    [
-      "LOCKT",
-      {
-        op: OP_LOCKT,
-        args: {
-          locktype: 1,
-          offset: 0n,
-          length: 1n,
-          owner: { clientid: 0n, owner: Uint8Array.from([2]) },
-        },
-      },
-    ],
-    [
-      "LOCKU",
-      {
-        op: OP_LOCKU,
-        args: { locktype: 1, seqid: 1, lockStateid: ANON, offset: 0n, length: 1n },
-      },
-    ],
-  ] as [string, Op][]) {
-    it(`answers ${name} with NFS4ERR_NOTSUPP for now`, async () => {
-      const { driver, counts } = counting(await populated());
-      const session = new Nfs4Session(driver);
-      const client = await Client.open(session);
-      // The arguments are decoded in full — only the handler is pending — and
-      // the compound halts there, which the trailing GETFH proves.
-      const reply = await client.run([...TO_DIR, entry, { op: OP_GETFH }]);
-      expect(reply.compound.status).toBe(NFS4ERR_NOTSUPP);
-      expect(reply.compound.resarray).toHaveLength(4);
-      expect(counts.get("open")).toBeUndefined();
-    });
-  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1661,5 +1687,1467 @@ describe("the version router", () => {
     await session.destroy();
     expect(session.destroyed).toBe(true);
     expect(session.v4.destroyed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OPEN / CLOSE / OPEN_DOWNGRADE, READ / WRITE, LOCK / LOCKT / LOCKU
+// ---------------------------------------------------------------------------
+
+/**
+ * A client that has finished reclaiming.
+ *
+ * §18.51.3 makes this mandatory rather than tidy: a client "MUST send a
+ * RECLAIM_COMPLETE with rca_one_fs set to FALSE" before its first non-reclaim
+ * lock-obtaining operation "even if there are no locks to reclaim", and the
+ * server answers `NFS4ERR_GRACE` until it does — which is a case of its own
+ * below.
+ */
+async function ready(session: Nfs4Session, ownerid = "test-client"): Promise<Client> {
+  const client = await Client.open(session, ownerid);
+  const done = await client.run([{ op: OP_RECLAIM_COMPLETE, args: { oneFs: false } }]);
+  expect(done.compound.status).toBe(NFS4_OK);
+  return client;
+}
+
+interface OpenOptions {
+  name?: string;
+  access?: number;
+  deny?: number;
+  owner?: number;
+  openhow?: unknown;
+  claim?: unknown;
+}
+
+/** An OPEN operation, with this suite's defaults: read-only, deny nothing, `/dir/file`. */
+function OPEN(options: OpenOptions = {}): Op {
+  return {
+    op: OP_OPEN,
+    args: {
+      // §18.16.3: "The 'seqid' field of the request is not used in NFSv4.1, but
+      // it MAY be any value and the server MUST ignore it" — so a value that
+      // would be wrong in 4.0 goes out deliberately.
+      seqid: 77,
+      shareAccess: options.access ?? OPEN4_SHARE_ACCESS_READ,
+      shareDeny: options.deny ?? OPEN4_SHARE_DENY_NONE,
+      // The clientid here is the one §18.16.3 orders the server to ignore.
+      owner: { clientid: 0xdead_beefn, owner: Uint8Array.from([options.owner ?? 1]) },
+      openhow: options.openhow ?? { opentype: OPEN4_NOCREATE },
+      claim: options.claim ?? { claim: CLAIM_NULL, file: options.name ?? "file" },
+    },
+  };
+}
+
+/** `createhow4` for the two create modes this server implements. */
+function createHow(mode: number, attrs: { bits?: number[]; values?: Fattr4Values } = {}): unknown {
+  return {
+    opentype: OPEN4_CREATE,
+    how: {
+      mode,
+      createattrs: {
+        attrmask: bitmapOf(attrs.bits ?? []),
+        values: attrs.values ?? {},
+        unsupported: [],
+      },
+    },
+  };
+}
+
+/** Open `/dir/file` and hand back the stateid, with the file as the current FH. */
+async function opened(client: Client, options: OpenOptions = {}): Promise<Stateid4> {
+  const reply = await client.run([...TO_DIR, OPEN(options)]);
+  expect(reply.compound.status).toBe(NFS4_OK);
+  return resFor<Open4res>(reply, OP_OPEN).stateid!;
+}
+
+/** A stateid whose seqid is one behind — the `NFS4ERR_OLD_STATEID` shape. */
+function oneBehind(stateid: Stateid4): Stateid4 {
+  return { seqid: stateid.seqid - 1, other: stateid.other };
+}
+
+const ANONYMOUS: Stateid4 = { seqid: 0, other: new Uint8Array(12) };
+const BYPASS: Stateid4 = { seqid: 0xff_ff_ff_ff, other: new Uint8Array(12).fill(0xff) };
+const CURRENT: Stateid4 = { seqid: 1, other: new Uint8Array(12) };
+
+/**
+ * A driver that counts the file handles opened through it and closed again.
+ *
+ * The plain method counter cannot see this: `close` is a method of the
+ * `FileHandleLike` the driver *returns*, not of the driver, so the handle has
+ * to be wrapped as it goes past.
+ */
+function tracked(driver: FullFsDriver): {
+  driver: FsDriver;
+  handles: { opened: number; closed: number };
+} {
+  const handles = { opened: 0, closed: 0 };
+  const wrap = (handle: FileHandleLike): FileHandleLike =>
+    new Proxy(handle, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver) as unknown;
+        if (typeof value !== "function") {
+          return value;
+        }
+        if (property === "close") {
+          return async () => {
+            handles.closed++;
+            await (value as () => Promise<void>).call(target);
+          };
+        }
+        return (value as (...args: unknown[]) => unknown).bind(target);
+      },
+    });
+  const proxy = new Proxy(driver, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver) as unknown;
+      if (typeof value !== "function") {
+        return value;
+      }
+      if (property === "open") {
+        return async (...args: unknown[]) => {
+          const handle = (await (value as (...rest: unknown[]) => Promise<FileHandleLike>).apply(
+            target,
+            args,
+          )) as FileHandleLike;
+          handles.opened++;
+          return wrap(handle);
+        };
+      }
+      return (value as (...args: unknown[]) => unknown).bind(target);
+    },
+  });
+  return { driver: proxy as FsDriver, handles };
+}
+
+describe("OPEN", () => {
+  it("opens an existing file, sets the current filehandle to it, and grants no delegation", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([...TO_DIR, OPEN(), { op: OP_GETFH }, GETATTR([FATTR4_SIZE])]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    const open = resFor<Open4res>(reply, OP_OPEN);
+    // §18.16.3: "Upon success ... the current filehandle is replaced by that of
+    // the created or existing object", which the GETATTR after it proves — the
+    // current FH was `/dir` before the OPEN and the size is `/dir/file`'s.
+    expect(session.handles.resolve(resFor<Getfh4res>(reply, OP_GETFH).object!)).toBe("/dir/file");
+    expect(attrsFor(reply).size).toBe(5n);
+    // §8.2.2: a new set of locks comes back with a seqid of one.
+    expect(open.stateid!.seqid).toBe(1);
+    // §18.16.3 rules OPEN4_RESULT_CONFIRM out for 4.1 and this server claims
+    // only POSIX byte-range semantics.
+    expect(open.rflags).toBe(OPEN4_RESULT_LOCKTYPE_POSIX);
+    // The client asked for no delegation either way, so the plain NONE arm.
+    expect(open.delegation!.delegationType).toBe(OPEN_DELEGATE_NONE);
+    expect(open.attrset).toEqual([]);
+  });
+
+  it("creates with UNCHECKED4, reports only the attributes it set, and moves the directory's change", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const before = await changeOfPath(client);
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({
+        name: "made",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o640 } }),
+      }),
+      GETATTR([FATTR4_MODE, FATTR4_SIZE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    const open = resFor<Open4res>(reply, OP_OPEN);
+    expect(attrsFor(reply).mode).toBe(0o640);
+    // Honest `attrset`: the mode went in as `open`'s argument and is reported;
+    // nothing else was asked for, so nothing else is claimed.
+    expect(open.attrset).toEqual(bitmapOf([FATTR4_MODE]));
+    expect(open.cinfo!.before).toBe(before);
+    expect(open.cinfo!.after).toBe(await changeOfPath(client));
+    expect(open.cinfo!.atomic).toBe(false);
+  });
+
+  it("truncates an existing file on UNCHECKED4 with size zero, and applies nothing else", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, {
+          bits: [FATTR4_SIZE, FATTR4_MODE],
+          values: { size: 0n, mode: 0o600 },
+        }),
+      }),
+      GETATTR([FATTR4_SIZE, FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    const values = attrsFor(reply);
+    // §18.16.3: "When an UNCHECKED4 create encounters an existing file, the
+    // attributes specified by createattrs are not used, except that when
+    // createattrs specifies the size attribute with a size of zero, the
+    // existing file is truncated."
+    expect(values.size).toBe(0n);
+    expect(values.mode).not.toBe(0o600);
+    expect(resFor<Open4res>(reply, OP_OPEN).attrset).toEqual(bitmapOf([FATTR4_SIZE]));
+  });
+
+  it("refuses GUARDED4 over an existing file with NFS4ERR_EXIST, and creates when there is none", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const clash = await client.run([...TO_DIR, OPEN({ openhow: createHow(GUARDED4) })]);
+    // §18.16.3: "If GUARDED4 is specified, the server checks for the presence
+    // of a duplicate object by name before performing the create. If a
+    // duplicate exists, NFS4ERR_EXIST is returned."
+    expect(clash.compound.status).toBe(NFS4ERR_EXIST);
+
+    const fresh = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "guarded", openhow: createHow(GUARDED4) }),
+    ]);
+    expect(fresh.compound.status).toBe(NFS4_OK);
+  });
+
+  it("re-opens the current filehandle with CLAIM_FH", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const first = await client.run([...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }]);
+    expect(first.compound.status).toBe(NFS4_OK);
+    // The file is the current filehandle, and CLAIM_FH names nothing else —
+    // which is what a Linux client sends when it re-opens a file it has.
+    const reply = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "file" } },
+      OPEN({ claim: { claim: CLAIM_FH } }),
+      { op: OP_GETFH },
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(session.handles.resolve(resFor<Getfh4res>(reply, OP_GETFH).object!)).toBe("/dir/file");
+    // No target directory, so nothing to say about one.
+    expect(resFor<Open4res>(reply, OP_OPEN).cinfo).toEqual({
+      atomic: false,
+      before: 0n,
+      after: 0n,
+    });
+  });
+
+  it("refuses a create whose claim carries no name with NFS4ERR_INVAL", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    // §18.16.3: "If opentype is OPEN4_CREATE, then the claim field ... MUST be
+    // one of CLAIM_NULL, CLAIM_DELEGATE_CUR, or CLAIM_DELEGATE_PREV, because
+    // these claim methods include a component of a file name."
+    const reply = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "file" } },
+      OPEN({ claim: { claim: CLAIM_FH }, openhow: createHow(UNCHECKED4) }),
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_INVAL);
+  });
+
+  it("refuses both exclusive create modes with NFS4ERR_INVAL", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
+      const reply = await client.run([
+        ...TO_DIR,
+        OPEN({
+          name: "exclusive",
+          openhow: {
+            opentype: OPEN4_CREATE,
+            how:
+              mode === EXCLUSIVE4
+                ? { mode, createverf: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]) }
+                : {
+                    mode,
+                    createboth: {
+                      verf: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]),
+                      attrs: { attrmask: [], values: {}, unsupported: [] },
+                    },
+                  },
+          },
+        }),
+      ]);
+      // There is nowhere to commit a verifier to. §18.16.4 would have this be
+      // NFS4ERR_NOTSUPP, but §15.2's OPEN row and §15.4's NFS4ERR_NOTSUPP row
+      // both exclude that status for OPEN, and NFS4ERR_INVAL is what §18.16.3
+      // itself gives the neighbouring "this form must not be used here" cases.
+      expect(reply.compound.status).toBe(NFS4ERR_INVAL);
+    }
+    await expect(session.driver.stat("/dir/exclusive")).rejects.toThrow();
+  });
+
+  it("answers a reclaim with NFS4ERR_NO_GRACE, whichever claim asks", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    for (const claim of [
+      { claim: CLAIM_PREVIOUS, delegateType: 0 },
+      { claim: CLAIM_DELEG_PREV_FH },
+    ]) {
+      const reply = await client.run([...TO_DIR, OPEN({ claim })]);
+      // §15.1.9.3: no active grace period, and no role in reclaiming locks.
+      expect(reply.compound.status).toBe(NFS4ERR_NO_GRACE);
+    }
+  });
+
+  it("answers a delegation claim with NFS4ERR_BAD_STATEID, having granted none", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const held = await opened(client);
+    for (const claim of [
+      { claim: CLAIM_DELEGATE_CUR, delegateCurInfo: { delegateStateid: ANONYMOUS, file: "file" } },
+      // Even a stateid this server *did* issue is not a delegation: §8.2.4's
+      // "valid in general but ... not appropriate to the context".
+      { claim: CLAIM_DELEG_CUR_FH, ocDelegateStateid: held },
+    ]) {
+      const reply = await client.run([...TO_DIR, OPEN({ claim })]);
+      expect(reply.compound.status).toBe(NFS4ERR_BAD_STATEID);
+    }
+  });
+
+  it("tells a client that wanted a delegation why it has none", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const asked = await client.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WANT_READ_DELEG }),
+    ]);
+    const wanted = resFor<Open4res>(asked, OP_OPEN).delegation!;
+    // §18.16.3: a client that sends a _WANT_ flag and gets no delegation "MUST"
+    // be answered with OPEN_DELEGATE_NONE_EXT and a reason.
+    expect(wanted.delegationType).toBe(OPEN_DELEGATE_NONE_EXT);
+    expect(wanted.whynone).toEqual({ why: WND4_RESOURCE, serverWillSignalAvail: false });
+
+    const declined = await client.run([
+      ...TO_DIR,
+      OPEN({
+        owner: 2,
+        access: OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
+      }),
+    ]);
+    expect(resFor<Open4res>(declined, OP_OPEN).delegation!.whynone!.why).toBe(WND4_NOT_WANTED);
+
+    const cancelled = await client.run([
+      ...TO_DIR,
+      OPEN({ owner: 3, access: OPEN4_SHARE_ACCESS_READ | OPEN4_SHARE_ACCESS_WANT_CANCEL }),
+    ]);
+    // §18.16.3: "the client specified OPEN4_SHARE_ACCESS_WANT_CANCEL and now
+    // any 'want' for this file object is cancelled" — vacuously true of a
+    // server that registers no wants. (The prose spells the reason
+    // WND4_CANCELED and the XDR spells it WND4_CANCELLED; the constant follows
+    // the XDR.)
+    expect(resFor<Open4res>(cancelled, OP_OPEN).delegation!.whynone!.why).toBe(WND4_CANCELLED);
+  });
+
+  it("refuses a conflicting share reservation across two clients", async () => {
+    const session = new Nfs4Session(await populated());
+    const first = await ready(session, "client-a");
+    const second = await ready(session, "client-b");
+    const held = await first.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_READ, deny: OPEN4_SHARE_DENY_WRITE }),
+    ]);
+    expect(held.compound.status).toBe(NFS4_OK);
+
+    const clash = await second.run([...TO_DIR, OPEN({ access: OPEN4_SHARE_ACCESS_WRITE })]);
+    expect(clash.compound.status).toBe(NFS4ERR_SHARE_DENIED);
+    // The other direction: a deny the first open's own access contradicts.
+    const other = await second.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_READ, deny: OPEN4_SHARE_DENY_READ }),
+    ]);
+    expect(other.compound.status).toBe(NFS4ERR_SHARE_DENIED);
+  });
+
+  it("unions the access of a second OPEN by the same owner, keeping one stateid", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const first = await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    const second = await opened(client, { access: OPEN4_SHARE_ACCESS_WRITE });
+    // §18.16.3: "the stateid returned as an 'other' field that matches that of
+    // the previous open while the 'seqid' field is incremented".
+    expect([...second.other]).toEqual([...first.other]);
+    expect(second.seqid).toBe(first.seqid + 1);
+    // And the union is real: a WRITE through it is allowed where the first
+    // open alone would have been NFS4ERR_OPENMODE.
+    const written = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "file" } },
+      { op: OP_WRITE, args: { stateid: second, offset: 0n, stable: FILE_SYNC4, data: b("Z") } },
+    ]);
+    expect(written.compound.status).toBe(NFS4_OK);
+  });
+
+  it("answers an OPEN before RECLAIM_COMPLETE with NFS4ERR_GRACE", async () => {
+    const session = new Nfs4Session(await populated());
+    // Deliberately *not* `ready`: no RECLAIM_COMPLETE has been sent.
+    const client = await Client.open(session);
+    const reply = await client.run([...TO_DIR, OPEN()]);
+    // §18.51.3: "If non-reclaim locking operations are done before the
+    // RECLAIM_COMPLETE, an NFS4ERR_GRACE error will be returned."
+    expect(reply.compound.status).toBe(NFS4ERR_GRACE);
+  });
+
+  it("refuses to open a directory", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([...TO_DIR, OPEN({ name: "sub" })]);
+    expect(reply.compound.status).toBe(NFS4ERR_ISDIR);
+  });
+});
+
+describe("READ and WRITE", () => {
+  /** Open `/dir/file` for both, leaving it as the current filehandle. */
+  async function readWrite(client: Client): Promise<Stateid4> {
+    return opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+  }
+
+  /** `PUTFH`-free preamble: walk to the file so the current FH is it. */
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  it("writes and reads the bytes back through an open stateid", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await readWrite(client);
+    const written = await client.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid, offset: 1n, stable: UNSTABLE4, data: b("XY") } },
+    ]);
+    expect(written.compound.status).toBe(NFS4_OK);
+    const write = resFor<Write4res>(written, OP_WRITE);
+    expect(write.count).toBe(2);
+    // Table 20 allows a stronger `committed` than the `stable` asked for, and
+    // every driver write is already durable — the claim `../v3/session.ts` makes.
+    expect(write.committed).toBe(FILE_SYNC4);
+    expect([...write.writeverf]).toEqual([...session.writeVerifier]);
+
+    const read = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid, offset: 0n, count: 5 } },
+    ]);
+    const got = resFor<Read4res>(read, OP_READ);
+    expect(new TextDecoder().decode(got.data)).toBe("hXYlo");
+    expect(got.eof).toBe(true);
+  });
+
+  it("is exact about eof at the boundaries", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await readWrite(client);
+    const cases: [number, number, string, boolean][] = [
+      // §18.22.3: eof is TRUE when offset + count reaches the size, and a read
+      // starting at or past the end returns nothing with eof TRUE.
+      [0, 4, "hell", false],
+      [0, 5, "hello", true],
+      [4, 1, "o", true],
+      [5, 4, "", true],
+      [9, 4, "", true],
+      [5, 0, "", true],
+    ];
+    for (const [offset, count, data, eof] of cases) {
+      const reply = await client.run([
+        ...TO_FILE,
+        { op: OP_READ, args: { stateid, offset: BigInt(offset), count } },
+      ]);
+      const read = resFor<Read4res>(reply, OP_READ);
+      expect([new TextDecoder().decode(read.data), read.eof]).toEqual([data, eof]);
+    }
+  });
+
+  it("refuses I/O the open mode does not sanction", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const readOnly = await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    const write = await client.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid: readOnly, offset: 0n, stable: FILE_SYNC4, data: b("!") } },
+    ]);
+    // §9.1.2 makes this a MUST for WRITE-type operations.
+    expect(write.compound.status).toBe(NFS4ERR_OPENMODE);
+
+    const writeOnly = await opened(client, { owner: 2, access: OPEN4_SHARE_ACCESS_WRITE });
+    const read = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: writeOnly, offset: 0n, count: 1 } },
+    ]);
+    // For READ the check is §9.1.2's MAY ("the server may perform the
+    // corresponding check on the access mode, or it may choose to allow READ on
+    // OPENs for OPEN4_SHARE_ACCESS_WRITE"), and this server takes it — which is
+    // what lets it skip the share-reservation check for an open stateid.
+    expect(read.compound.status).toBe(NFS4ERR_OPENMODE);
+  });
+
+  it("refuses a stateid it never issued, and one whose seqid is behind", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const upgraded = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect(upgraded.seqid).toBe(stateid.seqid + 1);
+
+    const bogus = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_READ,
+        args: { stateid: { seqid: 1, other: new Uint8Array(12).fill(7) }, offset: 0n, count: 1 },
+      },
+    ]);
+    expect(bogus.compound.status).toBe(NFS4ERR_BAD_STATEID);
+
+    const stale = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: oneBehind(upgraded), offset: 0n, count: 1 } },
+    ]);
+    expect(stale.compound.status).toBe(NFS4ERR_OLD_STATEID);
+  });
+
+  it("refuses I/O on something that is not an ordinary file", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const reply = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "sub" } },
+      { op: OP_READ, args: { stateid, offset: 0n, count: 1 } },
+    ]);
+    // The type check comes first: §18.22.3's "in the case that the current
+    // filehandle represents an object of type NF4DIR, NFS4ERR_ISDIR".
+    expect(reply.compound.status).toBe(NFS4ERR_ISDIR);
+
+    const link = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "link" } },
+      { op: OP_READ, args: { stateid, offset: 0n, count: 1 } },
+    ]);
+    expect(link.compound.status).toBe(NFS4ERR_SYMLINK);
+  });
+
+  it("answers NFS4ERR_WRONG_TYPE for I/O on something that is neither of those", async () => {
+    // No driver here can make a FIFO — `mountx.mknod` is what CREATE would need
+    // and the memory driver has none — so the type is put on the stat instead.
+    // The rule has three arms and the third would otherwise never be reached.
+    const base = await populated();
+    const driver = new Proxy(base, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver) as unknown;
+        if (property === "lstat") {
+          return async (path: string) => {
+            const stats = await base.lstat(path);
+            return path === "/dir/file"
+              ? { ...stats, mode: (stats.mode & 0o7777) | 0o010_000 }
+              : stats;
+          };
+        }
+        return typeof value === "function"
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    }) as FsDriver;
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: ANONYMOUS, offset: 0n, count: 1 } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_WRONG_TYPE);
+  });
+
+  it("serves anonymous I/O, and refuses it against a share reservation", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const plain = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: ANONYMOUS, offset: 0n, count: 5 } },
+    ]);
+    expect(plain.compound.status).toBe(NFS4_OK);
+    expect(new TextDecoder().decode(resFor<Read4res>(plain, OP_READ).data)).toBe("hello");
+
+    const other = await ready(session, "client-b");
+    expect(
+      (
+        await other.run([
+          ...TO_DIR,
+          OPEN({ access: OPEN4_SHARE_ACCESS_READ, deny: OPEN4_SHARE_DENY_READ }),
+        ])
+      ).compound.status,
+    ).toBe(NFS4_OK);
+
+    const denied = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: ANONYMOUS, offset: 0n, count: 5 } },
+    ]);
+    // §9.1.2: "when the OPEN denies READ or WRITE operations, that denial
+    // results in such operations being rejected with error NFS4ERR_LOCKED".
+    expect(denied.compound.status).toBe(NFS4ERR_LOCKED);
+
+    const bypassed = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: BYPASS, offset: 0n, count: 5 } },
+    ]);
+    // §8.2.3: the all-ones stateid is a READ bypass — "when used in READ, the
+    // server MAY grant access, even if access would normally be denied".
+    expect(bypassed.compound.status).toBe(NFS4_OK);
+  });
+
+  it("gives the all-ones stateid no bypass on a WRITE", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const other = await ready(session, "client-b");
+    expect(
+      (
+        await other.run([
+          ...TO_DIR,
+          OPEN({ access: OPEN4_SHARE_ACCESS_WRITE, deny: OPEN4_SHARE_DENY_WRITE }),
+        ])
+      ).compound.status,
+    ).toBe(NFS4_OK);
+    const reply = await client.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid: BYPASS, offset: 0n, stable: FILE_SYNC4, data: b("!") } },
+    ]);
+    // §18.32.3: "For a WRITE with a stateid value of all bits equal to 1, the
+    // server MUST NOT allow the WRITE operation to bypass locking checks at the
+    // server and otherwise is treated as if a stateid of all bits equal to zero
+    // were used."
+    expect(reply.compound.status).toBe(NFS4ERR_LOCKED);
+  });
+
+  it("clamps a READ to maxread and a WRITE to maxwrite", async () => {
+    const session = new Nfs4Session(await populated(), { rtmax: 3, wtmax: 2 });
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const written = await client.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid, offset: 0n, stable: FILE_SYNC4, data: b("ABCDE") } },
+    ]);
+    // "The server MAY write fewer bytes than requested by the client."
+    expect(resFor<Write4res>(written, OP_WRITE).count).toBe(2);
+
+    const read = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid, offset: 0n, count: 5 } },
+    ]);
+    const got = resFor<Read4res>(read, OP_READ);
+    expect(new TextDecoder().decode(got.data)).toBe("ABl");
+    expect(got.eof).toBe(false);
+  });
+
+  it("refuses an offset past what a driver can name", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const reply = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid, offset: 2n ** 63n, count: 1 } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_INVAL);
+  });
+});
+
+describe("CLOSE and OPEN_DOWNGRADE", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  it("closes an open, and answers the invalid special stateid", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const reply = await client.run([
+      ...TO_FILE,
+      { op: OP_CLOSE, args: { seqid: 99, openStateid: stateid } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // §18.2.4: "the server SHOULD return the invalid special stateid (the
+    // 'other' value is zero and the 'seqid' field is NFS4_UINT32_MAX)".
+    const closed = resFor<Close4res>(reply, OP_CLOSE).openStateid!;
+    expect(closed.seqid).toBe(0xff_ff_ff_ff);
+    expect([...closed.other]).toEqual(Array.from({ length: 12 }, () => 0));
+
+    const again = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid, offset: 0n, count: 1 } },
+    ]);
+    expect(again.compound.status).toBe(NFS4ERR_BAD_STATEID);
+  });
+
+  it("narrows the state on OPEN_DOWNGRADE, and refuses a widening one", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const down = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_OPEN_DOWNGRADE,
+        args: {
+          openStateid: stateid,
+          seqid: 4,
+          shareAccess: OPEN4_SHARE_ACCESS_READ,
+          shareDeny: OPEN4_SHARE_DENY_NONE,
+        },
+      },
+    ]);
+    expect(down.compound.status).toBe(NFS4_OK);
+    const narrowed = resFor<OpenDowngrade4res>(down, OP_OPEN_DOWNGRADE).openStateid!;
+    expect(narrowed.seqid).toBe(stateid.seqid + 1);
+
+    const write = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_WRITE,
+        args: { stateid: narrowed, offset: 0n, stable: FILE_SYNC4, data: b("!") },
+      },
+    ]);
+    // The driver handle behind it is still the wide one; what a WRITE is
+    // checked against is the state, and the state narrowed.
+    expect(write.compound.status).toBe(NFS4ERR_OPENMODE);
+
+    const up = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_OPEN_DOWNGRADE,
+        args: {
+          openStateid: narrowed,
+          seqid: 5,
+          shareAccess: OPEN4_SHARE_ACCESS_BOTH,
+          shareDeny: OPEN4_SHARE_DENY_NONE,
+        },
+      },
+    ]);
+    // §18.18.3: the bits SHOULD be a subset of those already granted, and this
+    // server takes the SHOULD rather than granting an upgrade through the one
+    // operation whose name says it cannot.
+    expect(up.compound.status).toBe(NFS4ERR_INVAL);
+  });
+
+  it("refuses a CLOSE whose stateid names another file", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const reply = await client.run([
+      ...TO_DIR,
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: stateid } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_BAD_STATEID);
+  });
+});
+
+describe("byte-range locks", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  /** A LOCK taking a new lock-owner off an open stateid. */
+  function LOCK(
+    openStateid: Stateid4,
+    options: { type?: number; offset?: bigint; length?: bigint; owner?: number } = {},
+  ): Op {
+    return {
+      op: OP_LOCK,
+      args: {
+        locktype: options.type ?? WRITE_LT,
+        reclaim: false,
+        offset: options.offset ?? 0n,
+        length: options.length ?? 10n,
+        locker: {
+          newLockOwner: true,
+          openOwner: {
+            // The three seqids and the owner's clientid are the fields
+            // §18.10.3 orders the server to ignore; they go out wrong on
+            // purpose.
+            openSeqid: 41,
+            openStateid,
+            lockSeqid: 42,
+            lockOwner: { clientid: 0xdead_beefn, owner: Uint8Array.from([options.owner ?? 5]) },
+          },
+        },
+      },
+    };
+  }
+
+  it("grants a lock, releases exactly the range, and lets CLOSE through afterwards", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const open = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const locked = await client.run([...TO_FILE, LOCK(open)]);
+    expect(locked.compound.status).toBe(NFS4_OK);
+    const lockStateid = resFor<Lock4res>(locked, OP_LOCK).lockStateid!;
+    expect(lockStateid.seqid).toBe(1);
+
+    const held = await client.run([
+      ...TO_FILE,
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: open } },
+    ]);
+    // §9.8, via §18.2.3: "The server MUST return failure if any locks would
+    // exist after the CLOSE."
+    expect(held.compound.status).toBe(NFS4ERR_LOCKS_HELD);
+
+    const unlocked = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCKU,
+        args: { locktype: WRITE_LT, seqid: 8, lockStateid, offset: 0n, length: 10n },
+      },
+    ]);
+    expect(unlocked.compound.status).toBe(NFS4_OK);
+    expect(resFor<Locku4res>(unlocked, OP_LOCKU).lockStateid!.seqid).toBe(2);
+
+    const closed = await client.run([
+      ...TO_FILE,
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: open } },
+    ]);
+    expect(closed.compound.status).toBe(NFS4_OK);
+  });
+
+  it("denies a conflicting lock and names the holder's real client ID", async () => {
+    const session = new Nfs4Session(await populated());
+    const holder = await ready(session, "client-a");
+    const rival = await ready(session, "client-b");
+    const open = await opened(holder, { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect((await holder.run([...TO_FILE, LOCK(open, { owner: 5 })])).compound.status).toBe(
+      NFS4_OK,
+    );
+
+    const rivalOpen = await opened(rival, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const denied = await rival.run([...TO_FILE, LOCK(rivalOpen, { owner: 6, offset: 4n })]);
+    expect(denied.compound.status).toBe(NFS4ERR_DENIED);
+    const body = resFor<Lock4res>(denied, OP_LOCK).denied!;
+    // §18.10.3: "if the server returns NFS4ERR_DENIED, it MUST set the clientid
+    // field of the owner field of the denied field" — to "the actual client
+    // associated with the conflicting lock", which is the *other* client here.
+    expect(body.owner.clientid).toBe(holder.clientid);
+    expect(body.owner.clientid).not.toBe(rival.clientid);
+    expect([...body.owner.owner]).toEqual([5]);
+    expect(body).toMatchObject({ offset: 0n, length: 10n, locktype: WRITE_LT });
+
+    const test = await rival.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCKT,
+        args: {
+          locktype: WRITE_LT,
+          offset: 4n,
+          length: 2n,
+          owner: { clientid: 0xdead_beefn, owner: Uint8Array.from([6]) },
+        },
+      },
+    ]);
+    expect(test.compound.status).toBe(NFS4ERR_DENIED);
+    expect(resFor<Lockt4res>(test, OP_LOCKT).denied!.owner.clientid).toBe(holder.clientid);
+
+    const clear = await rival.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCKT,
+        args: {
+          locktype: WRITE_LT,
+          offset: 20n,
+          length: 2n,
+          owner: { clientid: 0n, owner: Uint8Array.from([6]) },
+        },
+      },
+    ]);
+    // §18.11.3: "If no lock is held, nothing other than NFS4_OK is returned."
+    expect(clear.compound.status).toBe(NFS4_OK);
+    expect(resFor<Lockt4res>(clear, OP_LOCKT).denied).toBeUndefined();
+  });
+
+  it("lets a WRITE through another owner's lock, because the locks are advisory", async () => {
+    // The locks this server grants are advisory in §9.1.2's sense: they "only
+    // prevent the granting of conflicting lock requests and have no effect on
+    // READs or WRITEs". So the thing a competing byte range blocks is the LOCK
+    // — proved above — and *not* the I/O, which is what this checks. A server
+    // implementing mandatory locking would answer NFS4ERR_LOCKED here instead.
+    const session = new Nfs4Session(await populated());
+    const holder = await ready(session, "client-a");
+    const rival = await ready(session, "client-b");
+    const open = await opened(holder, { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect((await holder.run([...TO_FILE, LOCK(open)])).compound.status).toBe(NFS4_OK);
+
+    const rivalOpen = await opened(rival, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const written = await rival.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid: rivalOpen, offset: 0n, stable: FILE_SYNC4, data: b("Q") } },
+    ]);
+    expect(written.compound.status).toBe(NFS4_OK);
+  });
+
+  it("does I/O through a lock stateid, on the open's own handle", async () => {
+    const { driver, handles } = tracked(await populated());
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+    const open = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const openedHandles = handles.opened;
+    const locked = await client.run([...TO_FILE, LOCK(open)]);
+    const lockStateid = resFor<Lock4res>(locked, OP_LOCK).lockStateid!;
+
+    const reply = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: lockStateid, offset: 0n, count: 5 } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // §9.1.2: a lock stateid's access mode is the open's — and so is its handle.
+    expect(handles.opened).toBe(openedHandles);
+  });
+
+  it("refuses a reclaiming LOCK with NFS4ERR_NO_GRACE", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const open = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const reply = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCK,
+        args: {
+          locktype: READ_LT,
+          reclaim: true,
+          offset: 0n,
+          length: 1n,
+          locker: {
+            newLockOwner: true,
+            openOwner: {
+              openSeqid: 0,
+              openStateid: open,
+              lockSeqid: 0,
+              lockOwner: { clientid: 0n, owner: Uint8Array.from([5]) },
+            },
+          },
+        },
+      },
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_NO_GRACE);
+  });
+
+  it("refuses a lock on a directory", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const open = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const reply = await client.run([...TO_DIR, LOCK(open)]);
+    expect(reply.compound.status).toBe(NFS4ERR_ISDIR);
+  });
+});
+
+describe("the current stateid", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  it("passes the stateid an OPEN returned to the READ after it", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    // §16.2.3.1.2, Figure 4: the OPEN sets the current stateid and the READ's
+    // (seqid 1, other 0) means "that one".
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_BOTH }),
+      { op: OP_READ, args: { stateid: CURRENT, offset: 0n, count: 5 } },
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: CURRENT } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(new TextDecoder().decode(resFor<Read4res>(reply, OP_READ).data)).toBe("hello");
+    expect(statusFor(reply, OP_CLOSE)).toBe(NFS4_OK);
+  });
+
+  it("refuses the current stateid when no operation has returned one", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    // §16.2.3.1.2, Figure 6: a LOOKUP sets the current filehandle and clears
+    // the stateid to (0, 0), which is not a stateid to substitute.
+    const reply = await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: CURRENT, offset: 0n, count: 1 } },
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_BAD_STATEID);
+  });
+
+  it("saves and restores the stateid with the filehandle", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_BOTH }),
+      { op: OP_SAVEFH },
+      ...TO_DIR,
+      { op: OP_RESTOREFH },
+      { op: OP_READ, args: { stateid: CURRENT, offset: 0n, count: 5 } },
+    ]);
+    // "The SAVEFH and RESTOREFH operations will save and restore both the
+    // current filehandle and the current stateid as a set."
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(new TextDecoder().decode(resFor<Read4res>(reply, OP_READ).data)).toBe("hello");
+  });
+});
+
+describe("SETATTR with a stateid", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  /** SETATTR of `size`, which is the only attribute the stateid governs. */
+  function TRUNCATE(stateid: Stateid4, size = 0n): Op {
+    return {
+      op: OP_SETATTR,
+      args: {
+        stateid,
+        objAttributes: {
+          attrmask: bitmapOf([FATTR4_SIZE]),
+          values: { size },
+          unsupported: [],
+        },
+      },
+    };
+  }
+
+  it("accepts a valid open stateid and the anonymous one", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const sized = await client.run([...TO_FILE, TRUNCATE(stateid, 2n), GETATTR([FATTR4_SIZE])]);
+    expect(sized.compound.status).toBe(NFS4_OK);
+    expect(attrsFor(sized).size).toBe(2n);
+    // §18.30.3: "When the file size attribute is not set, the special stateid
+    // consisting of all bits equal to zero MAY be passed" — and when it *is*
+    // set, the anonymous stateid is still legal so long as no reservation
+    // denies the write.
+    expect((await client.run([...TO_FILE, TRUNCATE(ANONYMOUS, 1n)])).compound.status).toBe(NFS4_OK);
+  });
+
+  it("refuses a size change the stateid does not sanction", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const readOnly = await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    // §9.1.2: a SETATTR that sets size "has the same locking requirements as a
+    // corresponding WRITE", so the MUST applies.
+    expect((await client.run([...TO_FILE, TRUNCATE(readOnly)])).compound.status).toBe(
+      NFS4ERR_OPENMODE,
+    );
+
+    const both = await opened(client, { owner: 2, access: OPEN4_SHARE_ACCESS_BOTH });
+    const upgraded = await opened(client, { owner: 2, access: OPEN4_SHARE_ACCESS_BOTH });
+    expect(upgraded.seqid).toBe(both.seqid + 1);
+    expect((await client.run([...TO_FILE, TRUNCATE(oneBehind(upgraded))])).compound.status).toBe(
+      NFS4ERR_OLD_STATEID,
+    );
+  });
+
+  it("ignores the stateid when the request does not set size", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_SETATTR,
+        args: {
+          // A stateid this server never issued, which a size change would
+          // refuse — §18.30.3 leaves it unexamined when size is absent.
+          stateid: { seqid: 3, other: new Uint8Array(12).fill(9) },
+          objAttributes: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o604 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(attrsFor(reply).mode).toBe(0o604);
+  });
+});
+
+describe("owner and owner_group mapping", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  /** A tiny two-entry name service, both directions. */
+  const users: Record<number, string> = { 1000: "alice" };
+  const groups: Record<number, string> = { 20: "staff" };
+  const userIds: Record<string, number> = { alice: 1000 };
+  const groupIds: Record<string, number> = { staff: 20 };
+  const idmap = {
+    domain: "example.org",
+    nameOf: (id: number, group: boolean): string | undefined => (group ? groups[id] : users[id]),
+    idOf: (name: string, group: boolean): number | undefined =>
+      group ? groupIds[name] : userIds[name],
+  };
+
+  it("answers with numeric strings when nothing is configured", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([...TO_FILE, GETATTR([FATTR4_OWNER, FATTR4_OWNER_GROUP])]);
+    const values = attrsFor(reply);
+    // §5.9's NFSv3 compatibility form, which is all a server with no name
+    // service can honestly say.
+    expect(values.owner).toMatch(/^\d+$/);
+    expect(values.ownerGroup).toMatch(/^\d+$/);
+  });
+
+  it("qualifies a mapped name with the configured domain, and maps it back", async () => {
+    const session = new Nfs4Session(await populated(), { nfs4: { idmap } });
+    const client = await ready(session);
+    const set = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_SETATTR,
+        args: {
+          stateid: ANONYMOUS,
+          objAttributes: {
+            attrmask: bitmapOf([FATTR4_OWNER, FATTR4_OWNER_GROUP]),
+            values: { owner: "alice@example.org", ownerGroup: "staff@example.org" },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_OWNER, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(set.compound.status).toBe(NFS4_OK);
+    expect(resFor<Setattr4res>(set, OP_SETATTR).attrsset).toEqual(
+      bitmapOf([FATTR4_OWNER, FATTR4_OWNER_GROUP]),
+    );
+    const values = attrsFor(set);
+    expect(values.owner).toBe("alice@example.org");
+    expect(values.ownerGroup).toBe("staff@example.org");
+    expect((await session.driver.stat("/dir/file")).uid).toBe(1000);
+  });
+
+  it("still takes the numeric form, and falls back to it for an unmapped id", async () => {
+    const session = new Nfs4Session(await populated(), { nfs4: { idmap } });
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_SETATTR,
+        args: {
+          stateid: ANONYMOUS,
+          objAttributes: {
+            attrmask: bitmapOf([FATTR4_OWNER]),
+            values: { owner: "4242" },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_OWNER]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // The map has no name for 4242, so §5.9's unqualified numeric form comes
+    // back — "the absence of the @ ... signifies that no translation was
+    // available at the sender".
+    expect(attrsFor(reply).owner).toBe("4242");
+  });
+
+  it("refuses a name it cannot map, and a domain it does not serve", async () => {
+    const session = new Nfs4Session(await populated(), { nfs4: { idmap } });
+    const client = await ready(session);
+    // In order: a local name the map does not know, a domain this server does
+    // not serve, and an unqualified string — which §5.9 defines as meaning "no
+    // translation was available at the sender", never as a name to look up.
+    for (const owner of ["nobody@example.org", "alice@elsewhere.example", "alice"]) {
+      const reply = await client.run([
+        ...TO_FILE,
+        {
+          op: OP_SETATTR,
+          args: {
+            stateid: ANONYMOUS,
+            objAttributes: {
+              attrmask: bitmapOf([FATTR4_OWNER]),
+              values: { owner },
+              unsupported: [],
+            },
+          },
+        },
+      ]);
+      // §5.9: "Servers that do not provide support for all possible values of
+      // the owner and owner_group attributes SHOULD return an error
+      // (NFS4ERR_BADOWNER) when a string is presented that has no translation."
+      expect(reply.compound.status).toBe(NFS4ERR_BADOWNER);
+    }
+  });
+
+  it("refuses an unmappable owner in an OPEN's createattrs", async () => {
+    const session = new Nfs4Session(await populated(), { nfs4: { idmap } });
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({
+        name: "owned",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, {
+          bits: [FATTR4_OWNER],
+          values: { owner: "nobody@example.org" },
+        }),
+      }),
+    ]);
+    // §15.2 lists NFS4ERR_BADOWNER for OPEN as well as for SETATTR and CREATE.
+    expect(reply.compound.status).toBe(NFS4ERR_BADOWNER);
+  });
+});
+
+describe("driver handles", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  it("holds one open handle per open state, and closes it on CLOSE", async () => {
+    const { driver, handles } = tracked(await populated());
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect(handles.opened - handles.closed).toBe(1);
+
+    // Every READ and WRITE goes through that one handle: nothing is opened.
+    const opens = handles.opened;
+    await client.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid, offset: 0n, stable: FILE_SYNC4, data: b("Z") } },
+      { op: OP_READ, args: { stateid, offset: 0n, count: 5 } },
+    ]);
+    expect(handles.opened).toBe(opens);
+
+    const closed = await client.run([
+      ...TO_FILE,
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: stateid } },
+    ]);
+    expect(closed.compound.status).toBe(NFS4_OK);
+    expect(handles.opened).toBe(handles.closed);
+  });
+
+  it("opens one of its own for anonymous I/O, and closes it again", async () => {
+    const { driver, handles } = tracked(await populated());
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+    await client.run([
+      ...TO_FILE,
+      { op: OP_READ, args: { stateid: ANONYMOUS, offset: 0n, count: 5 } },
+    ]);
+    expect(handles.opened).toBe(1);
+    expect(handles.closed).toBe(1);
+  });
+
+  it("re-opens wider when an OPEN upgrades the access", async () => {
+    const { driver, handles } = tracked(await populated());
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+    await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_WRITE });
+    // The narrow handle went as the wide one arrived, and there is still one.
+    expect(handles.opened - handles.closed).toBe(1);
+    const written = await client.run([
+      ...TO_FILE,
+      { op: OP_WRITE, args: { stateid, offset: 0n, stable: FILE_SYNC4, data: b("Z") } },
+    ]);
+    expect(written.compound.status).toBe(NFS4_OK);
+  });
+
+  it("closes what an expired lease revoked", async () => {
+    let now = 0;
+    const { driver, handles } = tracked(await populated());
+    const session = new Nfs4Session(driver, {
+      nfs4: { now: () => now, leaseSeconds: 1 },
+    });
+    const client = await ready(session);
+    await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect(handles.opened - handles.closed).toBe(1);
+
+    // The lease lapses, and the next SEQUENCE revokes what it was holding
+    // (§8.4.3) — which reaches this file through `onOpenReleased`.
+    now = 10_000;
+    const after = await client.run([{ op: OP_PUTROOTFH }]);
+    expect(after.compound.status).toBe(NFS4_OK);
+    expect(handles.opened).toBe(handles.closed);
+  });
+
+  it("closes stragglers on destroy()", async () => {
+    const { driver, handles } = tracked(await populated());
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+    await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect(handles.opened - handles.closed).toBe(1);
+    await session.destroy();
+    expect(handles.opened).toBe(handles.closed);
+    // Idempotent: a second destroy has nothing left to close.
+    await session.destroy();
+    expect(handles.opened).toBe(handles.closed);
+  });
+});
+
+describe("a reply too big to cache", () => {
+  it("answers NFS4ERR_REP_TOO_BIG_TO_CACHE on the operation that overran, and caches that", async () => {
+    const { driver, counts } = counting(await populated());
+    // A cache that fits the SEQUENCE and the PUTROOTFH but not a GETATTR.
+    const session = new Nfs4Session(driver, { nfs4: { maxCachedResponseSize: 96 } });
+    const client = await Client.open(session);
+    const ops: Op[] = [
+      { op: OP_PUTROOTFH },
+      GETATTR([FATTR4_SUPPORTED_ATTRS, FATTR4_CHANGE, FATTR4_SIZE, FATTR4_MODE, FATTR4_OWNER]),
+      { op: OP_GETFH },
+    ];
+    const reply = await client.run(ops, { cachethis: true });
+    // §2.10.6.4: "If the reply exceeds ca_maxresponsesize_cached (and
+    // sa_cachethis ... is TRUE), then the server MUST return
+    // NFS4ERR_REP_TOO_BIG_TO_CACHE."
+    expect(reply.compound.status).toBe(NFS4ERR_REP_TOO_BIG_TO_CACHE);
+    // SEQUENCE, PUTROOTFH, and the GETATTR carrying the status — the GETFH
+    // after it is gone with the rest of the over-sized reply.
+    expect(reply.compound.resarray).toHaveLength(3);
+    expect(reply.compound.resarray[2]!.op).toBe(OP_GETATTR);
+    expect(statusAt(reply, 2)).toBe(NFS4ERR_REP_TOO_BIG_TO_CACHE);
+
+    // "...then the reply MUST be cached if sa_cachethis ... is TRUE": the
+    // retransmission replays those exact bytes and re-runs nothing.
+    const before = counts.get("lstat") ?? 0;
+    const retry = await client.send([
+      client.sequence({ cachethis: true, sequenceid: client.slotSeqid }),
+      ...ops,
+    ]);
+    expect([...retry.body]).toEqual([...reply.body]);
+    expect(counts.get("lstat") ?? 0).toBe(before);
+  });
+
+  it("gives up a result that fits when the status word would not, at the exact band", async () => {
+    // The trim has to leave a reply that is *itself* within the cap, and the
+    // replacement status word is not free. These two caps are the band where
+    // the overrunning result (the READ) cannot be the one replaced — the reply
+    // would come out over the cap by a few bytes, and §2.10.6.4's "then the
+    // reply MUST be cached if sa_cachethis ... is TRUE" would be missed for
+    // want of them — so the PUTFH before it, whose own result fitted, is what
+    // carries the status instead.
+    for (const cap of [64, 70]) {
+      const { driver, counts } = counting(await populated());
+      const session = new Nfs4Session(driver, { nfs4: { maxCachedResponseSize: cap } });
+      const client = await Client.open(session);
+      const found = await client.run([
+        ...TO_DIR,
+        { op: OP_LOOKUP, args: { objname: "file" } },
+        { op: OP_GETFH },
+      ]);
+      const fh = resFor<Getfh4res>(found, OP_GETFH).object!;
+
+      const ops: Op[] = [
+        { op: OP_PUTFH, args: { object: fh } },
+        { op: OP_READ, args: { stateid: ANONYMOUS, offset: 0n, count: 2048 } },
+      ];
+      const reply = await client.run(ops, { cachethis: true });
+      expect(reply.compound.status).toBe(NFS4ERR_REP_TOO_BIG_TO_CACHE);
+      expect(reply.compound.resarray).toHaveLength(2);
+      expect(reply.compound.resarray[1]!.op).toBe(OP_PUTFH);
+      expect(statusAt(reply, 1)).toBe(NFS4ERR_REP_TOO_BIG_TO_CACHE);
+      // The reply that carries the status is small enough to be the one cached,
+      // which is the whole point of trimming it.
+      expect(reply.body.byteLength).toBeLessThanOrEqual(cap);
+
+      const before = counts.get("open") ?? 0;
+      const retry = await client.send([
+        client.sequence({ cachethis: true, sequenceid: client.slotSeqid }),
+        ...ops,
+      ]);
+      expect([...retry.body]).toEqual([...reply.body]);
+      expect(counts.get("open") ?? 0).toBe(before);
+    }
+  });
+
+  it("leaves a reply the client did not ask to cache alone", async () => {
+    const session = new Nfs4Session(await populated(), { nfs4: { maxCachedResponseSize: 96 } });
+    const client = await Client.open(session);
+    const reply = await client.run([
+      { op: OP_PUTROOTFH },
+      GETATTR([FATTR4_SUPPORTED_ATTRS, FATTR4_CHANGE, FATTR4_SIZE, FATTR4_MODE, FATTR4_OWNER]),
+    ]);
+    // No `sa_cachethis`, so §2.10.6.4's rule does not apply and the whole
+    // answer goes out.
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(reply.compound.resarray).toHaveLength(3);
+  });
+});
+
+describe("OPEN, the awkward paths", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  it("refuses a CLAIM_NULL whose current filehandle is not a directory", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([...TO_FILE, OPEN({ name: "under-a-file" })]);
+    expect(reply.compound.status).toBe(NFS4ERR_NOTDIR);
+  });
+
+  it("leaves no open state behind when the driver refuses the handle", async () => {
+    const base = await populated();
+    // Everything works except `open`, which is the one call an OPEN makes
+    // *after* `./state.ts` has already granted the share reservation.
+    const driver = new Proxy(base, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver) as unknown;
+        if (property === "open") {
+          return () => Promise.reject(fsError("EACCES", { message: "EACCES: open" }));
+        }
+        return typeof value === "function"
+          ? (value as (...args: unknown[]) => unknown).bind(target)
+          : value;
+      },
+    }) as FsDriver;
+    const session = new Nfs4Session(driver);
+    const client = await ready(session);
+
+    const plain = await client.run([...TO_DIR, OPEN()]);
+    expect(plain.compound.status).toBe(13); // NFS4ERR_ACCESS
+    // A stateid whose file could not be opened would only be found out about
+    // on the client's first READ.
+    expect(session.state.stateCount).toBe(0);
+
+    const creating = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "never", openhow: createHow(UNCHECKED4) }),
+    ]);
+    expect(creating.compound.status).toBe(13);
+    expect(session.state.stateCount).toBe(0);
+  });
+
+  it("refuses an OPEN_DOWNGRADE of a stateid it never issued", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const reply = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_OPEN_DOWNGRADE,
+        args: {
+          openStateid: { seqid: 1, other: new Uint8Array(12).fill(3) },
+          seqid: 1,
+          shareAccess: OPEN4_SHARE_ACCESS_READ,
+          shareDeny: OPEN4_SHARE_DENY_NONE,
+        },
+      },
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_BAD_STATEID);
+  });
+
+  it("takes a second range through an established lock stateid", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const open = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const first = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCK,
+        args: {
+          locktype: WRITE_LT,
+          reclaim: false,
+          offset: 0n,
+          length: 4n,
+          locker: {
+            newLockOwner: true,
+            openOwner: {
+              openSeqid: 0,
+              openStateid: open,
+              lockSeqid: 0,
+              lockOwner: { clientid: 0n, owner: Uint8Array.from([5]) },
+            },
+          },
+        },
+      },
+    ]);
+    const lockStateid = resFor<Lock4res>(first, OP_LOCK).lockStateid!;
+
+    const second = await client.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCK,
+        args: {
+          locktype: WRITE_LT,
+          reclaim: false,
+          offset: 8n,
+          length: 4n,
+          // The `new_lock_owner == FALSE` arm: an established lock-owner named
+          // by its stateid, with a `lock_seqid` the server must ignore.
+          locker: { newLockOwner: false, lockOwner: { lockStateid, lockSeqid: 99 } },
+        },
+      },
+    ]);
+    expect(second.compound.status).toBe(NFS4_OK);
+    expect(resFor<Lock4res>(second, OP_LOCK).lockStateid!.seqid).toBe(lockStateid.seqid + 1);
   });
 });

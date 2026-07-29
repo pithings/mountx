@@ -76,6 +76,7 @@ import { Nfs4Session } from "./v4/session.ts";
 export { DEFAULT_DTPREF, DEFAULT_RTMAX, DEFAULT_WTMAX } from "./v3/session.ts";
 export { MAX_OFFSET } from "./util.ts";
 export type {
+  Nfs4IdMap,
   Nfs4StateKnobs,
   NfsRequestContext,
   NfsSessionOptions,
