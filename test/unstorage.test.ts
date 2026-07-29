@@ -7,8 +7,12 @@
  * flat key space.
  */
 
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createStorage, prefixStorage } from "unstorage";
+import fsLiteStorageDriver from "unstorage/drivers/fs-lite";
 import memoryStorageDriver from "unstorage/drivers/memory";
 import { createUnstorageDriver } from "../src/drivers/unstorage.ts";
 import { createLoopback } from "../src/harness.ts";
@@ -23,6 +27,34 @@ function setup(options?: Parameters<typeof createUnstorageDriver>[1]): {
 } {
   const storage = createStorage();
   return { fs: createLoopback(createUnstorageDriver(storage, options)), storage };
+}
+
+function setupFailingWrites(): {
+  fs: Loopback;
+  storage: Storage;
+  failNextWrite: () => void;
+} {
+  const backing = memoryStorageDriver();
+  let fail = false;
+  const storage = createStorage({
+    driver: {
+      ...backing,
+      async setItemRaw(key, value, options) {
+        if (fail) {
+          fail = false;
+          throw new Error("transient write failure");
+        }
+        await backing.setItemRaw!(key, value, options);
+      },
+    },
+  });
+  return {
+    fs: createLoopback(createUnstorageDriver(storage)),
+    storage,
+    failNextWrite: () => {
+      fail = true;
+    },
+  };
 }
 
 const read = async (fs: Loopback, path: string): Promise<string> =>
@@ -274,6 +306,124 @@ describe("unstorage driver: handles", () => {
 
     expect(await read(fs, "/target")).toBe("source");
     expect(await storage.hasItem("source")).toBe(false);
+  });
+
+  it("writes an open file back only at its renamed key", async () => {
+    const { fs, storage } = setup();
+    await fs.writeFile("/from", "aaaa");
+    const handle = await fs.open("/from", "r+");
+    await handle.write(new TextEncoder().encode("bb"), 0, 2, 0);
+    await fs.rename("/from", "/to");
+    await handle.write(new TextEncoder().encode("cc"), 0, 2, 2);
+    await handle.close();
+
+    expect(await storage.hasItem("from")).toBe(false);
+    expect(await stored(storage, "to")).toBe("bbcc");
+  });
+
+  it("retries dirty data after a failed last close", async () => {
+    const { fs, storage, failNextWrite } = setupFailingWrites();
+    await fs.writeFile("/f", "aaaa");
+    const handle = await fs.open("/f", "r+");
+    await handle.write(new TextEncoder().encode("bbbb"), 0, 4, 0);
+
+    failNextWrite();
+    await expect(handle.close()).rejects.toThrow("transient write failure");
+    expect(await stored(storage, "f")).toBe("aaaa");
+
+    const retry = await fs.open("/f", "r+");
+    await retry.sync!();
+    await retry.close();
+    expect(await stored(storage, "f")).toBe("bbbb");
+  });
+
+  it("persists path truncation after a failed last close", async () => {
+    const { fs, storage, failNextWrite } = setupFailingWrites();
+    await fs.writeFile("/f", "aaaa");
+    const handle = await fs.open("/f", "r+");
+    await handle.write(new TextEncoder().encode("bbbb"), 0, 4, 0);
+
+    failNextWrite();
+    await expect(handle.close()).rejects.toThrow("transient write failure");
+    await fs.truncate("/f", 2);
+
+    expect(await stored(storage, "f")).toBe("bb");
+    const fresh = createLoopback(createUnstorageDriver(storage));
+    expect(await read(fresh, "/f")).toBe("bb");
+  });
+
+  it("keeps a concurrent write dirty while a flush is pending", async () => {
+    const backing = memoryStorageDriver();
+    let delayNextWrite = false;
+    let reached!: () => void;
+    let resume!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const storage = createStorage({
+      driver: {
+        ...backing,
+        async setItemRaw(key, value, options) {
+          if (delayNextWrite) {
+            delayNextWrite = false;
+            reached();
+            await gate;
+          }
+          await backing.setItemRaw!(key, value, options);
+        },
+      },
+    });
+    const fs = createLoopback(createUnstorageDriver(storage));
+    await fs.writeFile("/f", "aaaa");
+    const first = await fs.open("/f", "r+");
+    const second = await fs.open("/f", "r+");
+    await first.write(new TextEncoder().encode("bbbb"), 0, 4, 0);
+
+    delayNextWrite = true;
+    const syncing = first.sync!();
+    await pending;
+    await second.write(new TextEncoder().encode("cccc"), 0, 4, 0);
+    resume();
+    await syncing;
+    await first.close();
+    await second.close();
+
+    expect(await stored(storage, "f")).toBe("cccc");
+  });
+
+  it("does not keep a clean buffer after a renamed file closes", async () => {
+    const { fs, storage } = setup();
+    await fs.writeFile("/from", "old");
+    const handle = await fs.open("/from", "r");
+    await fs.rename("/from", "/to");
+    await handle.close();
+
+    await storage.setItemRaw("to", new TextEncoder().encode("fresh"));
+    expect(await read(fs, "/to")).toBe("fresh");
+  });
+
+  it("persists a renamed open file through a fresh fs-lite driver", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mountx-unstorage-"));
+    try {
+      const firstStorage = createStorage({ driver: fsLiteStorageDriver({ base: root }) });
+      const first = createLoopback(createUnstorageDriver(firstStorage));
+      await first.writeFile("/from", "aaaa");
+      const handle = await first.open("/from", "r+");
+      await handle.write(new TextEncoder().encode("bb"), 0, 2, 0);
+      await first.rename("/from", "/to");
+      await handle.write(new TextEncoder().encode("cc"), 0, 2, 2);
+      await handle.close();
+
+      const freshStorage = createStorage({ driver: fsLiteStorageDriver({ base: root }) });
+      const fresh = createLoopback(createUnstorageDriver(freshStorage));
+      await expect(fresh.stat("/from")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await read(fresh, "/to")).toBe("bbcc");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
