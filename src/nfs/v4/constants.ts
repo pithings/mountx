@@ -560,6 +560,65 @@ export const CLAIM_FH = 4;
 export const CLAIM_DELEG_CUR_FH = 5;
 export const CLAIM_DELEG_PREV_FH = 6;
 
+/**
+ * `enum limit_by4`, the discriminant of `nfs_space_limit4` (RFC 8881 §18.16.1,
+ * where the declaration sits; the struct that uses it is in §18.16.2's
+ * `open_write_delegation4`).
+ *
+ * A write delegation carries one: the client may buffer writes locally until
+ * the file would exceed this, and must flush to the server before it does.
+ * There is **no zero value** — the union has no default arm either, so a
+ * `limitby` outside this pair is a malformed message rather than a limit the
+ * client can ignore.
+ */
+export const NFS_LIMIT_SIZE = 1;
+export const NFS_LIMIT_BLOCKS = 2;
+
+// ---------------------------------------------------------------------------
+// LOCK / LOCKT / LOCKU (RFC 5662 §2; RFC 8881 §18.10)
+// ---------------------------------------------------------------------------
+
+/**
+ * `enum nfs_lock_type4`.
+ *
+ * One of the few enumerations RFC 8881 never writes out — it names the values
+ * in prose (§9.6, §18.11.3) and leaves the declaration to RFC 5662 §2, which is
+ * where these four numbers are transcribed from.
+ *
+ * The `W` pair is the *blocking* form — "wait for it" — which NFSv4 does not
+ * actually implement as a blocking call: the server answers `NFS4ERR_DENIED`
+ * either way and the client polls (§9.6). The distinction survives on the wire
+ * because a server may use it to decide whether to send `CB_NOTIFY_LOCK`.
+ */
+export const READ_LT = 1;
+export const WRITE_LT = 2;
+export const READW_LT = 3;
+export const WRITEW_LT = 4;
+
+// ---------------------------------------------------------------------------
+// BIND_CONN_TO_SESSION (RFC 8881 §18.34)
+// ---------------------------------------------------------------------------
+
+/**
+ * `enum channel_dir_from_client4` (§18.34.1) — which channels the client wants
+ * this connection bound to.
+ *
+ * Note `CDFC4_BACK_OR_BOTH` is **7, not 4**: the `_OR_BOTH` values are the
+ * plain direction with the other direction's bit permitted alongside it, so
+ * they are `FORE|BACK`-shaped rather than a continuing count. Transcribed
+ * exactly as RFC 5662 writes it, because guessing the next integer here is
+ * precisely the mistake it invites.
+ */
+export const CDFC4_FORE = 0x1;
+export const CDFC4_BACK = 0x2;
+export const CDFC4_FORE_OR_BOTH = 0x3;
+export const CDFC4_BACK_OR_BOTH = 0x7;
+
+/** `enum channel_dir_from_server4` (§18.34.2) — what the server actually bound. */
+export const CDFS4_FORE = 0x1;
+export const CDFS4_BACK = 0x2;
+export const CDFS4_BOTH = 0x3;
+
 // ---------------------------------------------------------------------------
 // EXCHANGE_ID (RFC 8881 §18.35.1)
 // ---------------------------------------------------------------------------

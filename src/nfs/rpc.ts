@@ -87,7 +87,7 @@ export interface OpaqueAuth {
 /** The `AUTH_NONE` credential, and the verifier on every reply we send. */
 export const AUTH_NULL: OpaqueAuth = { flavor: AUTH_NONE, body: new Uint8Array(0) };
 
-/** `struct authsys_parms` (RFC 5531 §8.2), the body of an `AUTH_SYS` credential. */
+/** `struct authsys_parms` (RFC 5531 Appendix A), the body of an `AUTH_SYS` credential. */
 export interface AuthSysParams {
   stamp: number;
   machineName: string;
