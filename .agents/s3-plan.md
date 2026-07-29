@@ -158,7 +158,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       `test/matrix.ts` so `pnpm matrix` grows the column; regenerate
       `.agents/conformance-matrix.md`. Verify: declared capabilities match what
       the session actually answers, none faked.
-- [ ] **9. rclone oracle** — install the static rclone binary user-level
+- [x] **9. rclone oracle** — install the static rclone binary user-level
       (document where in `.agents/environment.md`); `test/s3/oracle.test.ts`
       gated on a `command -v rclone` probe (skips clean when absent, the
       `nfsClientProbe` pattern): copy/ls/sync round-trips, mtime preservation

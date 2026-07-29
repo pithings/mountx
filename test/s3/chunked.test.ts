@@ -36,7 +36,13 @@
  * chunks with this module's own primitives — a round trip, not a golden.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+// The exhaustive sweeps here are O(n²) over the wire length (~2.7 s alone) and
+// share the machine with the rclone oracle's subprocesses under `pnpm test`;
+// the raised default is headroom against that load, not an expectation.
+vi.setConfig({ testTimeout: 30_000 });
+
 import {
   AwsChunkedDecoder,
   type AwsChunkedParams,
