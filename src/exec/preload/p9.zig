@@ -67,10 +67,21 @@ const SOCK_STREAM = 1;
 // ---------------------------------------------------------------------------
 
 pub const P9_RLERROR = 7;
+pub const P9_TSTATFS = 8;
 pub const P9_TLOPEN = 12;
 pub const P9_TLCREATE = 14;
+pub const P9_TSYMLINK = 16;
+pub const P9_TMKNOD = 18;
+pub const P9_TRENAME = 20;
+pub const P9_TREADLINK = 22;
 pub const P9_TGETATTR = 24;
+pub const P9_TSETATTR = 26;
 pub const P9_TREADDIR = 40;
+pub const P9_TFSYNC = 50;
+pub const P9_TLINK = 70;
+pub const P9_TMKDIR = 72;
+pub const P9_TRENAMEAT = 74;
+pub const P9_TUNLINKAT = 76;
 pub const P9_TVERSION = 100;
 pub const P9_TATTACH = 104;
 pub const P9_TWALK = 110;
@@ -83,6 +94,23 @@ pub const P9_MAXWELEM = 16;
 pub const P9_IOHDRSZ = 24;
 /// `P9_GETATTR_BASIC` — everything a `struct stat` needs and nothing reserved.
 pub const P9_GETATTR_BASIC: u64 = 0x0000_07ff;
+
+/// `Tsetattr.valid` bits — `P9_ATTR_*` in the kernel's `fs/9p/vfs_inode_dotl.c`,
+/// spelled after the field each one fills the way `src/9p/constants.ts` spells
+/// them.
+pub const P9_SETATTR_MODE: u32 = 1 << 0;
+pub const P9_SETATTR_UID: u32 = 1 << 1;
+pub const P9_SETATTR_GID: u32 = 1 << 2;
+pub const P9_SETATTR_SIZE: u32 = 1 << 3;
+pub const P9_SETATTR_ATIME: u32 = 1 << 4;
+pub const P9_SETATTR_MTIME: u32 = 1 << 5;
+pub const P9_SETATTR_CTIME: u32 = 1 << 6;
+pub const P9_SETATTR_ATIME_SET: u32 = 1 << 7;
+pub const P9_SETATTR_MTIME_SET: u32 = 1 << 8;
+
+/// `Tunlinkat.flags` — the `AT_REMOVEDIR` of `unlinkat(2)`, and the only flag
+/// the message carries.
+pub const P9_DOTL_AT_REMOVEDIR: u32 = 0x200;
 
 /// Qid type bits, the file-type half of a 9P identity.
 pub const P9_QTDIR: u8 = 0x80;
@@ -226,6 +254,17 @@ pub const Client = struct {
     /// corruption bug that only shows up under load. Checked per request.
     owner_pid: i32 = 0,
     lock: Lock = .{},
+    /// Recycled fid numbers.
+    ///
+    /// A counter that only ever goes up is fine for a spike and wrong for a
+    /// supervisor that outlives a `cp -r`: every walk takes a fid and every
+    /// clunk gives one back, so without recycling a long run climbs towards
+    /// `P9_NOFID` while the server holds nothing. The free list is fixed-size
+    /// on purpose — this struct is embedded in a process that must not depend
+    /// on an allocator — and overflowing it costs a fid number, not
+    /// correctness.
+    free: [256]u32 = undefined,
+    free_len: usize = 0,
     buf: [MSIZE]u8 = undefined,
 
     pub fn connect(self: *Client, path: []const u8) Error!void {
@@ -319,17 +358,43 @@ pub const Client = struct {
     }
 
     pub fn allocFid(self: *Client) u32 {
+        if (self.free_len > 0) {
+            self.free_len -= 1;
+            return self.free[self.free_len];
+        }
         self.next_fid += 1;
         return self.next_fid;
     }
 
-    /// Walk `path` (slash-separated, relative to the attach root) onto a fresh
-    /// fid. A zero-element walk clones the root fid, which is how the root
-    /// itself is reached.
-    pub fn walk(self: *Client, path: []const u8, out_qid: ?*Qid) Error!u32 {
-        const newfid = self.allocFid();
+    /// Hand a fid number back, once the server has forgotten it.
+    ///
+    /// Only ever called after a `Tclunk`, because a number recycled while the
+    /// server still holds it comes back as `EINVAL: fid already in use`.
+    pub fn freeFid(self: *Client, fid: u32) void {
+        if (self.free_len < self.free.len) {
+            self.free[self.free_len] = fid;
+            self.free_len += 1;
+        }
+    }
+
+    /// One `Twalk` of at most `P9_MAXWELEM` names, `from` → `newfid`.
+    ///
+    /// Reports a *partial* walk as `ENOENT` rather than as a short reply: this
+    /// client asked for a path, not a prefix, and `src/9p/session.ts` answers
+    /// `Rwalk` with fewer qids rather than an error because that is the
+    /// protocol's rule. `walked` is how many names actually resolved, which is
+    /// what makes a caller able to tell "the first name failed" from "the
+    /// fourth did" without a second round trip.
+    pub fn walkOnce(
+        self: *Client,
+        from: u32,
+        newfid: u32,
+        path: []const u8,
+        out_qid: ?*Qid,
+        out_walked: ?*u16,
+    ) Error!void {
         var w = Writer{ .buf = &self.buf };
-        w.u32v(self.root_fid);
+        w.u32v(from);
         w.u32v(newfid);
         const count_at = w.at;
         w.u16v(0);
@@ -344,25 +409,86 @@ pub const Client = struct {
         self.buf[count_at + 1] = @truncate(n >> 8);
         var got = try self.roundTrip(&w, P9_TWALK);
         const nwqid = try got[0].u16v();
-        // A partial walk is a failure to *this* client: it asked for a path,
-        // not a prefix. `src/9p/session.ts` answers `Rwalk` with fewer qids
-        // rather than an error, which is the protocol's rule, so the check has
-        // to be here.
+        if (out_walked) |slot| slot.* = nwqid;
+        var last: Qid = .{ .qtype = P9_QTDIR, .version = 0, .path = 0 };
+        var i: u16 = 0;
+        while (i < nwqid) : (i += 1) last = try Qid.read(&got[0]);
         if (nwqid != n) {
             self.last_errno = 2; // ENOENT
             return Error.Remote;
         }
-        var last: Qid = .{ .qtype = P9_QTDIR, .version = 0, .path = 0 };
-        var i: u16 = 0;
-        while (i < nwqid) : (i += 1) last = try Qid.read(&got[0]);
         if (out_qid) |slot| slot.* = last;
+    }
+
+    /// Walk `path` (slash-separated, relative to the attach root) onto a fresh
+    /// fid, in `P9_MAXWELEM`-sized steps. A zero-element walk clones the root
+    /// fid, which is how the root itself is reached.
+    ///
+    /// The walk continues *in place* (`newfid == fid`) after the first step,
+    /// which the protocol allows and the session treats as a clone onto
+    /// itself — so a path of any depth costs one fid rather than one per 16
+    /// components.
+    pub fn walk(self: *Client, path: []const u8, out_qid: ?*Qid) Error!u32 {
+        const newfid = self.allocFid();
+        errdefer self.freeFid(newfid);
+        var from = self.root_fid;
+        var it = Split{ .s = path };
+        var chunk: [P9_MAXWELEM]([]const u8) = undefined;
+        var n: usize = 0;
+        var any = false;
+        var qid: Qid = .{ .qtype = P9_QTDIR, .version = 0, .path = 0 };
+        while (true) {
+            const part = it.next();
+            if (part) |p| {
+                chunk[n] = p;
+                n += 1;
+            }
+            if (n == 0) break;
+            if (part != null and n < P9_MAXWELEM) continue;
+            // `chunk` holds slices of `path`, and `walkOnce` writes them into
+            // the client buffer as it goes, so the join has to happen here
+            // rather than by handing `walkOnce` a second path string.
+            var joined: [4096]u8 = undefined;
+            var at: usize = 0;
+            for (chunk[0..n]) |p| {
+                if (at != 0) {
+                    joined[at] = '/';
+                    at += 1;
+                }
+                if (at + p.len > joined.len) return Error.Protocol;
+                @memcpy(joined[at .. at + p.len], p);
+                at += p.len;
+            }
+            try self.walkOnce(from, newfid, joined[0..at], &qid, null);
+            any = true;
+            from = newfid;
+            n = 0;
+            if (part == null) break;
+        }
+        if (!any) {
+            // The root itself: a zero-element walk, which clones the fid and
+            // answers no qids at all — so the qid, if anybody wants one, has to
+            // come from `Tgetattr` instead.
+            try self.walkOnce(self.root_fid, newfid, "", null, null);
+            if (out_qid != null) qid = try self.getattrQid(newfid);
+        }
+        if (out_qid) |slot| slot.* = qid;
         return newfid;
+    }
+
+    /// The qid of what a fid names, for the one caller that has no walk step to
+    /// take it from.
+    fn getattrQid(self: *Client, fid: u32) Error!Qid {
+        const a = try self.getattr(fid);
+        return a.qid;
     }
 
     pub fn clunk(self: *Client, fid: u32) void {
         var w = Writer{ .buf = &self.buf };
         w.u32v(fid);
-        _ = self.roundTrip(&w, P9_TCLUNK) catch {};
+        // Recycled only on success: a fid the server still holds comes back as
+        // `EINVAL: fid already in use` on the next walk that draws it.
+        if (self.roundTrip(&w, P9_TCLUNK)) |_| self.freeFid(fid) else |_| {}
     }
 
     pub fn getattr(self: *Client, fid: u32) Error!Attr {
@@ -471,6 +597,179 @@ pub const Client = struct {
         if (count > into.len) return Error.Protocol;
         @memcpy(into[0..count], self.buf[HDR + 4 .. HDR + 4 + count]);
         return count;
+    }
+
+    // -----------------------------------------------------------------------
+    // Namespace mutation and metadata
+    //
+    // Every message below is transcribed from `src/9p/protocol.ts` — field
+    // order, field width and all — and the reply of each is either a bare
+    // header or a qid this client does not need, which is why most of them
+    // answer `void`.
+    // -----------------------------------------------------------------------
+
+    /// `Tsetattr` — the one message behind `chmod`, `chown`, `truncate` and
+    /// `utimensat` alike. `valid` says which of the fields that follow mean
+    /// anything; there is no ctime *value*, only a bit asking for "now".
+    pub fn setattr(
+        self: *Client,
+        fid: u32,
+        valid: u32,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        atime_sec: u64,
+        atime_nsec: u64,
+        mtime_sec: u64,
+        mtime_nsec: u64,
+    ) Error!void {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(fid);
+        w.u32v(valid);
+        w.u32v(mode);
+        w.u32v(uid);
+        w.u32v(gid);
+        w.u64v(size);
+        w.u64v(atime_sec);
+        w.u64v(atime_nsec);
+        w.u64v(mtime_sec);
+        w.u64v(mtime_nsec);
+        _ = try self.roundTrip(&w, P9_TSETATTR);
+    }
+
+    pub fn mkdir(self: *Client, dfid: u32, name: []const u8, mode: u32, gid: u32) Error!Qid {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(dfid);
+        w.str(name);
+        w.u32v(mode);
+        w.u32v(gid);
+        var got = try self.roundTrip(&w, P9_TMKDIR);
+        return try Qid.read(&got[0]);
+    }
+
+    /// `Tunlinkat` — `flags` carries exactly one bit, `P9_DOTL_AT_REMOVEDIR`:
+    /// without it this is `unlink`, with it `rmdir`.
+    pub fn unlinkat(self: *Client, dfid: u32, name: []const u8, flags: u32) Error!void {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(dfid);
+        w.str(name);
+        w.u32v(flags);
+        _ = try self.roundTrip(&w, P9_TUNLINKAT);
+    }
+
+    pub fn renameat(
+        self: *Client,
+        olddirfid: u32,
+        oldname: []const u8,
+        newdirfid: u32,
+        newname: []const u8,
+    ) Error!void {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(olddirfid);
+        w.str(oldname);
+        w.u32v(newdirfid);
+        w.str(newname);
+        _ = try self.roundTrip(&w, P9_TRENAMEAT);
+    }
+
+    pub fn symlink(
+        self: *Client,
+        dfid: u32,
+        name: []const u8,
+        target: []const u8,
+        gid: u32,
+    ) Error!Qid {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(dfid);
+        w.str(name);
+        w.str(target);
+        w.u32v(gid);
+        var got = try self.roundTrip(&w, P9_TSYMLINK);
+        return try Qid.read(&got[0]);
+    }
+
+    /// `Tlink` — note the order: the *directory* comes first here and second in
+    /// `Trename`, which is real in `p9_client_link()` and pinned by byte
+    /// fixtures on the TypeScript side.
+    pub fn link(self: *Client, dfid: u32, fid: u32, name: []const u8) Error!void {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(dfid);
+        w.u32v(fid);
+        w.str(name);
+        _ = try self.roundTrip(&w, P9_TLINK);
+    }
+
+    pub fn mknod(
+        self: *Client,
+        dfid: u32,
+        name: []const u8,
+        mode: u32,
+        major: u32,
+        minor: u32,
+        gid: u32,
+    ) Error!Qid {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(dfid);
+        w.str(name);
+        w.u32v(mode);
+        w.u32v(major);
+        w.u32v(minor);
+        w.u32v(gid);
+        var got = try self.roundTrip(&w, P9_TMKNOD);
+        return try Qid.read(&got[0]);
+    }
+
+    /// `Treadlink` — the target, copied into `into`. Never resolved: what the
+    /// link holds is what comes back.
+    pub fn readlink(self: *Client, fid: u32, into: []u8) Error![]const u8 {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(fid);
+        var got = try self.roundTrip(&w, P9_TREADLINK);
+        const target = try got[0].str();
+        if (target.len > into.len) return Error.Protocol;
+        @memcpy(into[0..target.len], target);
+        return into[0..target.len];
+    }
+
+    /// `Tfsync` — `datasync` non-zero asks for `fdatasync(2)` rather than
+    /// `fsync(2)`.
+    pub fn fsync(self: *Client, fid: u32, datasync: u32) Error!void {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(fid);
+        w.u32v(datasync);
+        _ = try self.roundTrip(&w, P9_TFSYNC);
+    }
+
+    /// `Rstatfs`, in the field order `src/9p/protocol.ts`'s `writeRstatfs` uses.
+    pub const Statfs = struct {
+        ftype: u32,
+        bsize: u32,
+        blocks: u64,
+        bfree: u64,
+        bavail: u64,
+        files: u64,
+        ffree: u64,
+        fsid: u64,
+        namelen: u32,
+    };
+
+    pub fn statfs(self: *Client, fid: u32) Error!Statfs {
+        var w = Writer{ .buf = &self.buf };
+        w.u32v(fid);
+        const got = try self.roundTrip(&w, P9_TSTATFS);
+        var r = got[0];
+        return .{
+            .ftype = try r.u32v(),
+            .bsize = try r.u32v(),
+            .blocks = try r.u64v(),
+            .bfree = try r.u64v(),
+            .bavail = try r.u64v(),
+            .files = try r.u64v(),
+            .ffree = try r.u64v(),
+            .fsid = try r.u64v(),
+            .namelen = try r.u32v(),
+        };
     }
 
     /// True when this process is not the one that opened the socket, i.e. we

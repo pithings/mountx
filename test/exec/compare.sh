@@ -82,4 +82,28 @@ for spike in a b c; do
   printf '\n'
 done
 
+say "write-back (does what the command wrote actually reach the driver?)"
+# The axis that separates the three, and the one worth measuring rather than
+# claiming: the seccomp supervisor answered `openat` from an injected `memfd`
+# until this was closed, so every one of these reported success and changed
+# nothing. A mechanism that prints anything but the four expected words here is
+# losing data quietly, which is worse than failing.
+WRITES='
+  echo created > "$MOUNTX_ROOT/w.txt"
+  cat "$MOUNTX_ROOT/w.txt"
+  echo appended >> "$MOUNTX_ROOT/w.txt"
+  tail -1 "$MOUNTX_ROOT/w.txt"
+  printf ab | dd of="$MOUNTX_ROOT/w.txt" bs=1 seek=0 conv=notrunc 2>/dev/null
+  head -c 2 "$MOUNTX_ROOT/w.txt"; echo
+  rm -f "$MOUNTX_ROOT/w.txt"
+  test -e "$MOUNTX_ROOT/w.txt" && echo "STILL THERE" || echo removed
+'
+for spike in a b c; do
+  printf '  spike %s: ' "$spike"
+  timeout 90 node "src/exec/spike-$spike.ts" sh -c "$WRITES" 2>&1 |
+    grep -v '^\[spike' | tr '\n' ' '
+  printf '\n'
+done
+
 say "done — expected sha prefix bfe74807c87a6443, 5 files, 3082 blocks"
+say "     — expected writes: created appended ab removed"
