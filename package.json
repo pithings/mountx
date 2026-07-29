@@ -44,6 +44,10 @@
       "types": "./dist/s3/index.d.mts",
       "default": "./dist/s3/index.mjs"
     },
+    "./exec": {
+      "types": "./dist/exec/index.d.mts",
+      "default": "./dist/exec/index.mjs"
+    },
     "./drivers/memory": {
       "types": "./dist/drivers/memory.d.mts",
       "default": "./dist/drivers/memory.mjs"
