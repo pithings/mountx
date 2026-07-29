@@ -13,7 +13,7 @@ Generated 2026-07-29 with `pnpm matrix`.
 | **9P**       | `test/9p/conformance.test.ts` — 9P2000.L through the codecs, the JS client from `test/9p/client.ts`                                                         | 189 passed, 6 skipped (3 targets: memory driver, over 9P; memory driver with no handles, over 9P; node-fs oracle, over 9P) |
 | **NFSv3**    | `test/nfs/v3/conformance.test.ts` — NFSv3 over a TCP socket, the JS client from `test/nfs/v3/client.ts`                                                     | 122 passed, 8 skipped (2 targets: memory driver, over NFS; node-fs driver, over NFS)                                       |
 | **NFSv4.1**  | `test/nfs/v4/conformance.test.ts` — NFSv4.1 over a TCP socket, the JS client from `test/nfs/v4/client.ts` and the driver over it in `test/nfs/v4/driver.ts` | 122 passed, 8 skipped (2 targets: memory driver, over NFSv4.1; node-fs driver, over NFSv4.1)                               |
-| **S3**       | `test/s3/conformance.test.ts` — an S3 gateway in process, the JS client from `test/s3/client.ts`                                                            | 46 passed, 17 skipped, **2 failed** (1 target: memory driver, over S3)                                                     |
+| **S3**       | `test/s3/conformance.test.ts` — an S3 gateway in process, the JS client from `test/s3/client.ts`                                                            | 48 passed, 17 skipped (1 target: memory driver, over S3)                                                                   |
 
 ## Capability loss
 
@@ -95,19 +95,19 @@ Derived from the run, not declared here: a requirement counts as unmet in a colu
 
 ### rename
 
-| Case                                                     | Needs     | loopback | FUSE | 9P                                                                                                           | NFSv3         | NFSv4.1       | S3       |
-| -------------------------------------------------------- | --------- | -------- | ---- | ------------------------------------------------------------------------------------------------------------ | ------------- | ------------- | -------- |
-| renames a file                                           |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| replaces an existing destination file                    |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| moves a whole subtree                                    |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| keeps an open file attached across rename                | `handles` | pass     | pass | pass (memory driver, over 9P), skip (memory driver with no handles, over 9P), pass (node-fs oracle, over 9P) | skip: handles | skip: handles | **FAIL** |
-| keeps an open file attached across ancestor rename       | `handles` | pass     | pass | pass (memory driver, over 9P), skip (memory driver with no handles, over 9P), pass (node-fs oracle, over 9P) | skip: handles | skip: handles | **FAIL** |
-| renames a directory onto an empty directory              |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| rejects a non-empty destination directory with ENOTEMPTY |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| rejects mismatched types with EISDIR and ENOTDIR         |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| rejects a missing source with ENOENT                     |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| renames a path onto itself as a no-op                    |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
-| rejects moving a directory into itself with EINVAL       |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass     |
+| Case                                                     | Needs     | loopback | FUSE | 9P                                                                                                           | NFSv3         | NFSv4.1       | S3   |
+| -------------------------------------------------------- | --------- | -------- | ---- | ------------------------------------------------------------------------------------------------------------ | ------------- | ------------- | ---- |
+| renames a file                                           |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| replaces an existing destination file                    |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| moves a whole subtree                                    |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| keeps an open file attached across rename                | `handles` | pass     | pass | pass (memory driver, over 9P), skip (memory driver with no handles, over 9P), pass (node-fs oracle, over 9P) | skip: handles | skip: handles | pass |
+| keeps an open file attached across ancestor rename       | `handles` | pass     | pass | pass (memory driver, over 9P), skip (memory driver with no handles, over 9P), pass (node-fs oracle, over 9P) | skip: handles | skip: handles | pass |
+| renames a directory onto an empty directory              |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| rejects a non-empty destination directory with ENOTEMPTY |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| rejects mismatched types with EISDIR and ENOTDIR         |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| rejects a missing source with ENOENT                     |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| renames a path onto itself as a no-op                    |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
+| rejects moving a directory into itself with EINVAL       |           | pass     | pass | pass                                                                                                         | pass          | pass          | pass |
 
 ### hard links
 
