@@ -36,6 +36,10 @@
       "types": "./dist/nfs/index.d.mts",
       "default": "./dist/nfs/index.mjs"
     },
+    "./9p": {
+      "types": "./dist/9p/index.d.mts",
+      "default": "./dist/9p/index.mjs"
+    },
     "./s3": {
       "types": "./dist/s3/index.d.mts",
       "default": "./dist/s3/index.mjs"
@@ -71,9 +75,10 @@
     "test:differential": "sh test/root.sh test/fuse/differential.test.ts",
     "test:mount": "sh test/root.sh test/fuse/mount.test.ts",
     "test:nfs:mount": "sh test/root.sh test/nfs/mount.test.ts",
+    "test:9p:mount": "sh test/root.sh test/9p/mount.test.ts",
     "test:pjdfstest": "sh test/pjdfstest/run.sh",
     "test:rootless": "sh test/rootless.sh test/fuse/mount-rootless.test.ts test/auto-mount.test.ts test/nfs/mount.test.ts",
-    "test:root": "sh test/root.sh test/fuse/mount.test.ts test/fuse/differential.test.ts test/fuse/conformance-mount.test.ts test/nfs/mount.test.ts",
+    "test:root": "sh test/root.sh test/fuse/mount.test.ts test/fuse/differential.test.ts test/fuse/conformance-mount.test.ts test/nfs/mount.test.ts test/9p/mount.test.ts",
     "typecheck": "tsc --noEmit --skipLibCheck"
   },
   "devDependencies": {

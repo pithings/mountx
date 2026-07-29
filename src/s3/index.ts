@@ -1,7 +1,7 @@
 /**
  * The S3 gateway: `mountx/s3`.
  *
- * The third transport over the same `FsDriver`, and the one that is not a
+ * A transport over the same `FsDriver`, and the one that is not a
  * mount: it serves the driver to an S3 client (`rclone`, the AWS CLI, an SDK,
  * a presigned URL in a browser) over HTTP, path-style, one bucket per driver.
  * Nothing here produces a mountpoint, which is why it is deliberately outside

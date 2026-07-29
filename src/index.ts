@@ -9,8 +9,8 @@ export * from "./types.ts";
 // `node:child_process` into every `import … from "mountx"` — ~90 kB — for a
 // name that has to change shape anyway.
 //
-// That second transport now exists, and so does the chooser this comment used
-// to predict: it is `mountx/auto`, not the root export, for the same reason —
-// `src/auto.ts` reaches both transports through `await import()`, so a caller
-// pays for the one it mounts with and nothing else. Importing it from here
-// would undo that.
+// There are three transports now — `mountx/fuse`, `mountx/9p` and `mountx/nfs`
+// — and the chooser this comment used to predict exists too: it is
+// `mountx/auto`, not the root export, for the same reason — `src/auto.ts`
+// reaches every transport through `await import()`, so a caller pays for the
+// one it mounts with and nothing else. Importing it from here would undo that.

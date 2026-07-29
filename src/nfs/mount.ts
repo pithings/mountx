@@ -75,10 +75,10 @@
  * whole thing is idempotent and retryable.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { realpath, stat as statPath } from "node:fs/promises";
 import { resolve as resolveNative } from "node:path";
+import { describe, errorMessage, run, type RunOptions, type SpawnResult } from "../fuse/exec.ts";
 import type { FsDriver } from "../types.ts";
 import { nfsClientProbe, type NfsPlatform, nfsPlatform } from "./probe.ts";
 import { createNfsServer, type NfsServer, type NfsServerOptions } from "./server.ts";
@@ -270,10 +270,6 @@ export async function mountNfs(
   return impl;
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /** `/proc/self/mounts` escapes these four characters in paths. */
 function unescapeMountPath(path: string): string {
   return path.replace(/\\(?:040|011|012|134)/g, (match) =>
@@ -332,7 +328,9 @@ const MOUNT_TABLE_TIMEOUT = 5000;
 /** The mount table, or `undefined` if it could not be read. */
 async function mountTable(platform: NfsPlatform): Promise<MountEntry[] | undefined> {
   if (platform === "darwin") {
-    const result = await run("mount", [], MOUNT_TABLE_TIMEOUT).catch(() => undefined);
+    const result = await run("mount", [], { stdio: CAPTURE, timeout: MOUNT_TABLE_TIMEOUT }).catch(
+      () => undefined,
+    );
     return result === undefined || result.status !== 0
       ? undefined
       : parseMountTable(platform, result.stdout);
@@ -387,77 +385,14 @@ async function isMounted(target: string, platform: NfsPlatform): Promise<boolean
   return entry === null ? undefined : entry !== undefined;
 }
 
-interface SpawnResult {
-  status: number | null;
-  signal: NodeJS.Signals | null;
-  stdout: string;
-  stderr: string;
-  /** The deadline passed with the child still running. See {@link run}. */
-  timedOut: boolean;
-}
-
 /**
- * Run a command and collect both its streams.
+ * The `stdio` every spawn here uses: both streams captured, nothing on stdin.
  *
- * `timeout` **settles** the promise rather than rejecting or waiting for the
- * child, and this is the part that matters: a `umount(8)` blocked inside the
- * kernel does not die on `SIGKILL`, so a run that waited for `close` would
- * never return and a caller that moved on without one would leave a child
- * behind, still holding the very mount the caller is about to escalate
- * against. The kill is sent because usually it works; the result is reported
- * either way, with `timedOut` saying which happened.
+ * `mount(8)`'s stdout is the mount table on macOS, and `umount(8)`'s stderr is
+ * what tells the consent gate apart from a busy mountpoint, so neither can be
+ * thrown away.
  */
-function run(command: string, args: readonly string[], timeout?: number): Promise<SpawnResult> {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, [...args], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    const timer =
-      timeout === undefined
-        ? undefined
-        : setTimeout(() => {
-            child.kill("SIGKILL");
-            // Let go of it completely: an unkillable child must not keep this
-            // process's event loop alive after the caller has given up on it.
-            child.stdout?.destroy();
-            child.stderr?.destroy();
-            child.unref();
-            resolvePromise({
-              status: null,
-              signal: null,
-              stdout,
-              stderr: stderr.trim(),
-              timedOut: true,
-            });
-          }, timeout);
-    timer?.unref();
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      rejectPromise(error);
-    });
-    child.once("close", (status, signal) => {
-      clearTimeout(timer);
-      resolvePromise({ status, signal, stdout, stderr: stderr.trim(), timedOut: false });
-    });
-  });
-}
-
-function describe(command: string, result: SpawnResult): string {
-  const how = result.timedOut
-    ? "no answer before the deadline, still running"
-    : result.signal === null
-      ? `exit ${result.status}`
-      : `signal ${result.signal}`;
-  return result.stderr === "" ? `${command}: ${how}` : `${command}: ${how}: ${result.stderr}`;
-}
+const CAPTURE: RunOptions["stdio"] = ["ignore", "pipe", "pipe"];
 
 /**
  * Does this `umount(8)` failure look like macOS refusing at its consent gate?
@@ -637,7 +572,9 @@ class NfsMountImpl implements NfsMount {
       // Deliberately *not* `-i`: unlike FUSE, the NFS mount genuinely wants its
       // `mount.nfs`/`mount_nfs` helper, which is what resolves the host into
       // the `addr=` the kernel needs and negotiates the version.
-      result = await run("mount", ["-t", "nfs", "-o", options, this.source, this.mountpoint]);
+      result = await run("mount", ["-t", "nfs", "-o", options, this.source, this.mountpoint], {
+        stdio: CAPTURE,
+      });
     } catch (error) {
       throw new Error(`mountx: could not run mount(8): ${errorMessage(error)}`);
     }
@@ -733,7 +670,7 @@ class NfsMountImpl implements NfsMount {
     }
     let result: SpawnResult;
     try {
-      result = await run("umount", [this.mountpoint], deadline);
+      result = await run("umount", [this.mountpoint], { stdio: CAPTURE, timeout: deadline });
     } catch (error) {
       throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
     }
@@ -807,7 +744,7 @@ class NfsMountImpl implements NfsMount {
       }
       // Bounded for the same reason the first `umount` is: a step that never
       // returns must not outlive the ladder it is a step of.
-      const result = await run("umount", args, timeout).catch(() => undefined);
+      const result = await run("umount", args, { stdio: CAPTURE, timeout }).catch(() => undefined);
       if (result !== undefined && isConsentDenial(this.#platform, result.stderr)) {
         denied = result;
       }
