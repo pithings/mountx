@@ -192,3 +192,31 @@ export const UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD";
  * decoder lives in `chunked.ts`.
  */
 export const STREAMING_PAYLOAD = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+/**
+ * The same, plus a trailing-header block after the terminal chunk carrying its
+ * own `x-amz-trailer-signature` (SigV4 streaming specification, "Including
+ * Trailing Headers"). What the AWS CLI sends whenever it computes a checksum.
+ */
+export const STREAMING_PAYLOAD_TRAILER = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+/**
+ * `aws-chunked` framing with a trailing-header block and **no** signatures on
+ * either — what a client sends over TLS, where the transport already covers
+ * what the chunk signatures would.
+ */
+export const STREAMING_UNSIGNED_PAYLOAD_TRAILER = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+
+/**
+ * The `Content-Encoding` token a chunked body carries.
+ *
+ * **A token in a list, not a header value**: `Content-Encoding` is
+ * comma-separated and a client may send `aws-chunked,gzip`, so this is matched
+ * by splitting on commas and trimming, never with `header === AWS_CHUNKED_ENCODING`.
+ *
+ * A body can carry this token with no streaming sentinel in
+ * `x-amz-content-sha256` at all, which is the unsigned framing without
+ * trailers — the one shape `streamingPayloadKind()` cannot see, because it
+ * lives in this header instead.
+ */
+export const AWS_CHUNKED_ENCODING = "aws-chunked";

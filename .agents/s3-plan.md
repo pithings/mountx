@@ -108,7 +108,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       CompleteMultipartUpload); escaping both ways. Tests: round-trips + golden
       fixtures. Verify: fixtures give every field a distinct value; parser is
       bounds-checked against hostile input (no entity expansion, depth-capped).
-- [ ] **3. `src/s3/chunked.ts`** — `aws-chunked` /
+- [x] **3. `src/s3/chunked.ts`** — `aws-chunked` /
       `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` streaming decoder with per-chunk
       signature verification (and unsigned-chunked passthrough), trailer
       handling. Tests: golden frames, split-across-read-boundary cases. Verify:
