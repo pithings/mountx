@@ -206,9 +206,17 @@ export class NfsSession {
    * Resolves to the encoded reply, or `null` for a record too damaged to carry
    * an xid — there is nothing to address a reply to. **Never rejects.**
    *
-   * `message` is read across awaits and must not be overwritten while the
-   * promise is outstanding; everything a session *keeps* — names, `WRITE`
-   * payloads, file handles — is copied out of it by the decoders.
+   * A direct caller must not overwrite `message` while the promise is
+   * outstanding; everything a session *keeps* — names, `WRITE` payloads, file
+   * handles — is copied out of it by the decoders. The transport never has to
+   * think about it: `./rpc.ts`'s `RecordAssembler` hands over a record copied
+   * out of the socket's buffers rather than a view of them.
+   *
+   * The **reply** travels the other way: this forwards whichever versioned
+   * session answered, and both hand back a view of the one `XdrWriter` they
+   * built for that call. Write it to the wire before yielding — the writer is
+   * dropped at `return` so nothing will overwrite it, but nothing copies it for
+   * you either. See `XdrWriter.view()` for the rule.
    */
   async handleCall(
     message: Uint8Array,

@@ -21,11 +21,19 @@ export function resolveCapabilities(driver: FsDriver): ResolvedCapabilities {
   const declared = driver.capabilities ?? {};
   const has = (name: FsDriverMethod): boolean => typeof driver[name] === "function";
   return {
-    // Neither of these can be inferred from the shape of a driver: `open()`
-    // exists on every driver whether or not it returns real per-open state,
-    // and `rename()` exists whether or not it is atomic. Unclaimed means no.
+    // None of these three can be inferred from the shape of a driver.
+    // `open()` exists on every driver whether or not it returns real per-open
+    // state, and `rename()` exists whether or not it is atomic.
+    //
+    // `readOnly` means what its own doc says — *every* mutating operation
+    // answers `EROFS` — and no absence of methods establishes that: a driver
+    // with no `unlink`, `mkdir` or `rename` can still implement `open` for
+    // writing, `truncate` and `chmod`, which is a filesystem you can change,
+    // not a read-only one. The old inference claimed otherwise. Unclaimed
+    // means no, and a genuinely read-only driver says so.
     handles: declared.handles ?? false,
     atomicRename: declared.atomicRename ?? false,
+    readOnly: declared.readOnly ?? false,
     hardlinks: declared.hardlinks ?? has("link"),
     symlinks: declared.symlinks ?? (has("symlink") && has("readlink") && has("lstat")),
     permissions: declared.permissions ?? has("chmod"),
@@ -33,7 +41,6 @@ export function resolveCapabilities(driver: FsDriver): ResolvedCapabilities {
     truncate: declared.truncate ?? has("truncate"),
     caseSensitive: declared.caseSensitive ?? true,
     statfs: declared.statfs ?? has("statfs"),
-    readOnly: declared.readOnly ?? !(has("unlink") || has("mkdir") || has("rename")),
     extensions:
       declared.extensions ?? (Object.keys(driver.mountx ?? {}) as (keyof MountxExtensions)[]),
   };
@@ -57,13 +64,50 @@ const encoder = new TextEncoder();
 
 /** Wrap a driver in the loopback harness. */
 export function createLoopback(driver: FsDriver): Loopback {
+  /**
+   * Bind one driver method, once.
+   *
+   * Whether the driver has a method, and which function it is, cannot change
+   * between calls — so the string-keyed property load, the `typeof` check and
+   * the `bind()` allocation happen here rather than per request. That matters
+   * because all five sessions — FUSE, 9P, NFSv3, NFSv4.1 and S3 — build one
+   * loopback at construction and route every driver call through it.
+   *
+   * The trade is deliberate: the driver's *shape* is read once, so a driver
+   * that grows a method after `createLoopback()` keeps answering `ENOSYS`. A
+   * driver is a value, not a mutable registry, and nothing in this project
+   * (the CLI's `Proxy` wrapper included) hands one over half-built.
+   */
   function use<K extends FsDriverMethod>(name: K): NonNullable<FsDriver[K]> {
     const method = driver[name] as ((...args: never[]) => unknown) | undefined;
     if (typeof method !== "function") {
-      throw fsError("ENOSYS", { syscall: name });
+      // Built per call rather than shared: an `ENOSYS` carries a stack, and a
+      // stack from `createLoopback()` names nothing the caller did.
+      return (() => {
+        throw fsError("ENOSYS", { syscall: name });
+      }) as NonNullable<FsDriver[K]>;
     }
     return method.bind(driver) as NonNullable<FsDriver[K]>;
   }
+
+  const stat = use("stat");
+  const lstat = use("lstat");
+  const statfs = use("statfs");
+  const readdir = use("readdir");
+  const open = use("open");
+  const mkdir = use("mkdir");
+  const rmdir = use("rmdir");
+  const unlink = use("unlink");
+  const rename = use("rename");
+  const link = use("link");
+  const symlink = use("symlink");
+  const readlink = use("readlink");
+  const chmod = use("chmod");
+  const chown = use("chown");
+  const lchown = use("lchown");
+  const truncate = use("truncate");
+  const utimes = use("utimes");
+  const lutimes = use("lutimes");
 
   const loopback: Loopback = {
     driver,
@@ -72,28 +116,27 @@ export function createLoopback(driver: FsDriver): Loopback {
 
     // Every wrapper is `async` so that a missing method rejects rather than
     // throwing synchronously: callers only ever have to handle one of the two.
-    stat: async (path) => use("stat")(normalizePath(path)),
-    lstat: async (path) => use("lstat")(normalizePath(path)),
-    statfs: async (path) => use("statfs")(normalizePath(path)),
-    readdir: async (path, options) => use("readdir")(normalizePath(path), options),
-    open: async (path, flags, mode) => use("open")(normalizePath(path), flags, mode),
-    mkdir: async (path, options) => use("mkdir")(normalizePath(path), options),
-    rmdir: async (path) => use("rmdir")(normalizePath(path)),
-    unlink: async (path) => use("unlink")(normalizePath(path)),
-    rename: async (oldPath, newPath) =>
-      use("rename")(normalizePath(oldPath), normalizePath(newPath)),
+    stat: async (path) => stat(normalizePath(path)),
+    lstat: async (path) => lstat(normalizePath(path)),
+    statfs: async (path) => statfs(normalizePath(path)),
+    readdir: async (path, options) => readdir(normalizePath(path), options),
+    open: async (path, flags, mode) => open(normalizePath(path), flags, mode),
+    mkdir: async (path, options) => mkdir(normalizePath(path), options),
+    rmdir: async (path) => rmdir(normalizePath(path)),
+    unlink: async (path) => unlink(normalizePath(path)),
+    rename: async (oldPath, newPath) => rename(normalizePath(oldPath), normalizePath(newPath)),
     link: async (existingPath, newPath) =>
-      use("link")(normalizePath(existingPath), normalizePath(newPath)),
+      link(normalizePath(existingPath), normalizePath(newPath)),
     // The target of a symlink is opaque: it may be relative, and it is only
     // resolved when something walks through it.
-    symlink: async (target, path, type) => use("symlink")(target, normalizePath(path), type),
-    readlink: async (path) => use("readlink")(normalizePath(path)),
-    chmod: async (path, mode) => use("chmod")(normalizePath(path), mode),
-    chown: async (path, uid, gid) => use("chown")(normalizePath(path), uid, gid),
-    lchown: async (path, uid, gid) => use("lchown")(normalizePath(path), uid, gid),
-    truncate: async (path, length) => use("truncate")(normalizePath(path), length),
-    utimes: async (path, atime, mtime) => use("utimes")(normalizePath(path), atime, mtime),
-    lutimes: async (path, atime, mtime) => use("lutimes")(normalizePath(path), atime, mtime),
+    symlink: async (target, path, type) => symlink(target, normalizePath(path), type),
+    readlink: async (path) => readlink(normalizePath(path)),
+    chmod: async (path, mode) => chmod(normalizePath(path), mode),
+    chown: async (path, uid, gid) => chown(normalizePath(path), uid, gid),
+    lchown: async (path, uid, gid) => lchown(normalizePath(path), uid, gid),
+    truncate: async (path, length) => truncate(normalizePath(path), length),
+    utimes: async (path, atime, mtime) => utimes(normalizePath(path), atime, mtime),
+    lutimes: async (path, atime, mtime) => lutimes(normalizePath(path), atime, mtime),
 
     async readFile(path) {
       const handle = await loopback.open(path, "r");

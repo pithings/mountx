@@ -311,10 +311,13 @@ rather than by accident.
 - **`FUSE_PASSTHROUGH`** (Linux 6.9+) — lets the kernel bypass the daemon
   for read/write on a backing fd; relevant for overlay-shaped drivers.
 - **`FUSE_READDIRPLUS_AUTO` default.** Benchmarked as actively costing the
-  readdirplus win: a cold 1000-entry `ls -l` gets 10.3k entries/s with it
-  on vs. 25.0k (the predicted 2.4×) with it off, at a ~20% cost to a
-  names-only `readdir`. Not changed in v1 — see `.agents/benchmarks.md` for
-  the numbers — but it is the best-supported open question in the repo.
+  readdirplus win: a cold 1000-entry `ls -l` gets 9.6k entries/s with it
+  on vs. 25.0k (the predicted 2.4×, measured 2.6×) with it off, at a 1.56×
+  cost to a names-only `readdir`. Measured on two trees in one sitting
+  (2.6× and 2.47×), so the finding replicates; the cost side grew from
+  1.32× because `7185f33` made the plain-`READDIR` path 1.20× faster and
+  left the plus path alone. Not changed in v1 — see `.agents/benchmarks.md`
+  for the numbers — but it is the best-supported open question in the repo.
 - **unstorage driver adapter** — deferred per the drivers-in-v1 decision
   above; would make 30+ storage backends mountable with no new code.
 - **`mountx/drivers/s3`** — an `FsDriver` over a real S3-compatible bucket,
@@ -325,10 +328,21 @@ rather than by accident.
 - **Negative-entry caching.** Nothing currently populates FUSE's negative
   dentry cache for lookups that miss, so a repeated failed `LOOKUP` always
   reaches the driver.
-- **Handle-table / file-handle growth bound.** NFSv3 has no `FORGET`, so a
-  handle entry lives as long as the server — a real, bounded leak (one per
-  path the client ever named), accepted as the honest v1 tradeoff. A
-  generation-stamped LRU is the fix if a workload needs bounded memory.
+- **Handle-table growth bound.** Neither NFS version has a `FORGET`, so
+  nothing tells the server a client is done with a handle. Half of this is
+  now closed: `FileHandleTable.#detachPath` drops an entry once its last path
+  is detached, since such an entry could only ever be reached by `decode()` →
+  `pathOf()` and that always threw `ESTALE` — ids come off a monotonic
+  counter and are never reused, so the same handle still answers `ESTALE`,
+  from `decode()` ("unknown file handle") one step earlier. Create/delete
+  churn under a mount therefore no longer grows the table without bound.
+  What is left is genuinely bounded: **one entry per path a client currently
+  has a name for**, held for the life of the server however long ago the
+  client looked, plus the root entry, which is exempt from eviction because
+  `PUTROOTFH`/`PUTPUBFH`/`MNT` encode it from a field rather than from a
+  lookup. A generation-stamped LRU is still the fix if a workload needs a
+  bound on _that_ — it is the only remaining growth, and it is the one an
+  LRU can serve without breaking a live client.
 - **Set-gid inheritance and caller credentials in the driver interface.** A
   new entry in a set-gid directory should take its parent's group; more
   generally, supplementary groups and per-call caller credentials want to

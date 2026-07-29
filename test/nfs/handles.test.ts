@@ -144,6 +144,83 @@ describe("identity", () => {
     const entry = table.bind("/b", stats(5, 0));
     expect([...entry.paths]).toEqual(["/a", "/b"]);
   });
+
+  it("carries the fileid every version reports, and refreshes it on rebind", () => {
+    const table = new FileHandleTable();
+    expect(table.bind("/a", stats(7)).fileid).toBe(7n);
+    // No `ino` on offer is a driver with no identity, and the entry id is what
+    // both sessions substitute.
+    const anonymous = table.bind("/b", stats(0));
+    expect(anonymous.fileid).toBe(anonymous.id);
+  });
+});
+
+/**
+ * The half of the lifetime rule that is not "nothing is ever dropped".
+ *
+ * An entry whose last name is gone can only be reached through `decode()` →
+ * `pathOf()`, and `pathOf()` always throws `ESTALE` for it — so keeping it
+ * bought nothing and cost one entry per name the client had ever seen, with no
+ * bound at all under create/delete churn.
+ */
+describe("path-less entries", () => {
+  it("frees an entry whose last name is gone, so churn does not grow the table", () => {
+    const table = new FileHandleTable();
+    const handles: Uint8Array[] = [];
+    for (let index = 0; index < 100; index++) {
+      const path = `/build/tmp${index}`;
+      const entry = table.bind(path, stats(1000 + index));
+      handles.push(table.encode(entry));
+      table.unbind(path);
+      expect(table.get(entry.id)).toBeUndefined();
+    }
+    // The root and nothing else. Before this, 101 — one per file the churn ever
+    // touched, none of them reachable.
+    expect(table.size).toBe(1);
+    expect(table.pathCount).toBe(1);
+
+    // And every handle the client kept still answers `ESTALE`, which is the
+    // whole reason dropping them is safe: the message moves from `pathOf` to
+    // `decode`, the status does not.
+    for (const fh of handles) {
+      expect(() => table.decode(fh)).toThrow(
+        expect.objectContaining({ code: "ESTALE", errno: -116 }),
+      );
+    }
+  });
+
+  it("keeps an entry while any of its names is left", () => {
+    const table = new FileHandleTable();
+    const entry = table.bind("/a", stats(5, 2));
+    table.bind("/b", stats(5, 2));
+    table.unbind("/a");
+    expect(table.get(entry.id)).toBe(entry);
+    expect(table.resolve(table.encode(entry))).toBe("/b");
+  });
+
+  it("never hands a freed id to a later file", () => {
+    const table = new FileHandleTable();
+    const gone = table.bind("/a", stats(5));
+    const fh = table.encode(gone);
+    table.unbind("/a");
+    // The same `ino`, straight back from the driver — which is what a real
+    // filesystem does. Ids come off a counter that only goes up, so the dead
+    // handle cannot alias the new file however the identities line up.
+    const fresh = table.bind("/b", stats(5));
+    expect(fresh.id).not.toBe(gone.id);
+    expect(() => table.decode(fh)).toThrow(/unknown file handle/);
+  });
+
+  it("never frees the root, whose handle is handed out without a lookup", () => {
+    const table = new FileHandleTable();
+    table.bind("/", stats(2, 1, S_IFDIR | 0o755));
+    // The driver's root turns out to be a different object than it was, so `/`
+    // is detached from the entry holding it — which happens to be the one entry
+    // `PUTROOTFH` and `MNT` encode from a field rather than from a lookup. It
+    // has to stay decodable, or this server mints a handle it then refuses.
+    table.bind("/", stats(9, 1, S_IFDIR | 0o755));
+    expect(table.decode(table.encode(table.root))).toBe(table.root);
+  });
 });
 
 describe("rename", () => {

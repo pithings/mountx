@@ -1,13 +1,34 @@
 /**
- * The FUSE protocol layer: wire-format codecs and `FUSE_INIT` negotiation.
+ * The FUSE transport: `mountx/fuse`.
  *
- * Pure data transformation with no I/O, no syscalls and no mount — it runs on
- * any OS. This is a documented public layer (`mountx/fuse`), because
- * low-level access is a feature: notifies, custom opcodes and record/replay
- * tooling all need it.
+ * The first transport over the `FsDriver` interface, and the only one the
+ * kernel talks to directly. Layered the way all four transports are — this is
+ * the one that set the shape:
  *
- * The session layer sits on top of the same codecs: it turns a driver into
- * something that answers FUSE messages, still without touching `/dev/fuse`.
+ * - `constants.ts` — opcodes and flags, transcribed from the kernel's
+ *   `include/uapi/linux/fuse.h` (v6.12, protocol 7.41).
+ * - `protocol.ts` — every struct encoded *and* decoded, plus framing and
+ *   dirent packing; `notify.ts` — the two invalidation codecs; `init.ts` —
+ *   `FUSE_INIT` negotiation, pure; `flags.ts` — the crossing between the
+ *   wire's `O_*` and the host's.
+ * - `inodes.ts` — the nodeid table: paths, `(dev, ino)` identity, lookup
+ *   refcounts, subtree remap on rename.
+ * - `session.ts` — bytes in, bytes out: the protocol over a driver, with no
+ *   `/dev/fuse` anywhere. `record.ts` — the same traffic as a file, and a file
+ *   replayed back through a session, with no kernel, no mount and no root.
+ * - `mount.ts` — the mount itself: `/dev/fuse`, `mount(8)` or `fusermount3`,
+ *   and the teardown state machine, with `fusermount.ts`, `exec.ts` and
+ *   `native.ts` behind it. This is the one path here that opens a device,
+ *   spawns a process or reaches the native addon, and re-exporting it is why
+ *   importing `mountx/fuse` pulls `node:fs`, `node:fs/promises`, `node:path`,
+ *   `node:child_process` and `#unfs/native` — the transport's own cost, paid on
+ *   the transport's own subpath. The root `mountx` export reaches none of it.
+ *
+ * Everything except that last bullet runs on any OS with no privileges, which
+ * is what makes the whole protocol testable with no kernel in the loop.
+ * Low-level access is a documented feature — notifies, custom opcodes and
+ * record/replay tooling all need it — which is why the codecs are on the public
+ * subpath and not just behind `mount()`.
  */
 
 export * from "./constants.ts";

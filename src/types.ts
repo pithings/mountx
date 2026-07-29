@@ -112,7 +112,9 @@ export type TimeLike = number | Date;
  *
  * Transports adapt or answer `ENOTSUP`; silently faking a capability is how a
  * filesystem passes `ls` and corrupts data under `git`. Unset means "infer it"
- * (see `resolveCapabilities`), not "false".
+ * (see `resolveCapabilities`), not "false" — except for `handles`,
+ * `atomicRename` and `readOnly`, which no shape of a driver establishes and
+ * which therefore default to `false` until they are claimed.
  */
 export interface FsCapabilities {
   /** `open()` returns real per-open state that survives `unlink`. */
@@ -133,7 +135,7 @@ export interface FsCapabilities {
   caseSensitive?: boolean;
   /** `statfs()` returns meaningful numbers. */
   statfs?: boolean;
-  /** Every mutating operation answers `EROFS`. */
+  /** Every mutating operation answers `EROFS`. Never inferred — say it. */
   readOnly?: boolean;
   /** Optional `mountx.*` extensions the driver implements. */
   extensions?: readonly (keyof MountxExtensions)[];
@@ -143,10 +145,22 @@ export interface FsCapabilities {
  * The optional extension namespace for what `node:fs` genuinely does not
  * cover. Transports probe for each member and degrade without it.
  *
- * Types only for now — no transport implements these yet. Deliberately just
- * the path-shaped gaps: locks, `fallocate`, `lseek` and cache-invalidation
- * notifies are per-open-file or session-scoped, so they get designed with the
- * session layer rather than guessed at here.
+ * Both members are live. `mknod` is consumed by all three mount transports —
+ * four sessions, counting NFSv3 and NFSv4.1 separately — and by none of them
+ * is it optional decoration: without it every one of them can create a regular
+ * file and nothing else. The S3 gateway is the transport that does not appear
+ * here, and cannot: object storage has no way to name a FIFO or a device node.
+ * `utimens` is consumed by the two wires that carry nanoseconds, FUSE's
+ * `SETATTR` and 9P's `Tsetattr` (NFS's `SETATTR` carries them too, but its
+ * sessions have not adopted the extension).
+ *
+ * Nothing here is speculative — the four `xattr` calls were, and were removed
+ * rather than left as a surface with no consumer. Re-adding them is type-only,
+ * and belongs with the session work that would answer the opcodes.
+ *
+ * Deliberately just the path-shaped gaps: locks, `fallocate`, `lseek` and
+ * cache-invalidation notifies are per-open-file or session-scoped, so they get
+ * designed with the session layer rather than guessed at here.
  */
 export interface MountxExtensions {
   /** Nanosecond timestamps; `fs.utimes` takes float seconds and loses them. */
@@ -158,10 +172,6 @@ export interface MountxExtensions {
   ): Promise<void>;
   /** FIFOs, sockets and device nodes. */
   mknod?(path: string, mode: number, dev: number): Promise<void>;
-  getxattr?(path: string, name: string): Promise<Uint8Array>;
-  setxattr?(path: string, name: string, value: Uint8Array, flags?: number): Promise<void>;
-  listxattr?(path: string): Promise<string[]>;
-  removexattr?(path: string, name: string): Promise<void>;
 }
 
 /**

@@ -26,7 +26,10 @@
  *   {@link ProtocolError} and nothing else — never a `RangeError`, never silent
  *   garbage.
  * - **Decoders copy.** Byte payloads are copied out of the input so a transport
- *   can reuse its receive buffer.
+ *   can reuse its receive buffer. The one exception is documented where it
+ *   lives: {@link FuseRequest.payload} copies lazily on first read, because
+ *   nothing on the mount path reads it and `body` already carries the copy the
+ *   session keeps.
  * - Names are decoded as UTF-8 `string`s (lossy for names that are not valid
  *   UTF-8 — see IDEA.md's note that keys are really bytes) and may not contain
  *   a NUL.
@@ -461,12 +464,37 @@ export function decodeOutHeader(buffer: Uint8Array): FuseOutHeader {
   return header;
 }
 
+/**
+ * Write a `fuse_out_header` into the front of a buffer the caller already owns.
+ *
+ * The in-place half of {@link encodeOutHeader}, and the reason it exists: a
+ * reply is a header followed by a body, so a caller that can size the body up
+ * front should allocate `FUSE_OUT_HEADER_SIZE + n` **once** and fill the body
+ * region in place rather than encoding a 16-byte header, allocating a second
+ * buffer and copying the body into it. See {@link allocReply}, which pairs the
+ * allocation with this write; `encodeNotify` uses this directly, since a
+ * notification is the same framing with a different `error`/`unique`.
+ *
+ * Writes exactly the first `FUSE_OUT_HEADER_SIZE` bytes of `target` and nothing
+ * else — the body region is left alone, whether it has been filled yet or not.
+ */
+export function writeOutHeaderInto(target: Uint8Array, header: FuseOutHeader): void {
+  if (target.length < FUSE_OUT_HEADER_SIZE) {
+    throw new ProtocolError(
+      `fuse_out_header needs ${FUSE_OUT_HEADER_SIZE} bytes, target holds ${target.length}`,
+    );
+  }
+  const view = new DataView(target.buffer, target.byteOffset, FUSE_OUT_HEADER_SIZE);
+  view.setUint32(0, header.len, true);
+  view.setInt32(4, header.error, true);
+  // `asUintN` rather than letting `setBigUint64` throw — same rule as `Writer`.
+  view.setBigUint64(8, BigInt.asUintN(64, header.unique), true);
+}
+
 export function encodeOutHeader(header: FuseOutHeader): Uint8Array {
-  const w = new Writer(FUSE_OUT_HEADER_SIZE);
-  w.u32(header.len);
-  w.i32(header.error);
-  w.u64(header.unique);
-  return w.done();
+  const bytes = new Uint8Array(FUSE_OUT_HEADER_SIZE);
+  writeOutHeaderInto(bytes, header);
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,13 +517,69 @@ export function fuseErrno(code: ErrnoCode | number): number {
   return -value;
 }
 
+/**
+ * A reply buffer under construction: one allocation, addressed two ways.
+ *
+ * `message` is what goes on the wire; `body` is the same memory past the
+ * header, which is the only part a caller fills.
+ */
+export interface FuseReplyBuffer {
+  /** Header **and** body — `FUSE_OUT_HEADER_SIZE + size` bytes. */
+  readonly message: Uint8Array;
+  /** The body region to fill: `message.subarray(FUSE_OUT_HEADER_SIZE)`. */
+  readonly body: Uint8Array;
+}
+
+/**
+ * Allocate a framed reply of `size` body bytes, header included, in one buffer.
+ *
+ * The point is that the caller fills {@link FuseReplyBuffer.body} **in place**
+ * — hand it straight to a driver's `read`, pack dirents into it — and then
+ * calls {@link finishReply}, which writes the header into the front of that
+ * same buffer. `encodeReply(unique, body)` is the two-allocation form of the
+ * same thing and stays for callers that already hold an encoded body.
+ *
+ * The buffer is zeroed, as every `new Uint8Array` is; a short fill therefore
+ * leaves zeroes past `bytesUsed`, and {@link finishReply} trims them off rather
+ * than sending them.
+ */
+export function allocReply(size: number): FuseReplyBuffer {
+  if (!Number.isSafeInteger(size) || size < 0) {
+    throw new ProtocolError(`reply body size must be a non-negative integer, got ${size}`);
+  }
+  const message = new Uint8Array(FUSE_OUT_HEADER_SIZE + size);
+  return { message, body: message.subarray(FUSE_OUT_HEADER_SIZE) };
+}
+
+/**
+ * Write the `fuse_out_header` into an {@link allocReply} buffer and hand back
+ * the bytes to send.
+ *
+ * `bytesUsed` defaults to the whole body and exists for the **short fill**: a
+ * `READ` asks for `size` bytes and a driver may return fewer, so both
+ * `fuse_out_header.len` and the returned subarray must describe `bytesUsed`,
+ * not what was allocated. Anything past it is left in the buffer and never
+ * reaches the kernel.
+ */
+export function finishReply(
+  reply: FuseReplyBuffer,
+  unique: bigint,
+  bytesUsed: number = reply.body.length,
+): Uint8Array {
+  if (!Number.isSafeInteger(bytesUsed) || bytesUsed < 0 || bytesUsed > reply.body.length) {
+    throw new ProtocolError(`reply used ${bytesUsed} of a ${reply.body.length}-byte body`);
+  }
+  const len = FUSE_OUT_HEADER_SIZE + bytesUsed;
+  writeOutHeaderInto(reply.message, { len, error: 0, unique });
+  return len === reply.message.length ? reply.message : reply.message.subarray(0, len);
+}
+
 /** A successful reply: `fuse_out_header` plus an optional body. */
 export function encodeReply(unique: bigint, body?: Uint8Array): Uint8Array {
   const payload = body ?? EMPTY_BYTES;
-  const message = new Uint8Array(FUSE_OUT_HEADER_SIZE + payload.length);
-  message.set(encodeOutHeader({ len: message.length, error: 0, unique }));
-  message.set(payload, FUSE_OUT_HEADER_SIZE);
-  return message;
+  const reply = allocReply(payload.length);
+  reply.body.set(payload);
+  return finishReply(reply, unique);
 }
 
 /** An error reply. The body is always empty; the kernel ignores one anyway. */
@@ -2722,8 +2806,28 @@ export interface FuseRequest {
   header: FuseInHeader;
   /** Opcode name, or `UNKNOWN(<n>)`. */
   name: string;
-  /** The op payload with the extension block stripped. */
-  payload: Uint8Array;
+  /**
+   * The op payload with the extension block stripped.
+   *
+   * **Read this during the decode tick — before the first `await` — or not at
+   * all.** Unlike every other retained field here it is a *lazy* copy: the
+   * first read copies the bytes out of `buffer` and memoizes the result, and
+   * every read after that returns the same array. Nothing in `src/` reads it —
+   * `body` already carries a copy of everything a session needs, and for
+   * `FUSE_WRITE` that copy *is* the payload — so an eager copy made every
+   * request pay for a second full copy of a body nobody looked at (109 µs of
+   * `decodeRequest`'s 200 µs at 1 MiB).
+   *
+   * The deferral is what costs the guarantee: a transport re-arms its receive
+   * buffer as soon as the un-awaited dispatch call returns
+   * (`src/fuse/mount.ts`), so a read taken after that copies whatever the
+   * *next* message left behind. This does not weaken "decoders always copy the
+   * bytes they retain" for anything on the mount path — `body`, `extensions`
+   * and `Reader.raw()` are all still copied eagerly, and those are what the
+   * session keeps. It narrows the guarantee for this one debugging/inspection
+   * field, deliberately.
+   */
+  readonly payload: Uint8Array;
   /** Request extensions (`total_extlen`, 7.38+), raw and undecoded. */
   extensions: Uint8Array;
   /** Decoded body, or `undefined` when no codec exists for the opcode. */
@@ -2755,10 +2859,17 @@ export function decodeRequest(buffer: Uint8Array, ctx?: ProtocolContext): FuseRe
   const payload = buffer.subarray(FUSE_IN_HEADER_SIZE, bodyEnd);
   const extensions = copyBytes(buffer, bodyEnd, header.len);
   const spec = OPCODES.get(header.opcode);
+  // `payload` is lazy — see the field's doc on `FuseRequest`. The copy is real
+  // when it happens; it just happens on the first read rather than here, so a
+  // 1 MiB `WRITE` is not copied twice for a field no session reads.
+  let copied: Uint8Array | undefined;
   return {
     header,
     name: opcodeName(header.opcode),
-    payload: copyBytes(payload),
+    get payload(): Uint8Array {
+      copied ??= copyBytes(payload);
+      return copied;
+    },
     extensions,
     body: spec === undefined ? undefined : spec.decodeRequest(payload, ctxOf(ctx)),
   };

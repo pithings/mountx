@@ -151,7 +151,17 @@ export type AutoMount =
   | (P9Mount & { readonly transport: "9p" })
   | (NfsMount & { readonly transport: "nfs" });
 
-/** Transports whose module has been loaded, so {@link unmountAll} knows who to ask. */
+/**
+ * Transports {@link mount} has loaded, so {@link unmountAll} knows who to ask.
+ *
+ * The *only* thing that scopes {@link unmountAll} and {@link liveMounts}: what
+ * a loaded transport then reports is every mount it has, not the ones this file
+ * asked for. See {@link unmountAll} for what that does and does not cover.
+ *
+ * Written only once the transport's `await import()` has resolved, so a module
+ * that failed to load is not remembered — {@link unmountAll} would otherwise
+ * re-import it on a teardown path and re-raise the same failure.
+ */
 const loaded = new Set<Transport>();
 
 const OK: TransportProbe = { usable: true, reason: undefined };
@@ -353,9 +363,15 @@ export async function mount(
   } else {
     transport = requested;
   }
-  loaded.add(transport);
+  // `loaded` is written *after* each import resolves, never before: a transport
+  // whose module could not be loaded has no mounts to unmount, and remembering
+  // it would make {@link unmountAll} re-import — and re-fail — on a teardown
+  // path. It is written before the mount is attempted, though, because a
+  // `mount()` that throws part-way may still have registered itself in the
+  // transport's own live set, and that is exactly what `unmountAll` is for.
   if (transport === "fuse") {
     const { mount: mountFuse } = await import("./fuse/mount.ts");
+    loaded.add("fuse");
     return tag(
       await mountFuse(driver, mountpoint, { ...shared(options), ...options.fuse }),
       "fuse",
@@ -363,36 +379,71 @@ export async function mount(
   }
   if (transport === "9p") {
     const { mount9p } = await import("./9p/mount.ts");
+    loaded.add("9p");
     return tag(await mount9p(driver, mountpoint, { ...shared(options), ...options["9p"] }), "9p");
   }
   const { mountNfs } = await import("./nfs/mount.ts");
+  loaded.add("nfs");
   return tag(await mountNfs(driver, mountpoint, { ...shared(options), ...options.nfs }), "nfs");
 }
 
 /**
- * Unmount every live mount in this process, on every transport. Never rejects.
+ * Unmount every live mount this process has on the transports this module has
+ * loaded. Never rejects: whatever went wrong comes back in the array.
+ *
+ * **This is not filtered to the mounts {@link mount} returned, and it cannot
+ * be.** Each transport keeps *one* process-wide registry of its live mounts —
+ * `src/fuse/mount.ts`'s `live` set and the same set in `src/9p/mount.ts` and
+ * `src/nfs/mount.ts` — filled by the one `mount()` that transport has, whether
+ * this file called it or you did. `unmountAllFuse()` and friends hand back that
+ * whole set, and this pushes all of it. So a mount you made by importing
+ * `mountx/fuse` directly **is** included here, and this **will** take it
+ * down — as soon as this module has itself mounted something over FUSE.
+ * Nothing here is safe to rely on to leave a mount alone.
+ *
+ * **The one gap** is a transport this module never loaded. {@link loaded} is
+ * written by {@link mount} and by nothing else, and there is no way to ask Node
+ * whether somebody *else* imported a module — so if you mount with `mountx/9p`
+ * directly while {@link mount} only ever chose FUSE, that 9P mount is invisible
+ * to this and to {@link liveMounts}. Call `unmountAll9p()` for it.
+ *
+ * Closing that gap would mean the three `mount.ts` files registering themselves
+ * into a shared module at import time: a load-order side effect in files that
+ * have none today, and one a bundler told `"sideEffects": false` is entitled to
+ * drop. So the gap stays, documented, rather than being traded for a registry
+ * that is silently absent in a bundle.
  *
  * Only transports {@link mount} actually used are asked, so this loads nothing
- * that was not already loaded.
+ * that was not already loaded, and an import or an unmount that fails lands in
+ * the array rather than rejecting out of a teardown path.
  */
 export async function unmountAll(): Promise<unknown[]> {
   const failures: unknown[] = [];
-  if (loaded.has("fuse")) {
-    const { unmountAll: unmountAllFuse } = await import("./fuse/mount.ts");
-    failures.push(...(await unmountAllFuse()));
-  }
-  if (loaded.has("9p")) {
-    const { unmountAll9p } = await import("./9p/mount.ts");
-    failures.push(...(await unmountAll9p()));
-  }
-  if (loaded.has("nfs")) {
-    const { unmountAllNfs } = await import("./nfs/mount.ts");
-    failures.push(...(await unmountAllNfs()));
-  }
+  const ask = async (transport: Transport, all: () => Promise<unknown[]>): Promise<void> => {
+    if (!loaded.has(transport)) {
+      return;
+    }
+    try {
+      failures.push(...(await all()));
+    } catch (error) {
+      failures.push(error);
+    }
+  };
+  await ask("fuse", async () => (await import("./fuse/mount.ts")).unmountAll());
+  await ask("9p", async () => (await import("./9p/mount.ts")).unmountAll9p());
+  await ask("nfs", async () => (await import("./nfs/mount.ts")).unmountAllNfs());
   return failures;
 }
 
-/** Every live mount in this process, on every transport, tagged. */
+/**
+ * Every live mount this process has on the transports this module has loaded,
+ * tagged with the transport serving it.
+ *
+ * Exactly {@link unmountAll}'s scope, for exactly its reason: **not** a list of
+ * what {@link mount} returned. A mount made by importing a transport directly
+ * appears here too, once this module has loaded that transport itself; a mount
+ * on a transport it never loaded does not.
+ */
 export async function liveMounts(): Promise<AutoMount[]> {
   const mounts: AutoMount[] = [];
   if (loaded.has("fuse")) {

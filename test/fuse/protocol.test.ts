@@ -17,6 +17,7 @@ import {
 } from "../../src/fuse/constants.ts";
 import { decodeNotify, encodeNotify } from "../../src/fuse/notify.ts";
 import {
+  allocReply,
   attrOutSize,
   attrSize,
   DEFAULT_PROTOCOL,
@@ -50,6 +51,7 @@ import {
   encodeStatfsOut,
   encodeXattrNames,
   entryOutSize,
+  finishReply,
   fuseErrno,
   initOutSize,
   isProtocolError,
@@ -60,6 +62,7 @@ import {
   readWriteInSize,
   SUPPORTED_OPCODES,
   UNIMPLEMENTED_OPCODES,
+  writeOutHeaderInto,
 } from "../../src/fuse/protocol.ts";
 import type { FuseRawData, FuseWriteIn, ProtocolContext } from "../../src/fuse/protocol.ts";
 import {
@@ -276,13 +279,49 @@ describe("retained bytes", () => {
     const message = Buffer.allocUnsafe(encoded.length);
     message.set(encoded);
     const decoded = decodeRequest(message);
-    const payload = new Uint8Array(decoded.payload);
+
+    // Nothing reads `.payload` first: the fields a session keeps must survive
+    // the transport re-arming its receive buffer on their own. For a `WRITE`
+    // the body *is* the data, so `body.data` is the load-bearing copy.
+    message.fill(0xaa);
+
+    expect([...decoded.extensions]).toEqual([...extensions]);
+    expect([...(decoded.body as FuseWriteIn).data]).toEqual([...data]);
+  });
+
+  it("copies the payload lazily, memoized on the first read", () => {
+    const payloadBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const encoded = encodeRequest({ opcode: 39 /* IOCTL */, unique: 1n, payload: payloadBytes });
+    const message = Buffer.allocUnsafe(encoded.length);
+    message.set(encoded);
+    const decoded = decodeRequest(message);
+
+    // Read inside the decode tick, the way `FuseRequest.payload` documents.
+    const first = decoded.payload;
+    expect([...first]).toEqual([...payloadBytes]);
 
     message.fill(0xaa);
 
-    expect([...decoded.payload]).toEqual([...payload]);
-    expect([...decoded.extensions]).toEqual([...extensions]);
-    expect([...(decoded.body as FuseWriteIn).data]).toEqual([...data]);
+    // The first read really copied, and the second returns that same array
+    // rather than re-reading the reused buffer.
+    expect([...decoded.payload]).toEqual([...payloadBytes]);
+    expect(decoded.payload).toBe(first);
+  });
+
+  it("pins the documented narrowing: a payload read after reuse sees the reuse", () => {
+    // Not a bug being enshrined — it is the trade `FuseRequest.payload` states
+    // in its own doc comment, and the reason no reader in `src/` may touch it
+    // past the first `await`. If this ever needs to become an eager copy again,
+    // this case is the one that says so out loud.
+    const payloadBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const encoded = encodeRequest({ opcode: 39 /* IOCTL */, unique: 1n, payload: payloadBytes });
+    const message = Buffer.allocUnsafe(encoded.length);
+    message.set(encoded);
+    const decoded = decodeRequest(message);
+
+    message.fill(0xaa);
+
+    expect([...decoded.payload]).toEqual([0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa]);
   });
 
   it("copies Buffer-backed reply bytes before the caller reuses them", () => {
@@ -313,6 +352,99 @@ describe("retained bytes", () => {
     message.fill(0xdd);
 
     expect([...decoded.body]).toEqual([...body]);
+  });
+});
+
+describe("framed replies", () => {
+  it("allocates header and body as one buffer", () => {
+    const reply = allocReply(64);
+    expect(reply.message.length).toBe(FUSE_OUT_HEADER_SIZE + 64);
+    expect(reply.body.length).toBe(64);
+    expect(reply.body.buffer).toBe(reply.message.buffer);
+    expect(reply.body.byteOffset).toBe(reply.message.byteOffset + FUSE_OUT_HEADER_SIZE);
+    // Filling the body is filling the message: one allocation, two views.
+    reply.body.fill(0x5a);
+    expect(reply.message[FUSE_OUT_HEADER_SIZE]).toBe(0x5a);
+  });
+
+  it("is byte-identical to encodeReply for a full body", () => {
+    const rng = new Rng(0x5e_ed_0a);
+    for (let round = 0; round < 200; round++) {
+      const unique = rng.u64();
+      const body = rng.bytes(rng.int(300));
+      const reply = allocReply(body.length);
+      reply.body.set(body);
+      expect(finishReply(reply, unique)).toEqual(encodeReply(unique, body));
+    }
+  });
+
+  it("is byte-identical to encodeReply for an empty body", () => {
+    expect(finishReply(allocReply(0), 7n)).toEqual(encodeReply(7n));
+    expect(finishReply(allocReply(0), 7n)).toEqual(encodeReply(7n, new Uint8Array(0)));
+  });
+
+  it("trims a short fill — the READ case", () => {
+    // A driver asked for 4096 bytes and returned 5: `len` and the returned
+    // bytes must describe what was filled, never what was allocated.
+    const reply = allocReply(4096);
+    reply.body.set(new Uint8Array([1, 2, 3, 4, 5]));
+    const message = finishReply(reply, 9n, 5);
+
+    expect(message.length).toBe(FUSE_OUT_HEADER_SIZE + 5);
+    expect(decodeOutHeader(message)).toEqual({
+      len: FUSE_OUT_HEADER_SIZE + 5,
+      error: 0,
+      unique: 9n,
+    });
+    expect(decodeReply(message, FUSE_READ).payload).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+    expect(message).toEqual(encodeReply(9n, new Uint8Array([1, 2, 3, 4, 5])));
+  });
+
+  it("trims a zero-length fill", () => {
+    const message = finishReply(allocReply(4096), 11n, 0);
+    expect(message.length).toBe(FUSE_OUT_HEADER_SIZE);
+    expect(message).toEqual(encodeReply(11n));
+  });
+
+  it("rejects an impossible body size", () => {
+    expect(() => allocReply(-1)).toThrow(ProtocolError);
+    expect(() => allocReply(1.5)).toThrow(ProtocolError);
+    expect(() => allocReply(Number.NaN)).toThrow(ProtocolError);
+  });
+
+  it("rejects a bytesUsed the body cannot back", () => {
+    const reply = allocReply(8);
+    expect(() => finishReply(reply, 1n, 9)).toThrow(ProtocolError);
+    expect(() => finishReply(reply, 1n, -1)).toThrow(ProtocolError);
+    expect(() => finishReply(reply, 1n, 1.5)).toThrow(ProtocolError);
+    expect(finishReply(reply, 1n, 8).length).toBe(FUSE_OUT_HEADER_SIZE + 8);
+  });
+
+  it("writes a fuse_out_header in place without touching the body", () => {
+    const message = new Uint8Array(FUSE_OUT_HEADER_SIZE + 4).fill(0x77);
+    writeOutHeaderInto(message, { len: message.length, error: -2, unique: 5n });
+    expect(message.subarray(0, FUSE_OUT_HEADER_SIZE)).toEqual(
+      encodeOutHeader({ len: message.length, error: -2, unique: 5n }),
+    );
+    expect([...message.subarray(FUSE_OUT_HEADER_SIZE)]).toEqual([0x77, 0x77, 0x77, 0x77]);
+  });
+
+  it("writes into a subarray at its own offset, not the underlying buffer's", () => {
+    const backing = new Uint8Array(FUSE_OUT_HEADER_SIZE + 8).fill(0x33);
+    const target = backing.subarray(8);
+    writeOutHeaderInto(target, { len: FUSE_OUT_HEADER_SIZE, error: 0, unique: 1n });
+    expect([...backing.subarray(0, 8)]).toEqual([0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33]);
+    expect(decodeOutHeader(target)).toEqual({ len: FUSE_OUT_HEADER_SIZE, error: 0, unique: 1n });
+  });
+
+  it("rejects a target too small for the header", () => {
+    expect(() =>
+      writeOutHeaderInto(new Uint8Array(FUSE_OUT_HEADER_SIZE - 1), {
+        len: FUSE_OUT_HEADER_SIZE,
+        error: 0,
+        unique: 1n,
+      }),
+    ).toThrow(ProtocolError);
   });
 });
 

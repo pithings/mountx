@@ -45,14 +45,32 @@
  * delete rather than an atomic operation. All four are declared, so the
  * transports answer `ENOSYS`/`ENOTSUP` rather than pretending.
  *
- * Costs worth knowing before mounting something remote: `readdir` lists every
- * key under the directory's prefix (there is no shallow listing in the
- * interface), and `stat` of a file falls back to fetching the value to measure
- * it when the underlying driver's `getMeta` reports no `size`.
+ * Costs worth knowing before mounting something remote, where each of these is
+ * a network round trip:
+ *
+ * - **A listing is the only existence test a directory has.** A directory is a
+ *   key prefix and has no key of its own, so "does `/a` exist" is
+ *   `getKeys("a")`, which on S3 is a paginated `ListObjectsV2` over the whole
+ *   subtree to answer a boolean. `GetKeysOptions.maxDepth` does not help: only
+ *   the `fs`/`fs-lite` drivers implement it, every other driver has it applied
+ *   as a *client-side filter over the full listing* (`Storage.getKeys` counts
+ *   the separators in the absolute key while `fs` counts levels below the
+ *   base, so the two do not even agree on what a depth is), and there is no
+ *   "stop after one" in the interface at all. What this driver does instead is
+ *   never ask twice: one listing is reused for every question a single call
+ *   asks of the same prefix, and a path walk needs exactly one of them.
+ * - **`readdir` lists every key under the prefix**, for the same reason —
+ *   there is no shallow listing to ask for.
+ * - **`stat` of a file falls back to fetching the value** to measure it when
+ *   the underlying driver's `getMeta` reports no `size`.
+ * - **Resolving `/a/b/c` costs a point lookup per component**, to catch the
+ *   store that holds both `a` and `a:b`. They are issued together rather than
+ *   one level at a time, so the walk is one round trip deep rather than as
+ *   deep as the path.
  */
 
 import { fsError } from "../errors.ts";
-import { basename, dirname, isPathInside, normalizePath, splitPath } from "../path.ts";
+import { basename, dirname, isPathInside, normalizePath, resolvePath, splitPath } from "../path.ts";
 import type {
   DirentLike,
   FileHandleLike,
@@ -265,6 +283,52 @@ export function createUnstorageDriver(
   // --- resolution ---
 
   /**
+   * The store's answers for the duration of one driver call, and no longer.
+   *
+   * A single operation asks the same question of the same key more than once:
+   * `readdir` classifies the directory and then lists it, `rmdir` and `rename`
+   * classify a destination and then ask whether it is empty, `rename`
+   * shadow-checks one parent for both of its paths. Each repeat is a round trip
+   * on a remote store.
+   *
+   * The lifetime is the point. A memo that outlived the call would turn another
+   * writer's change into a stale answer — the store is shared and this driver
+   * is long-lived — so a `Scope` is built by each of the driver's own methods,
+   * threaded down, and dropped when that method returns. Within one call it is
+   * safe because no operation here reads a key back after mutating it: every
+   * probe happens before the first `setItemRaw`/`removeItem`.
+   *
+   * Promises rather than values, so two probes issued concurrently for one key
+   * are also one round trip.
+   */
+  interface Scope {
+    readonly items: Map<string, Promise<boolean>>;
+    readonly keys: Map<string, Promise<string[]>>;
+  }
+
+  const newScope = (): Scope => ({ items: new Map(), keys: new Map() });
+
+  /** Is there a key exactly here? A point lookup. */
+  function hasKey(key: string, scope: Scope): Promise<boolean> {
+    let answer = scope.items.get(key);
+    if (answer === undefined) {
+      answer = storage.hasItem(key);
+      scope.items.set(key, answer);
+    }
+    return answer;
+  }
+
+  /** Every key under this prefix. A listing — the expensive one. */
+  function keysUnder(key: string, scope: Scope): Promise<string[]> {
+    let answer = scope.keys.get(key);
+    if (answer === undefined) {
+      answer = storage.getKeys(key);
+      scope.keys.set(key, answer);
+    }
+    return answer;
+  }
+
+  /**
    * What `path` names.
    *
    * A key wins over the prefix of the same name: a store holding both `a` and
@@ -273,7 +337,7 @@ export function createUnstorageDriver(
    * thing. It is also the cheap order — `hasItem` is a point lookup and the
    * prefix test is a listing.
    */
-  async function classify(path: string, syscall: string): Promise<Kind> {
+  async function classify(path: string, syscall: string, scope: Scope): Promise<Kind> {
     if (path === "/") {
       return "directory";
     }
@@ -281,13 +345,13 @@ export function createUnstorageDriver(
       return "file";
     }
     const key = keyOf(path, syscall);
-    if (await storage.hasItem(key)) {
+    if (await hasKey(key, scope)) {
       return "file";
     }
     if (emptyDirectories.has(path)) {
       return "directory";
     }
-    return (await storage.getKeys(key)).length > 0 ? "directory" : "missing";
+    return (await keysUnder(key, scope)).length > 0 ? "directory" : "missing";
   }
 
   /**
@@ -298,7 +362,7 @@ export function createUnstorageDriver(
    * Two things have to be checked, and both are arranged to stay off the happy
    * path:
    *
-   * - **Missing** — walk down from the root to say whether this is `ENOENT` or
+   * - **Missing** — {@link requireDirectory} says whether this is `ENOENT` or
    *   `ENOTDIR`. Only needed here: a key exists only under prefixes, so
    *   anything that *was* found has directories above it by construction.
    * - **Found, and shadowed** — a store holding both `a` and `a:b` has no tree
@@ -307,38 +371,94 @@ export function createUnstorageDriver(
    *   at every depth: if `/a` is a key then `/a/b` answers `ENOTDIR`, which
    *   makes `/a/b` not a directory either, and so on down.
    */
-  async function lookup(path: string, syscall: string): Promise<Kind> {
-    const kind = await classify(path, syscall);
+  async function lookup(path: string, syscall: string, scope: Scope): Promise<Kind> {
+    const kind = await classify(path, syscall, scope);
     if (kind === "missing") {
-      await requireDirectory(dirname(path), syscall, path);
+      await requireDirectory(dirname(path), syscall, path, scope);
       return kind;
     }
     const parent = dirname(path);
     // Nothing can shadow the root, which is where most lookups stop.
-    if (parent !== "/" && (await storage.hasItem(keyOf(parent, syscall)))) {
+    if (parent !== "/" && (await hasKey(keyOf(parent, syscall), scope))) {
       throw fsError("ENOTDIR", { syscall, path });
     }
     return kind;
   }
 
-  /** Every component of `path` must be a directory; say which one is not. */
-  async function requireDirectory(path: string, syscall: string, reported: string): Promise<void> {
-    let current = "";
-    for (const segment of splitPath(path)) {
-      current += `/${segment}`;
-      const kind = await classify(current, syscall);
-      if (kind !== "directory") {
-        throw fsError(kind === "file" ? "ENOTDIR" : "ENOENT", {
-          syscall,
-          path: normalizePath(reported),
-        });
-      }
+  /**
+   * Every component of `path` must be a directory.
+   *
+   * Two questions, and they are asked in this order because the first one
+   * decides what the second one can mean:
+   *
+   * - **Is any component itself a key?** That is the shadowed layout, and it is
+   *   `ENOTDIR` wherever it appears. One point lookup per component, all issued
+   *   together: a component's answer never depends on the one above it, so
+   *   waiting for each in turn only buys a walk that is as many round trips
+   *   deep as the path is long. The cost of asking all of them even when the
+   *   first one already refuses is a point lookup each, against a walk that is
+   *   one round trip deep for every path that resolves — which is nearly all of
+   *   them.
+   * - **Does the deepest component exist?** One listing settles it for the
+   *   whole walk: a key under `/a/b` is a key under `/a` as well, so a deepest
+   *   component that is a real prefix makes every component above it one too.
+   *   A directory that exists only in this process got there through `mkdir`,
+   *   which checked its own parents at the time.
+   *
+   * And nothing else can be wrong by then: no component is a key, so the only
+   * remaining failure is something missing, which is `ENOENT`. That ordering is
+   * why the answer matches a plain top-down walk exactly — a missing component
+   * can never have a *key* below it, since a key below it would have made it a
+   * prefix.
+   *
+   * `reported` is the path the caller asked about, which is the one the error
+   * names; which component was at fault has never been part of the answer.
+   */
+  async function requireDirectory(
+    path: string,
+    syscall: string,
+    reported: string,
+    scope: Scope,
+  ): Promise<void> {
+    if (path === "/") {
+      return;
+    }
+    // `keyOf` validates every segment, and the key it produces is the segments
+    // joined — so the prefixes are built from it rather than walking the string
+    // again for each level.
+    const segments = keyOf(path, syscall).split(SEPARATOR);
+    const paths: string[] = [];
+    const keys: string[] = [];
+    let currentPath = "";
+    let currentKey = "";
+    for (const segment of segments) {
+      currentPath += `/${segment}`;
+      currentKey = currentKey === "" ? segment : currentKey + SEPARATOR + segment;
+      paths.push(currentPath);
+      keys.push(currentKey);
+    }
+
+    const shadowed = await Promise.all(
+      paths.map((componentPath, index) =>
+        openFiles.has(componentPath) ? true : hasKey(keys[index]!, scope),
+      ),
+    );
+    if (shadowed.includes(true)) {
+      throw fsError("ENOTDIR", { syscall, path: normalizePath(reported) });
+    }
+
+    const deepest = paths.length - 1;
+    if (emptyDirectories.has(paths[deepest]!)) {
+      return;
+    }
+    if ((await keysUnder(keys[deepest]!, scope)).length === 0) {
+      throw fsError("ENOENT", { syscall, path: normalizePath(reported) });
     }
   }
 
   /** Resolve to an existing file, or say why not. */
-  async function resolveFile(path: string, syscall: string): Promise<void> {
-    const kind = await lookup(path, syscall);
+  async function resolveFile(path: string, syscall: string, scope: Scope): Promise<void> {
+    const kind = await lookup(path, syscall, scope);
     if (kind === "missing") {
       throw fsError("ENOENT", { syscall, path });
     }
@@ -348,8 +468,10 @@ export function createUnstorageDriver(
   }
 
   /** Does this directory hold anything at all? */
-  async function hasEntries(path: string, syscall: string): Promise<boolean> {
-    if ((await storage.getKeys(keyOf(path, syscall))).length > 0) {
+  async function hasEntries(path: string, syscall: string, scope: Scope): Promise<boolean> {
+    // The listing `classify` already paid for, whenever this directory is a
+    // real prefix — which is every case where the answer can be `true`.
+    if ((await keysUnder(keyOf(path, syscall), scope)).length > 0) {
       return true;
     }
     for (const directory of emptyDirectories) {
@@ -448,8 +570,8 @@ export function createUnstorageDriver(
     return makeStats(path, S_IFDIR | mode, BLOCK_SIZE, {});
   }
 
-  async function statOf(path: string, syscall: string): Promise<StatsLike> {
-    const kind = await lookup(path, syscall);
+  async function statOf(path: string, syscall: string, scope: Scope): Promise<StatsLike> {
+    const kind = await lookup(path, syscall, scope);
     if (kind === "missing") {
       throw fsError("ENOENT", { syscall, path });
     }
@@ -531,7 +653,12 @@ export function createUnstorageDriver(
         const explicit = validatePosition(at);
         const from = explicit ?? position;
         const bytesRead = Math.max(0, Math.min(count, entry.data.byteLength - from));
-        buffer.set(entry.data.subarray(from, from + bytesRead), start);
+        if (bytesRead > 0) {
+          // `TypedArray.set` rejects an out-of-bounds offset even with nothing
+          // to copy, and `read(buffer, offset, 0)` with an offset past the end
+          // is a call `node:fs` answers `bytesRead: 0` to.
+          buffer.set(entry.data.subarray(from, from + bytesRead), start);
+        }
         if (explicit === undefined) {
           position += bytesRead;
         }
@@ -633,17 +760,18 @@ export function createUnstorageDriver(
     },
 
     async stat(path) {
-      return statOf(normalizePath(path), "stat");
+      return statOf(normalizePath(path), "stat", newScope());
     },
 
     // No symlinks, so the two are the same call.
     async lstat(path) {
-      return statOf(normalizePath(path), "lstat");
+      return statOf(normalizePath(path), "lstat", newScope());
     },
 
     async readdir(path: string, _options: ReaddirOptions): Promise<DirentLike[]> {
+      const scope = newScope();
       const parentPath = normalizePath(path);
-      const kind = await lookup(parentPath, "scandir");
+      const kind = await lookup(parentPath, "scandir", scope);
       if (kind === "missing") {
         throw fsError("ENOENT", { syscall: "scandir", path: parentPath });
       }
@@ -657,7 +785,8 @@ export function createUnstorageDriver(
       // us the first segment is a directory. A key that is *both* is a file,
       // for the reason in `classify`.
       const entries = new Map<string, boolean>();
-      for (const key of await storage.getKeys(base)) {
+      // The listing `lookup` already paid for to call this a directory.
+      for (const key of await keysUnder(base, scope)) {
         if (!key.startsWith(prefix)) {
           continue;
         }
@@ -702,7 +831,7 @@ export function createUnstorageDriver(
       // `lookup` rather than `classify`: whether a missing file is `ENOENT` or
       // `ENOTDIR` is the parent's business either way, and it is only after
       // that that the `create` branch means anything.
-      const kind = await lookup(resolved, "open");
+      const kind = await lookup(resolved, "open", newScope());
       if (kind === "missing") {
         if (!parsed.create) {
           throw fsError("ENOENT", { syscall: "open", path: resolved });
@@ -722,7 +851,14 @@ export function createUnstorageDriver(
         }
         return createDirectoryHandle(resolved);
       }
-      const entry = await acquire(resolved);
+      // `O_TRUNC` discards every byte the store holds, so the buffer starts
+      // empty rather than being downloaded and then thrown away — `open(path,
+      // "w")` is the most common write a mount ever sees, and fetching first
+      // would move a 1 GB object twice to overwrite it. When the path is
+      // already open, `acquire` hands back the one shared buffer and ignores
+      // this, which is what makes the truncation visible through every other
+      // handle the way it is on `memory` and `node-fs`.
+      const entry = await acquire(resolved, parsed.truncate ? EMPTY : undefined);
       if (parsed.truncate) {
         resizeBytes(entry, 0);
         entry.dirty = true;
@@ -732,16 +868,16 @@ export function createUnstorageDriver(
     },
 
     async mkdir(path, mkdirOptions: MkdirOptions = {}) {
-      const resolved = normalizePath(path);
+      const scope = newScope();
+      const { path: resolved, segments } = resolvePath(path);
       mutable("mkdir", resolved);
       const mode = (mkdirOptions.mode ?? 0o777) & 0o7777;
-      const segments = splitPath(resolved);
       if (mkdirOptions.recursive) {
         let firstCreated: string | undefined;
         let current = "";
         for (const [index, segment] of segments.entries()) {
           current += `/${segment}`;
-          const kind = await classify(current, "mkdir");
+          const kind = await classify(current, "mkdir", scope);
           if (kind === "missing") {
             emptyDirectories.add(current);
             attributesOf(current).mode = mode;
@@ -754,7 +890,7 @@ export function createUnstorageDriver(
         }
         return firstCreated;
       }
-      if ((await lookup(resolved, "mkdir")) !== "missing") {
+      if ((await lookup(resolved, "mkdir", scope)) !== "missing") {
         throw fsError("EEXIST", { syscall: "mkdir", path: resolved });
       }
       emptyDirectories.add(resolved);
@@ -763,9 +899,10 @@ export function createUnstorageDriver(
     },
 
     async rmdir(path) {
+      const scope = newScope();
       const resolved = normalizePath(path);
       mutable("rmdir", resolved);
-      const kind = await lookup(resolved, "rmdir");
+      const kind = await lookup(resolved, "rmdir", scope);
       if (kind === "missing") {
         throw fsError("ENOENT", { syscall: "rmdir", path: resolved });
       }
@@ -775,7 +912,7 @@ export function createUnstorageDriver(
       if (resolved === "/") {
         throw fsError("EBUSY", { syscall: "rmdir", path: resolved });
       }
-      if (await hasEntries(resolved, "rmdir")) {
+      if (await hasEntries(resolved, "rmdir", scope)) {
         throw fsError("ENOTEMPTY", { syscall: "rmdir", path: resolved });
       }
       emptyDirectories.delete(resolved);
@@ -785,7 +922,7 @@ export function createUnstorageDriver(
     async unlink(path) {
       const resolved = normalizePath(path);
       mutable("unlink", resolved);
-      const kind = await lookup(resolved, "unlink");
+      const kind = await lookup(resolved, "unlink", newScope());
       if (kind === "missing") {
         throw fsError("ENOENT", { syscall: "unlink", path: resolved });
       }
@@ -803,10 +940,11 @@ export function createUnstorageDriver(
     },
 
     async rename(oldPath, newPath) {
+      const scope = newScope();
       const from = normalizePath(oldPath);
       const to = normalizePath(newPath);
       mutable("rename", from);
-      const source = await lookup(from, "rename");
+      const source = await lookup(from, "rename", scope);
       if (source === "missing") {
         throw fsError("ENOENT", { syscall: "rename", path: from, dest: to });
       }
@@ -817,14 +955,14 @@ export function createUnstorageDriver(
       if (directory && isPathInside(to, from)) {
         throw fsError("EINVAL", { syscall: "rename", path: from, dest: to });
       }
-      const destination = await lookup(to, "rename");
+      const destination = await lookup(to, "rename", scope);
       if (destination === "missing") {
         // Nothing to displace; `lookup` has already vouched for the parent.
       } else if (directory) {
         if (destination === "file") {
           throw fsError("ENOTDIR", { syscall: "rename", path: from, dest: to });
         }
-        if (await hasEntries(to, "rename")) {
+        if (await hasEntries(to, "rename", scope)) {
           throw fsError("ENOTEMPTY", { syscall: "rename", path: from, dest: to });
         }
       } else if (destination === "directory") {
@@ -844,7 +982,8 @@ export function createUnstorageDriver(
       if (directory) {
         const base = keyOf(from, "rename");
         const prefix = prefixOf(base);
-        for (const key of await storage.getKeys(base)) {
+        // The listing `lookup` already paid for to call the source a directory.
+        for (const key of await keysUnder(base, scope)) {
           if (!key.startsWith(prefix)) {
             continue;
           }
@@ -862,7 +1001,7 @@ export function createUnstorageDriver(
     async truncate(path, length = 0) {
       const resolved = normalizePath(path);
       mutable("truncate", resolved);
-      await resolveFile(resolved, "truncate");
+      await resolveFile(resolved, "truncate", newScope());
       const entry = openFiles.get(resolved);
       if (entry !== undefined) {
         // The buffer is the file's contents while it is open; the write-back
@@ -879,6 +1018,12 @@ export function createUnstorageDriver(
         }
         return;
       }
+      if (length === 0) {
+        // Nothing of the old value survives, so it is not fetched. Any other
+        // length keeps a prefix of it and has to.
+        await writeValue(resolved, EMPTY, "truncate");
+        return;
+      }
       const holder: ByteHolder = { data: copyOf(await readValue(resolved, "truncate")) };
       resizeBytes(holder, length);
       await writeValue(resolved, holder.data!, "truncate");
@@ -887,7 +1032,7 @@ export function createUnstorageDriver(
     async chmod(path, mode) {
       const resolved = normalizePath(path);
       mutable("chmod", resolved);
-      await statOf(resolved, "chmod");
+      await statOf(resolved, "chmod", newScope());
       const found = attributesOf(resolved);
       found.mode = mode & 0o7777;
       found.ctimeMs = now();
@@ -896,7 +1041,7 @@ export function createUnstorageDriver(
     async chown(path, ownerUid, ownerGid) {
       const resolved = normalizePath(path);
       mutable("chown", resolved);
-      await statOf(resolved, "chown");
+      await statOf(resolved, "chown", newScope());
       const found = attributesOf(resolved);
       if (ownerUid >= 0) {
         found.uid = ownerUid;
@@ -910,7 +1055,7 @@ export function createUnstorageDriver(
     async utimes(path, atime, mtime) {
       const resolved = normalizePath(path);
       mutable("utime", resolved);
-      await statOf(resolved, "utime");
+      await statOf(resolved, "utime", newScope());
       const found = attributesOf(resolved);
       found.atimeMs = toMs(atime);
       found.mtimeMs = toMs(mtime);

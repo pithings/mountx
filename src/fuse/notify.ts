@@ -21,7 +21,7 @@ import {
   FUSE_NOTIFY_UNIQUE,
   FUSE_OUT_HEADER_SIZE,
 } from "./constants.ts";
-import { encodeOutHeader, ProtocolError } from "./protocol.ts";
+import { ProtocolError, writeOutHeaderInto } from "./protocol.ts";
 
 /** `FUSE_NAME_MAX` — the kernel rejects a longer name in a notification. */
 export const FUSE_NAME_MAX = 1024;
@@ -61,11 +61,22 @@ export interface FuseNotifyInvalEntryOut {
   flags: number;
 }
 
-/** Frame a notification body: `fuse_out_header` with `unique = 0`. */
+/**
+ * Frame a notification body: `fuse_out_header` with `unique = 0`.
+ *
+ * One allocation, header written in place — `writeOutHeaderInto` is the same
+ * entry point `allocReply` is built on, used directly here because a
+ * notification is not a reply: `error` carries the `FUSE_NOTIFY_*` code and
+ * `unique` is fixed.
+ */
 export function encodeNotify(code: number, body: Uint8Array): Uint8Array {
   const message = new Uint8Array(FUSE_OUT_HEADER_SIZE + body.length);
-  message.set(encodeOutHeader({ len: message.length, error: code, unique: FUSE_NOTIFY_UNIQUE }));
   message.set(body, FUSE_OUT_HEADER_SIZE);
+  writeOutHeaderInto(message, {
+    len: message.length,
+    error: code,
+    unique: FUSE_NOTIFY_UNIQUE,
+  });
   return message;
 }
 

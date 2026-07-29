@@ -7,7 +7,7 @@
  */
 
 import { fsError } from "../errors.ts";
-import { isPathInside, joinPath, normalizePath, splitPath } from "../path.ts";
+import { isPathInside, joinPath, normalizePath, resolvePath, splitPath } from "../path.ts";
 import type { OpenFlags } from "./handle.ts";
 import { parseOpenFlags, resizeBytes, validatePosition, validateRange } from "./handle.ts";
 import type {
@@ -91,11 +91,30 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
   let nextIno = 1;
   let nextFd = 3;
 
+  /**
+   * What `statfs` reports, kept as running totals.
+   *
+   * The obvious implementation walks the whole tree per call, and desktops poll
+   * `statfs` on a timer (which is why `cli/watch.ts` lists it as noisy) — so a
+   * mount of a large tree paid an O(nodes) walk, plus a `Set` of every node, at
+   * whatever rate the desktop felt like asking. There are exactly three places
+   * either total can change: a node joining the tree ({@link createNode}), the
+   * last entry naming one going away ({@link unlinkEntry}), and a file's length
+   * changing ({@link resize}).
+   *
+   * "In the tree" is `nlink > 0`, which holds for every node here: `createNode`
+   * starts at 1, `link` bumps it, `unlinkEntry` drops it, and the root is never
+   * unlinked. A node kept alive by an open handle after its last `unlink` is
+   * *not* counted, which is what the tree walk answered too.
+   */
+  let nodeCount = 0;
+  let usedBlocks = 0;
+
   const now = (): number => Date.now();
 
   function createNode(mode: number, extra: Partial<MemNode> = {}): MemNode {
     const time = now();
-    return {
+    const node: MemNode = {
       ino: nextIno++,
       mode,
       nlink: 1,
@@ -108,6 +127,11 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
       birthtimeMs: time,
       ...extra,
     };
+    // Every node created here is linked into a directory by its caller on the
+    // next line, bar the root — which is in the tree by definition.
+    nodeCount++;
+    usedBlocks += blocksOf(node);
+    return node;
   }
 
   const root = createNode(S_IFDIR | (options.rootMode ?? 0o755), { children: new Map() });
@@ -115,8 +139,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
   // --- path resolution ---
 
   function walk(path: string, follow: boolean, syscall: string, depth = 0): Entry {
-    const normalized = normalizePath(path);
-    const segments = splitPath(normalized);
+    const { path: normalized, segments } = resolvePath(path);
     let directory = root;
     for (let index = 0; index < segments.length; index++) {
       const name = segments[index]!;
@@ -136,6 +159,13 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
           throw fsError("ELOOP", { syscall, path: normalized });
         }
         const target = node.target!;
+        if (target === "") {
+          // `symlink()` refuses to store one, but a driver built by hand (or an
+          // older snapshot) can hold one, and it must not be walked: joining
+          // an empty segment collapses onto the link's own parent, which would
+          // make the link a live alias for the directory it sits in.
+          throw fsError("ENOENT", { syscall, path: normalized });
+        }
         const base = target.startsWith("/")
           ? target
           : `/${segments.slice(0, index).join("/")}/${target}`;
@@ -177,6 +207,19 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
     entry.parent.mtimeMs = entry.parent.ctimeMs = now();
     node.nlink--;
     node.ctimeMs = now();
+    if (node.nlink === 0) {
+      nodeCount--;
+      usedBlocks -= blocksOf(node);
+    }
+  }
+
+  /** {@link resizeBytes}, keeping `statfs`'s block total in step. */
+  function resize(node: MemNode, size: number): void {
+    const before = blocksOf(node);
+    resizeBytes(node, size);
+    if (node.nlink > 0) {
+      usedBlocks += blocksOf(node) - before;
+    }
   }
 
   function nlinkOf(node: MemNode): number {
@@ -198,6 +241,10 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
     }
     // A symlink's size is its target in bytes, not in UTF-16 code units.
     return isSymlink(node) ? encoder.encode(node.target!).byteLength : (node.data?.byteLength ?? 0);
+  }
+
+  function blocksOf(node: MemNode): number {
+    return Math.ceil(sizeOf(node) / BLOCK_SIZE);
   }
 
   function toStats(node: MemNode): StatsLike {
@@ -253,7 +300,12 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
         const from = explicit ?? position;
         const data = node.data ?? EMPTY;
         const bytesRead = Math.max(0, Math.min(count, data.byteLength - from));
-        buffer.set(data.subarray(from, from + bytesRead), start);
+        if (bytesRead > 0) {
+          // `TypedArray.set` rejects an out-of-bounds offset even with nothing
+          // to copy, and `read(buffer, offset, 0)` with an offset past the end
+          // is a call `node:fs` answers `bytesRead: 0` to.
+          buffer.set(data.subarray(from, from + bytesRead), start);
+        }
         if (explicit === undefined) {
           position += bytesRead;
         }
@@ -267,7 +319,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
         const explicit = validatePosition(at);
         const from = flags.append ? sizeOf(node) : (explicit ?? position);
         if (from + count > (node.data?.byteLength ?? 0)) {
-          resizeBytes(node, from + count);
+          resize(node, from + count);
         }
         node.data!.set(buffer.subarray(start, start + count), from);
         if (flags.append || explicit === undefined) {
@@ -286,7 +338,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
 
       async truncate(length = 0) {
         begin("ftruncate", true);
-        resizeBytes(node, length);
+        resize(node, length);
         node.mtimeMs = node.ctimeMs = now();
       },
 
@@ -321,30 +373,16 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
 
     async statfs(path): Promise<StatsFsLike> {
       resolve(path, true, "statfs");
-      let used = 0;
-      const seen = new Set<MemNode>();
-      const visit = (node: MemNode): void => {
-        if (seen.has(node)) {
-          return;
-        }
-        seen.add(node);
-        used += Math.ceil(sizeOf(node) / BLOCK_SIZE);
-        if (isDirectory(node)) {
-          for (const child of node.children!.values()) {
-            visit(child);
-          }
-        }
-      };
-      visit(root);
       const blocks = 1024 * 1024;
+      const files = 1024 * 1024;
       return {
         type: 0x01_02_19_94, // TMPFS_MAGIC
         bsize: BLOCK_SIZE,
         blocks,
-        bfree: blocks - used,
-        bavail: blocks - used,
-        files: 1024 * 1024,
-        ffree: 1024 * 1024 - seen.size,
+        bfree: blocks - usedBlocks,
+        bavail: blocks - usedBlocks,
+        files,
+        ffree: files - nodeCount,
       };
     },
 
@@ -352,18 +390,22 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
       const node = directoryOf(path, "scandir");
       const parentPath = normalizePath(path);
       node.atimeMs = now();
+      // A `DirentLike` keeps only the type predicates, so a full `StatsLike`
+      // per entry is all waste — and `nlinkOf` makes it worse than waste, by
+      // rescanning every subdirectory's children to count links nobody reads.
+      // The file type is one field of `mode`.
       return [...node.children!].map(([name, child]) => {
-        const stats = toStats(child);
+        const type = child.mode & S_IFMT;
         return {
           name,
           parentPath,
-          isFile: stats.isFile,
-          isDirectory: stats.isDirectory,
-          isSymbolicLink: stats.isSymbolicLink,
-          isBlockDevice: stats.isBlockDevice,
-          isCharacterDevice: stats.isCharacterDevice,
-          isFIFO: stats.isFIFO,
-          isSocket: stats.isSocket,
+          isFile: () => type === S_IFREG,
+          isDirectory: () => type === S_IFDIR,
+          isSymbolicLink: () => type === S_IFLNK,
+          isBlockDevice: () => false,
+          isCharacterDevice: () => false,
+          isFIFO: () => false,
+          isSocket: () => false,
         };
       });
     },
@@ -388,7 +430,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
           throw fsError("EISDIR", { syscall: "open", path: entry.path });
         }
         if (parsed.truncate && !isDirectory(node)) {
-          resizeBytes(node, 0);
+          resize(node, 0);
           node.mtimeMs = node.ctimeMs = now();
         }
       }
@@ -506,6 +548,13 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
 
     async symlink(target, path) {
       const entry = walk(path, false, "symlink");
+      if (target === "") {
+        // POSIX has no empty pathname, and `symlink(2)` rejects it in
+        // `getname()` before the filesystem is reached. `node:fs` answers
+        // `ENOENT` — and does so *before* the `EEXIST` check, so the order of
+        // these two matters.
+        throw fsError("ENOENT", { syscall: "symlink", path: target, dest: entry.path });
+      }
       if (entry.node !== undefined) {
         throw fsError("EEXIST", { syscall: "symlink", path: target, dest: entry.path });
       }
@@ -539,7 +588,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
       if (isDirectory(node)) {
         throw fsError("EISDIR", { syscall: "open", path: normalizePath(path) });
       }
-      resizeBytes(node, length);
+      resize(node, length);
       node.mtimeMs = node.ctimeMs = now();
     },
 

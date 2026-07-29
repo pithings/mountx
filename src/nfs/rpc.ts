@@ -301,18 +301,54 @@ export function decodeReply(bytes: Uint8Array): { reply: RpcReply; results: XdrR
   return { reply, results: reader };
 }
 
-/** `MSG_ACCEPTED` with `SUCCESS`, then the encoded results. */
-export function encodeAcceptedReply(xid: number, results?: Uint8Array): Uint8Array {
-  const writer = new XdrWriter(32 + (results?.byteLength ?? 0));
+/**
+ * Bytes an accepted reply's header occupies: `xid`, `mtype`, `reply_stat`, the
+ * `AUTH_NULL` verifier (a flavor and a zero length, no body) and `accept_stat`.
+ *
+ * Fixed, which is what lets a session write it into the front of the same
+ * writer its results go into instead of concatenating two buffers afterwards.
+ */
+export const ACCEPTED_REPLY_HEADER_SIZE = 24;
+
+/**
+ * Write `MSG_ACCEPTED` / `SUCCESS` into `writer`, results to follow.
+ *
+ * The header for the reply a *handler* is about to append. Callers that have
+ * the results already should use {@link encodeAcceptedReply}; callers that are
+ * about to produce them start here, so the whole reply is built once in one
+ * buffer. {@link ACCEPTED_REPLY_HEADER_SIZE} is how many bytes this adds.
+ */
+export function writeAcceptedReplyHeader(writer: XdrWriter, xid: number): XdrWriter {
   writer.u32(xid);
   writer.u32(RPC_REPLY);
   writer.u32(MSG_ACCEPTED);
   writeAuth(writer, AUTH_NULL);
   writer.u32(RPC_SUCCESS);
+  return writer;
+}
+
+/**
+ * `MSG_ACCEPTED` with `SUCCESS`, then the encoded results.
+ *
+ * For a caller holding results it did not write into a reply writer itself —
+ * NFSv4.1's replay cache, whose bytes come back from `./v4/state.ts` and must
+ * not be written into. One allocation and one copy of `results`; building it
+ * through an `XdrWriter` cost two.
+ */
+export function encodeAcceptedReply(xid: number, results?: Uint8Array): Uint8Array {
+  const out = new Uint8Array(ACCEPTED_REPLY_HEADER_SIZE + (results?.byteLength ?? 0));
+  const view = new DataView(out.buffer);
+  view.setUint32(0, xid >>> 0, false);
+  view.setUint32(4, RPC_REPLY, false);
+  view.setUint32(8, MSG_ACCEPTED, false);
+  view.setUint32(12, AUTH_NONE, false);
+  // The `AUTH_NULL` verifier's body is empty, so its length word is the zero
+  // `out` already holds; `accept_stat` follows it.
+  view.setUint32(20, RPC_SUCCESS, false);
   if (results !== undefined) {
-    writer.raw(results);
+    out.set(results, ACCEPTED_REPLY_HEADER_SIZE);
   }
-  return writer.bytes();
+  return out;
 }
 
 /** `MSG_ACCEPTED` with an error status (`PROG_UNAVAIL`, `GARBAGE_ARGS`, …). */
@@ -372,6 +408,20 @@ export function encodeRpcMismatch(xid: number, low = RPC_VERSION, high = RPC_VER
  * across fragments exist and a receiver that assumed otherwise would corrupt
  * them silently.
  */
+/**
+ * Just the 4-byte header for a `length`-byte last fragment.
+ *
+ * For a sender that would rather put the mark and the message on the socket as
+ * two chunks than copy the message to put them on as one — which is what
+ * `server.ts` does, since a corked pair leaves as one `writev` and a
+ * {@link frameRecord} of a 1 MiB `READ` is a 1 MiB `memcpy`.
+ */
+export function recordMark(length: number): Uint8Array {
+  const mark = new Uint8Array(4);
+  new DataView(mark.buffer).setUint32(0, RM_LAST_FRAGMENT | length, false);
+  return mark;
+}
+
 export function frameRecord(message: Uint8Array): Uint8Array {
   const framed = new Uint8Array(4 + message.byteLength);
   new DataView(framed.buffer).setUint32(0, RM_LAST_FRAGMENT | message.byteLength, false);
@@ -409,98 +459,231 @@ export function frameFragments(message: Uint8Array, size: number): Uint8Array {
 }
 
 /**
+ * A genuine copy, whatever the input is.
+ *
+ * Not `bytes.slice(start, end)`: the input here is always a socket `Buffer`,
+ * and `Buffer.prototype.slice` **is `subarray`** — it returns a view, the trap
+ * `xdr.ts` documents at length.
+ *
+ * `xdr.ts` spells its copy `Uint8Array.prototype.slice.call`, which is equally
+ * correct and costs the same — the two are within noise of each other at every
+ * size and from either kind of input. What differs is the *type* that comes
+ * back: `slice.call` goes through `TypedArraySpeciesCreate`, so a `Buffer` in
+ * gives a `Buffer` out, and a record handed to a session would then be a value
+ * whose own `.slice()` is `subarray` again. A record exists to be owned
+ * outright by whoever holds it; handing back a plain `Uint8Array` keeps that
+ * from depending on what the socket happened to allocate.
+ */
+function copyBytes(bytes: Uint8Array, start: number, end: number): Uint8Array {
+  const out = new Uint8Array(end - start);
+  out.set(bytes.subarray(start, end));
+  return out;
+}
+
+/**
+ * How many fragments one record may arrive in, derived from its byte limit.
+ *
+ * A fragment costs a `Uint8Array` and an array slot whatever its length, so the
+ * byte limit alone does not bound what a record can make this class hold: a
+ * legal fragment may carry **zero** bytes, and a stream of bare 4-byte headers
+ * would grow `#fragments` without ever advancing `#assembled` (measured: 2 MB
+ * in, 59 MB retained). One fragment per kibibyte of the limit is far above what
+ * any real client does — the kernel's client and every `mount.nfs` send one
+ * fragment per record, and libtirpc's `xdrrec` flushes at its 8800-byte send
+ * buffer — and far below the count that makes the overhead matter.
+ */
+function fragmentLimit(byteLimit: number): number {
+  return Math.max(64, Math.ceil(byteLimit / 1024));
+}
+
+/**
  * The receiving half of record marking: bytes in, whole messages out.
  *
- * A stream reassembler, so it has to be paranoid about exactly two things — a
- * fragment header that claims more than the limit, and a record whose fragments
- * add up past it. Both are answered by throwing, which the server turns into a
- * closed connection: there is no way to resynchronize a record-marked stream
- * once a length is not to be believed.
+ * A stream reassembler, so it has to be paranoid about exactly three things — a
+ * fragment header that claims more than the byte limit, a record whose
+ * fragments add up past it, and a record split into more fragments than
+ * {@link fragmentLimit} allows. All three are answered by throwing, which the
+ * server turns into a closed connection: there is no way to resynchronize a
+ * record-marked stream once a length is not to be believed.
+ *
+ * ## Every record handed out is a copy
+ *
+ * Records used to be views of the socket chunk they arrived in whenever they
+ * fit in one, and copies whenever they did not — a per-caller contract that
+ * depended on how the bytes happened to be delivered. They are copies now,
+ * always, and the contract is simply that the caller owns what it is handed.
+ * The cost is one `memcpy` per record, which is what buys:
+ *
+ * - **Linear reassembly.** The old `concat(buffer, chunk)` per delivery was
+ *   O(n²) in record size against libuv's 64 KiB `data` cap — a legal 8 MiB
+ *   record cost ~79 ms of `memcpy` and blocked the event loop for all of it.
+ *   Deliveries are queued instead and the copy happens once, when a fragment is
+ *   complete: the same 8 MiB now reassembles in ~1.2 ms, and 1 MiB in 74 µs
+ *   against 823 µs.
+ * - **No pinned socket memory.** A 120-byte record that was a view kept its
+ *   whole 64 KiB pool slab alive for as long as anything held it. The old
+ *   defense against that (`#buffer.slice()`) never fired: `concat` returned the
+ *   socket `Buffer` unchanged when nothing was pending, so `.slice()` was
+ *   `subarray`.
+ *
+ * Downstream is unaffected either way — `xdr.ts` copies everything it retains,
+ * which is the standing rule and stays the standing rule.
  */
 export class RecordAssembler {
-  /** Bytes accepted for the record currently being assembled. */
+  /** Fragment bodies accepted for the record being assembled. Empty ones are not kept. */
   #fragments: Uint8Array[] = [];
+  /** Payload bytes accepted for it. */
   #assembled = 0;
-  /** Buffered stream bytes not yet consumed as a fragment. */
-  #buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  /** Fragments accepted for it, empty ones included — what {@link fragmentLimit} bounds. */
+  #count = 0;
+  /**
+   * Deliveries not yet consumed, oldest first, with `#head` bytes of the first
+   * already taken. Appending is O(1), which is the whole point.
+   */
+  #chunks: Uint8Array[] = [];
+  #head = 0;
+  /** Bytes across `#chunks` past `#head`. */
+  #buffered = 0;
   readonly #limit: number;
+  readonly #maxFragments: number;
 
-  constructor(limit = 8 * 1024 * 1024) {
+  constructor(limit = 8 * 1024 * 1024, maxFragments = fragmentLimit(limit)) {
     this.#limit = limit;
+    this.#maxFragments = Math.max(1, Math.trunc(maxFragments));
   }
 
-  /** Bytes held for a partially received record. */
+  /**
+   * Bytes held for a partially received record.
+   *
+   * Fragment headers count: they are four bytes this class consumed and cannot
+   * give back, and leaving them out is what let a flood of empty fragments
+   * report `0` while it grew.
+   */
   get pending(): number {
-    return this.#assembled + this.#buffer.byteLength;
+    return this.#assembled + this.#count * 4 + this.#buffered;
   }
 
   /**
    * Feed the socket's bytes in; get whatever complete records came out.
    *
-   * **The records may be views of `chunk`**, and `chunk` itself is kept when a
-   * record spans deliveries — so a caller must not overwrite a buffer it has
-   * handed over. That is deliberate rather than an oversight: a record is
-   * consumed by decoders that copy everything they retain (`xdr.ts`), so
-   * nothing downstream ever holds socket memory, and the framing layer stays
-   * free of a per-message `memcpy` on the `WRITE` path. Node's own socket
-   * chunks satisfy the contract — libuv allocates each one out of a pool it
-   * only ever advances.
+   * `chunk` is **kept** — queued as-is until its bytes have been consumed into a
+   * fragment — so a caller must not overwrite a buffer it has handed over.
+   * Node's own socket chunks satisfy that: libuv allocates each one out of a
+   * pool it only ever advances. The records coming back have no such condition
+   * on them; see the class docs.
    */
   push(chunk: Uint8Array<ArrayBufferLike>): Uint8Array[] {
-    this.#buffer = concat(this.#buffer, chunk);
+    if (chunk.byteLength > 0) {
+      this.#chunks.push(chunk);
+      this.#buffered += chunk.byteLength;
+    }
     const records: Uint8Array[] = [];
-    for (;;) {
-      if (this.#buffer.byteLength < 4) {
-        break;
-      }
-      const header = new DataView(
-        this.#buffer.buffer,
-        this.#buffer.byteOffset,
-        this.#buffer.byteLength,
-      ).getUint32(0, false);
+    while (this.#buffered >= 4) {
+      const header = this.#header();
       const length = header & RM_LENGTH_MASK;
       const last = (header & RM_LAST_FRAGMENT) !== 0;
+      // Both bounds are checked before the fragment is complete, so a record
+      // that cannot be legal is refused without being buffered first.
       if (this.#assembled + length > this.#limit) {
         throw new XdrError(
           `RPC record of at least ${this.#assembled + length} bytes exceeds the ` +
             `${this.#limit}-byte limit`,
         );
       }
-      if (this.#buffer.byteLength < 4 + length) {
+      if (this.#count >= this.#maxFragments) {
+        throw new XdrError(
+          `RPC record arrived in more than ${this.#maxFragments} fragments ` +
+            `(${this.#assembled} bytes so far)`,
+        );
+      }
+      if (this.#buffered < 4 + length) {
         break;
       }
-      this.#fragments.push(this.#buffer.slice(4, 4 + length));
+      this.#drop(4);
       this.#assembled += length;
-      this.#buffer = this.#buffer.subarray(4 + length);
+      this.#count++;
+      if (length > 0) {
+        this.#fragments.push(this.#take(length));
+      }
       if (last) {
         records.push(join(this.#fragments, this.#assembled));
         this.#fragments = [];
         this.#assembled = 0;
+        this.#count = 0;
       }
     }
-    // The remaining view keeps the whole chunk alive; copy it loose once it is
-    // the only thing left, so a big write does not pin its buffer forever.
-    if (this.#buffer.byteLength > 0 && this.#buffer.byteOffset > 0) {
-      this.#buffer = this.#buffer.slice();
+    // What is left over is a partial fragment. While it spans deliveries it
+    // stays queued — copying it out on every delivery is the O(n²) this class
+    // exists to avoid — but a tail sitting inside one otherwise-consumed chunk
+    // is copied loose, so a 4-byte remainder does not pin a 64 KiB pool slab.
+    if (this.#chunks.length === 1 && this.#head > 0) {
+      this.#chunks[0] = copyBytes(this.#chunks[0]!, this.#head, this.#head + this.#buffered);
+      this.#head = 0;
     }
     return records;
   }
-}
 
-function concat(
-  left: Uint8Array<ArrayBufferLike>,
-  right: Uint8Array<ArrayBufferLike>,
-): Uint8Array<ArrayBufferLike> {
-  if (left.byteLength === 0) {
-    return right;
+  /** The next four buffered bytes as a big-endian u32, without consuming them. */
+  #header(): number {
+    let value = 0;
+    let need = 4;
+    let at = this.#head;
+    for (let index = 0; need > 0; index++) {
+      const chunk = this.#chunks[index]!;
+      for (let byte = at; byte < chunk.byteLength && need > 0; byte++) {
+        value = value * 0x1_00 + chunk[byte]!;
+        need--;
+      }
+      at = 0;
+    }
+    return value;
   }
-  const out = new Uint8Array(left.byteLength + right.byteLength);
-  out.set(left, 0);
-  out.set(right, left.byteLength);
-  return out;
+
+  /**
+   * Consume `length` buffered bytes, copied out. Only ever called with enough
+   * present, and with `length > 0`.
+   *
+   * One allocation and one pass over the fragment however many deliveries it
+   * spans — which is the whole difference from the `concat`-per-delivery this
+   * replaced.
+   */
+  #take(length: number): Uint8Array {
+    const out = new Uint8Array(length);
+    let filled = 0;
+    while (filled < length) {
+      const chunk = this.#chunks[0]!;
+      const width = Math.min(chunk.byteLength - this.#head, length - filled);
+      out.set(chunk.subarray(this.#head, this.#head + width), filled);
+      filled += width;
+      this.#advance(width);
+    }
+    return out;
+  }
+
+  /** Consume `count` buffered bytes without copying them: a fragment header. */
+  #drop(count: number): void {
+    let dropped = 0;
+    while (dropped < count) {
+      const chunk = this.#chunks[0]!;
+      const width = Math.min(chunk.byteLength - this.#head, count - dropped);
+      dropped += width;
+      this.#advance(width);
+    }
+  }
+
+  #advance(width: number): void {
+    this.#head += width;
+    this.#buffered -= width;
+    if (this.#head === this.#chunks[0]!.byteLength) {
+      this.#chunks.shift();
+      this.#head = 0;
+    }
+  }
 }
 
 function join(parts: Uint8Array[], total: number): Uint8Array {
+  // One fragment is the common record and `#take` already copied it; zero
+  // fragments is the empty record, legal and produced by real clients.
   if (parts.length === 1) {
     return parts[0]!;
   }

@@ -24,7 +24,16 @@ export interface OpenFlags {
   exclusive: boolean;
 }
 
-const STRING_FLAGS: Record<string, OpenFlags> = Object.fromEntries(
+/**
+ * A `Map` rather than an object literal, deliberately: a plain object inherits
+ * from `Object.prototype`, so `STRING_FLAGS["toString"]` is a *function* and
+ * `STRING_FLAGS["__proto__"]` is `Object.prototype` — neither `undefined`, so
+ * both would sail past the check in {@link parseOpenFlags} and produce a
+ * "flags" object whose `read`/`write`/`create` are all `undefined`. The handle
+ * that came back would then answer `EBADF` to everything instead of the open
+ * being rejected outright.
+ */
+const STRING_FLAGS: ReadonlyMap<string, OpenFlags> = new Map(
   (
     [
       ["r", "r--"],
@@ -38,7 +47,7 @@ const STRING_FLAGS: Record<string, OpenFlags> = Object.fromEntries(
       ["a+", "rwca"],
       ["ax+", "rwcax"],
     ] as const
-  ).map(([name, spec]) => [
+  ).map(([name, spec]): [string, OpenFlags] => [
     name,
     {
       read: spec.includes("r"),
@@ -70,7 +79,7 @@ export function parseOpenFlags(flags: string | number, path: string): OpenFlags 
       exclusive: (flags & constants.O_EXCL) !== 0,
     };
   }
-  const parsed = STRING_FLAGS[flags.replace(/s/g, "")];
+  const parsed = STRING_FLAGS.get(flags.replace(/s/g, ""));
   if (parsed === undefined) {
     throw fsError("EINVAL", { syscall: "open", path, message: `Invalid open flags: '${flags}'` });
   }
@@ -80,6 +89,14 @@ export function parseOpenFlags(flags: string | number, path: string): OpenFlags 
 /**
  * `node:fs` argument validation for `read` / `write`: a driver that quietly
  * clamped these would report byte counts it never copied.
+ *
+ * The order of the checks is `node:fs`'s own, verified against it rather than
+ * reasoned about — `offset` is checked for integrality *before* its range
+ * (`-0.5` is "must be an integer", `-1` is "must be >= 0"), and `length` the
+ * other way round (`-0.5` is "must be >= 0"). The one place this is stricter
+ * than `node:fs` is a fractional `length`, which Node's JavaScript layer lets
+ * through to a C++ `CHECK(args[3]->IsInt32())` that aborts the process; a
+ * `RangeError` is the only sane reading of "what would `node:fs` do".
  */
 export function validateRange(
   buffer: Uint8Array,
@@ -89,7 +106,10 @@ export function validateRange(
 ): { start: number; count: number } {
   const byteLength = buffer.byteLength;
   const start = offset ?? 0;
-  if (start < 0) {
+  if (!Number.isInteger(start)) {
+    throw rangeError("offset", "an integer", start);
+  }
+  if (start < 0 || start > Number.MAX_SAFE_INTEGER) {
     throw rangeError("offset", `>= 0 && <= ${Number.MAX_SAFE_INTEGER}`, start);
   }
   if (write && start > byteLength) {
@@ -99,18 +119,38 @@ export function validateRange(
   if (count < 0) {
     throw rangeError("length", ">= 0", count);
   }
-  if (count > byteLength - start) {
+  // A zero-length read is the one shape that survives an out-of-range read
+  // offset: `node:fs` copies nothing, looks at nothing, and reports
+  // `bytesRead: 0`. Without this the remaining bound would compare `0` against
+  // a *negative* remainder and reject a call the oracle accepts.
+  if (count > 0 && count > byteLength - start) {
     throw rangeError("length", `<= ${byteLength - start}`, count);
+  }
+  if (!Number.isInteger(count)) {
+    throw rangeError("length", "an integer", count);
   }
   return { start, count };
 }
 
-/** An explicit position, or `undefined` for "wherever the handle is" (`null` and `-1`). */
+/**
+ * An explicit position, or `undefined` for "wherever the handle is" (`null` and
+ * `-1`).
+ *
+ * A fractional position is rejected rather than carried: it reaches
+ * `resizeBytes(node, 1.5 + count)` on the write side, and on the read side it
+ * comes back out as a *fractional* `bytesRead` — measured at `3.5` before this
+ * check existed — which then flows into every caller that adds it to an offset.
+ * `node:fs` rejects one with `ERR_OUT_OF_RANGE` "It must be an integer", which
+ * also covers `NaN` and `Infinity`.
+ */
 export function validatePosition(position: number | null | undefined): number | undefined {
   if (position === undefined || position === null || position === -1) {
     return undefined;
   }
-  if (position < -1) {
+  if (!Number.isInteger(position)) {
+    throw rangeError("position", "an integer", position);
+  }
+  if (position < -1 || position > Number.MAX_SAFE_INTEGER) {
     throw rangeError("position", `>= -1 && <= ${Number.MAX_SAFE_INTEGER}`, position);
   }
   return position;
