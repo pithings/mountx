@@ -1,7 +1,12 @@
 #!/bin/sh
-# SPIKE harness: build the three interception mechanisms and run one identical
-# workload through each, so the comparison in `.agents/proot-plan.md` is
-# measured rather than argued.
+# Build both interception mechanisms and run one identical workload through
+# each, so the comparison in `.agents/proot-plan.md` is measured rather than
+# argued.
+#
+# A third mechanism, an `LD_PRELOAD` interposer, was measured here too and is
+# gone: its column could not serve a static or Go binary at all, and its
+# write-back row lost data while reporting success. `.agents/proot-plan.md`
+# keeps the numbers; the code is out of the tree.
 #
 #   sh test/exec/compare.sh
 #
@@ -25,14 +30,10 @@ zig cc -target x86_64-linux-musl -static test/exec/probe.c -O2 -o "$OUT/probe-mu
 # into calls to the libc this binary deliberately does not have.
 zig cc -target x86_64-linux-none -nostdlib -static -ffreestanding -fno-builtin \
   test/exec/probe-raw.c -O2 -o "$OUT/probe-raw"
-( cd src/exec && zig build-lib -dynamic -lc -fPIC -O ReleaseSmall \
-    -femit-bin="$OUT/libmountx-shim.so" preload/shim.zig )
 ( cd src/exec && zig build-exe -lc -O ReleaseSmall -femit-bin="$OUT/mountx-trace" \
-    --dep p9 -Mroot=seccomp/trace.zig -Mp9=preload/p9.zig )
-row "shim" "$(wc -c < "$OUT/libmountx-shim.so") bytes"
+    --dep p9 -Mroot=seccomp/trace.zig -Mp9=seccomp/p9.zig )
 row "supervisor" "$(wc -c < "$OUT/mountx-trace") bytes"
 
-export MOUNTX_SHIM="$OUT/libmountx-shim.so"
 export MOUNTX_TRACE="$OUT/mountx-trace"
 
 # The checksum every passing run must produce over the 3 MiB file. Any
@@ -54,10 +55,9 @@ probe() { # <spike-runner> <probe>
 
 # Each column is one *named* mechanism, run through its own demo runner, so the
 # comparison never depends on what the picker in `mountx/exec` would have chosen.
-for spike in userns preload seccomp; do
+for spike in userns seccomp; do
   case $spike in
     userns)  name="A  userns + FUSE" ;;
-    preload) name="B  LD_PRELOAD" ;;
     seccomp) name="C  seccomp notify" ;;
   esac
   say "spike $name"
@@ -66,7 +66,7 @@ for spike in userns preload seccomp; do
   done
 done
 
-say "coreutils workload (glibc, the case all three claim)"
+say "coreutils workload (glibc, the case both claim)"
 WORK='
   set -e
   ls "$MOUNTX_ROOT" >/dev/null
@@ -77,10 +77,10 @@ WORK='
   find "$MOUNTX_ROOT" -type f | wc -l
   du -s "$MOUNTX_ROOT" | cut -f1
 '
-for spike in userns preload seccomp; do
+for spike in userns seccomp; do
   printf '  %-8s: ' "$spike"
   timeout 90 node "src/exec/demo-$spike.ts" sh -c "$WORK" 2>&1 |
-    grep -vE '^\[(userns|preload|seccomp)' | tr '\n' ' '
+    grep -vE '^\[(userns|seccomp)' | tr '\n' ' '
   printf '\n'
 done
 
@@ -100,10 +100,10 @@ WRITES='
   rm -f "$MOUNTX_ROOT/w.txt"
   test -e "$MOUNTX_ROOT/w.txt" && echo "STILL THERE" || echo removed
 '
-for spike in userns preload seccomp; do
+for spike in userns seccomp; do
   printf '  %-8s: ' "$spike"
   timeout 90 node "src/exec/demo-$spike.ts" sh -c "$WRITES" 2>&1 |
-    grep -vE '^\[(userns|preload|seccomp)' | tr '\n' ' '
+    grep -vE '^\[(userns|seccomp)' | tr '\n' ' '
   printf '\n'
 done
 

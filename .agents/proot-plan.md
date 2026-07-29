@@ -130,7 +130,11 @@ verbatim with no helper and no native addon.
 
 ## Spike B — `LD_PRELOAD`
 
-Works, and should not be shipped.
+Works, and should not be shipped. **The code has since been removed from the
+branch** (`src/exec/preload.ts`, `preload/shim.zig`, `demo-preload.ts`); what
+follows is why, and it is kept because the reasoning is what justifies the
+shape of the two mechanisms that remain. The 9P client it shared with the
+seccomp supervisor stayed and now lives at `src/exec/seccomp/p9.zig`.
 
 It reached a genuinely useful level of function — `ls -la`, `cat`, `grep`,
 `tail`, `sha256sum`, `find`, `du` and a full `cp -r` of the tree all behave —

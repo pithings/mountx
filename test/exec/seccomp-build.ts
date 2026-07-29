@@ -74,7 +74,7 @@ async function build(): Promise<string> {
       "--dep",
       "p9",
       "-Mroot=seccomp/trace.zig",
-      "-Mp9=preload/p9.zig",
+      "-Mp9=seccomp/p9.zig",
     ],
     { cwd: new URL("../../src/exec/", import.meta.url).pathname },
   );

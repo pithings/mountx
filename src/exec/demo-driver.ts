@@ -1,4 +1,4 @@
-/** SPIKE — the tree all three spikes are pointed at, so their results compare. */
+/** The tree both mechanisms are pointed at, so their results compare. */
 
 import { createMemoryDriver } from "../drivers/memory.ts";
 import { createLoopback } from "../harness.ts";
