@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { readFile, stat as nodeStat } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
@@ -18,6 +19,56 @@ import {
   splitPath,
 } from "../src/index.ts";
 import type { FsDriver } from "../src/index.ts";
+
+describe("every entry point runs under node's type stripping", () => {
+  /**
+   * `package.json` runs TypeScript sources directly — `node bench/index.ts`,
+   * `node src/cli/index.ts`, `node test/matrix.ts` — so `src/` may only use the
+   * TypeScript that node can *erase*. Anything needing emit (a parameter
+   * property, an `enum`, a `namespace`) throws
+   * `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` at import.
+   *
+   * Vitest cannot catch this: it transforms TypeScript in full, so a file that
+   * node refuses passes every suite. It reached `main` exactly that way — a
+   * `constructor(readonly slotid: number)` in `src/nfs/v4/state.ts` broke
+   * `pnpm bench` and `pnpm mountx -t nfs` from the day NFSv4.1 landed, with the
+   * whole suite green over it.
+   *
+   * Hence a real subprocess: one node, importing every published entry point,
+   * which is also why this asserts nothing about *which* syntax is at fault.
+   * The failure mode is "node cannot load it", and the check is node.
+   */
+  it("loads each published entry point in a plain node process", async () => {
+    const entries = [
+      "src/index.ts",
+      "src/auto.ts",
+      "src/fuse/index.ts",
+      "src/nfs/index.ts",
+      "src/9p/index.ts",
+      "src/s3/index.ts",
+      "src/drivers/memory.ts",
+      "src/drivers/node-fs.ts",
+      "src/drivers/unstorage.ts",
+    ];
+    const root = new URL("..", import.meta.url);
+    const program = entries
+      .map((entry) => `await import(${JSON.stringify(new URL(entry, root).href)});`)
+      .join("\n");
+
+    const node = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", program], {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => (stderr += chunk));
+      child.on("close", (code) => resolve({ code, stderr }));
+    });
+
+    expect(node.stderr).not.toContain("ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX");
+    expect({ code: node.code, stderr: node.stderr }).toEqual({ code: 0, stderr: "" });
+  }, 30_000);
+});
 
 describe("the root export's module graph", () => {
   /**

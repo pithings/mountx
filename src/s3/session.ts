@@ -552,9 +552,10 @@ function refuse(name: S3ErrorName, message?: string): S3ErrorThrown {
  * arrive.
  */
 class BodySourceError extends Error {
-  constructor(override readonly cause: unknown) {
+  constructor(cause: unknown) {
     super("the request body ended before the request did");
     this.name = "BodySourceError";
+    this.cause = cause;
   }
 }
 
