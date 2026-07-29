@@ -20,6 +20,7 @@ import {
   nfsMountOptions,
   ownershipRefusal,
   parseMountTable,
+  versionRefusal,
 } from "../../src/nfs/mount.ts";
 
 /** The option string as `key` → `value`, with valueless options mapped to `""`. */
@@ -106,6 +107,91 @@ describe("nfsMountOptions", () => {
   });
 });
 
+describe("nfsMountOptions, version 4.1", () => {
+  it("emits exactly the v4.1 option string, in order", () => {
+    // Pinned whole rather than field by field: the option string is the entire
+    // interface to `mount(8)`, and an option appearing where it should not is
+    // as much of a bug as one missing.
+    expect(nfsMountOptions(20_490, { version: "4.1" }, "linux")).toBe(
+      "vers=4.1,proto=tcp,port=20490,soft,timeo=50,retrans=2",
+    );
+  });
+
+  it("leaves out the two options nfs(5) marks version-2-and-3-only", () => {
+    const parsed = options(nfsMountOptions(2049, { version: "4.1" }, "linux"));
+    // No MOUNT program in v4, so nothing to point a `mountport` at.
+    expect(parsed.has("mountport")).toBe(false);
+    // NLM is folded into v4, so `nolock` is not an option there.
+    expect(parsed.has("nolock")).toBe(false);
+    expect(parsed.has("nolocks")).toBe(false);
+    // `port` still matters: the server is on an ephemeral one, not 2049.
+    expect(parsed.get("port")).toBe("2049");
+    expect(parsed.get("vers")).toBe("4.1");
+  });
+
+  it("does not send clientaddr, which mount(8) discovers and nothing here uses", () => {
+    // `nfs(5)`: with the option absent the mount command finds the callback
+    // address itself. This server originates no callback at all — no
+    // delegations, no pNFS, no backchannel asked for — and hard-coding the
+    // loopback address would be wrong for any other `host`.
+    expect(options(nfsMountOptions(1, { version: "4.1" }, "linux")).has("clientaddr")).toBe(false);
+  });
+
+  it("keeps the options every version shares, and the caller's, in the v4 branch", () => {
+    const parsed = options(
+      nfsMountOptions(
+        1,
+        { version: "4.1", hard: true, timeo: 7, retrans: 0, readOnly: true },
+        "linux",
+      ),
+    );
+    expect(parsed.has("hard")).toBe(true);
+    expect(parsed.has("soft")).toBe(false);
+    expect(parsed.get("timeo")).toBe("7");
+    expect(parsed.get("retrans")).toBe("0");
+    expect(parsed.has("ro")).toBe(true);
+    const text = nfsMountOptions(1, { version: "4.1", mountOptions: ["nconnect=2"] }, "linux");
+    expect(text.endsWith(",nconnect=2")).toBe(true);
+  });
+
+  it("refuses to build a macOS v4.1 mount at all", () => {
+    expect(() => nfsMountOptions(1, { version: "4.1" }, "darwin")).toThrow(/Linux-only/);
+  });
+
+  it("leaves version 3 exactly as it was, however it is spelled", () => {
+    // The default and the explicit `3` are the same string, and it is the one
+    // the assertions above this block already pin.
+    for (const platform of ["linux", "darwin"] as const) {
+      expect(nfsMountOptions(2049, { version: 3 }, platform)).toBe(
+        nfsMountOptions(2049, {}, platform),
+      );
+    }
+    expect(nfsMountOptions(2049, {}, "linux")).toBe(
+      "vers=3,proto=tcp,port=2049,mountport=2049,nolock,soft,timeo=50,retrans=2",
+    );
+    expect(nfsMountOptions(2049, {}, "darwin")).toBe(
+      "vers=3,proto=tcp,port=2049,mountport=2049,nolocks,soft,timeo=50,retrans=2,nobrowse",
+    );
+  });
+});
+
+describe("versionRefusal", () => {
+  it("refuses 4.1 on macOS, naming what is assumed rather than the error", () => {
+    const refusal = versionRefusal("darwin", "4.1");
+    // A1: macOS is treated as 4.0-only until somebody verifies otherwise, and
+    // 4.1 is the only minor version this server speaks.
+    expect(refusal).toContain("4.0-only");
+    expect(refusal).toContain("version: 3");
+  });
+
+  it("allows everything else, including the default", () => {
+    expect(versionRefusal("linux", "4.1")).toBeUndefined();
+    expect(versionRefusal("darwin", 3)).toBeUndefined();
+    expect(versionRefusal("darwin")).toBeUndefined();
+    expect(versionRefusal("linux")).toBeUndefined();
+  });
+});
+
 describe("parseMountTable", () => {
   it("reads /proc/self/mounts, escapes and all", () => {
     const table = [
@@ -149,6 +235,20 @@ describe("parseMountTable", () => {
       target: "/tmp/what",
       type: "nfs",
     });
+  });
+
+  it("reads a vers=4.1 mount, which Linux lists under its own filesystem type", () => {
+    // The one mount-table difference version 4 makes: `mount -t nfs -o
+    // vers=4.1` produces an entry of type `nfs4`, because Linux registers the
+    // version-4 client as a separate filesystem. Nothing in `mount.ts` matches
+    // on the type — teardown asks about the mountpoint — and this is what a
+    // consumer that starts to would have to cover.
+    const table = "127.0.0.1:/ /tmp/mountx nfs4 rw,vers=4.1,soft,proto=tcp 0 0";
+    expect(parseMountTable("linux", table)).toEqual([
+      { source: "127.0.0.1:/", target: "/tmp/mountx", type: "nfs4" },
+    ]);
+    // And the prefix the CLI's stale-mount cleanup matches on still covers it.
+    expect(parseMountTable("linux", table)[0]!.type.startsWith("nfs")).toBe(true);
   });
 
   it("ignores lines that are not entries", () => {
@@ -220,6 +320,25 @@ describe("nfsClientProbe", () => {
       // Linux's unprivileged mount needs an `fstab` entry marked `user`, which
       // is not something a library can arrange, so the requirement is real.
       expect(linux).toContain("needs root");
+    }
+  });
+
+  it("answers the v4 question separately, and only Linux can answer yes", () => {
+    // A1 again: macOS is treated as 4.0-only, so the field is false there
+    // whatever the host running this is, and the v3 path is untouched by it.
+    expect(nfsClientProbe("darwin").v4).toBe(false);
+    expect(nfsClientProbe("win32").v4).toBe(false);
+    // On Linux it is a fact about the *host*, not about this process: a
+    // non-root run reports `usable: false` and still says whether the client is
+    // there. Off Linux the file it reads does not exist, so the answer is
+    // `false` rather than a thrown `ENOENT`.
+    const linux = nfsClientProbe("linux");
+    expect(typeof linux.v4).toBe("boolean");
+    // The one implication that holds on every host: the helper loads whichever
+    // module a `vers=` asks for, so having it is enough — the same escape
+    // hatch `kernel`'s weakness note describes.
+    if (linux.helper !== undefined) {
+      expect(linux.v4).toBe(true);
     }
   });
 });

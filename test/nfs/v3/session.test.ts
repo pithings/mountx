@@ -53,6 +53,7 @@ import {
   RPC_PROG_MISMATCH,
   RPC_PROG_UNAVAIL,
 } from "../../../src/nfs/v3/constants.ts";
+import { NFS_V4 } from "../../../src/nfs/v4/constants.ts";
 import { decodeReply, encodeCall, frameFragments } from "../../../src/nfs/rpc.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
 import type { FsDriver } from "../../../src/types.ts";
@@ -159,7 +160,12 @@ describe("RPC-level errors", () => {
       procedure: NFSPROC3_NULL,
     });
     expect(nfs.acceptStat).toBe(RPC_PROG_MISMATCH);
-    expect([nfs.low, nfs.high]).toEqual([NFS_V3, NFS_V3]);
+    // The range is the *server's*, not this session's: a record naming an NFS
+    // version other than 3 never reaches here at all — the router in
+    // `src/nfs/session.ts` refuses it with the pair of versions the server
+    // speaks, which `test/nfs/session.test.ts` holds. This asserts the number a
+    // client actually receives from a server built by `createNfsServer`.
+    expect([nfs.low, nfs.high]).toEqual([NFS_V3, NFS_V4]);
     const mount = await answer(server, {
       xid: 3,
       program: MOUNT_PROGRAM,

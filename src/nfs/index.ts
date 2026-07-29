@@ -27,9 +27,11 @@ export * from "./v3/constants.ts";
 export * from "./handles.ts";
 // Everything from `mount.ts` **except** `parseMountTable`/`mountEntryAt`/
 // `MountEntry`, which are the platform's mount-table format rather than
-// anything a consumer of this package composes with. Same treatment, and same
-// reason, as the sub-struct helpers below: still exported from `mount.ts` for
-// the tests and for the CLI.
+// anything a consumer of this package composes with, and the pure refusal
+// predicates (`ownershipRefusal`, `versionRefusal`, `isConsentDenial`,
+// `consentAdvice`), which are what `mountNfs` says when it refuses rather than
+// something a caller asks. Same treatment, and same reason, as the sub-struct
+// helpers below: still exported from `mount.ts` for the tests and for the CLI.
 export {
   liveNfsMounts,
   mountNfs,
@@ -39,6 +41,7 @@ export {
   type NfsMount,
   nfsMountOptions,
   type NfsPlatform,
+  type NfsVersion,
   unmountAllNfs,
 } from "./mount.ts";
 // Everything from `protocol.ts` **except** the sub-struct helpers

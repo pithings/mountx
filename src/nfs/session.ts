@@ -34,14 +34,20 @@
  * readers on both, and `stats` add up across the pair. Each versioned session
  * still builds its own when constructed alone, which is what its unit tests do.
  *
- * **Version 4, for now.** A record naming NFS version 4 reaches
- * {@link Nfs4Session}, but the `PROG_MISMATCH` range this file advertises is
- * still `{low: 3, high: 3}` — so a client that negotiates is told this server
- * speaks v3 and nothing else, and v4 is reached only by a caller that already
- * decided to send it, which today means the tests. Raising the advertised range
- * is the version-switch step, and it is deliberately not this one: the mount
- * options, the client probe and the range move together or a client is offered
- * a version the mount command cannot ask for.
+ * **Two versions, advertised.** A record naming NFS version 4 reaches
+ * {@link Nfs4Session}, and the `PROG_MISMATCH` range this file answers with is
+ * `{low: 3, high: 4}` — so a client that negotiates downwards from a version it
+ * cannot get is told this server speaks both. The range, the mount options
+ * (`src/nfs/mount.ts`) and the client probe (`src/nfs/probe.ts`) moved together
+ * on purpose: advertising a version the mount command cannot be told to ask for
+ * would be an offer nothing can take up.
+ *
+ * The *minor* version is not this file's business. `vers=4.1` and `vers=4.0`
+ * are the same `vers` field on the wire — 4 — and the minor version travels
+ * inside COMPOUND, where {@link Nfs4Session} refuses everything but 1 with
+ * `NFS4ERR_MINOR_VERS_MISMATCH` (RFC 8881 §16.2.3). A 4.0 client is therefore
+ * routed here and refused there, which is the clean answer rather than a
+ * `PROG_MISMATCH` that would claim v4 is unavailable altogether.
  */
 
 import type { Loopback } from "../harness.ts";
@@ -93,7 +99,7 @@ const PEEK_BYTES = VERSION_OFFSET + 4;
 
 /** The lowest and highest NFS version this server answers, for `PROG_MISMATCH`. */
 const NFS_VERSION_LOW = NFS_V3;
-const NFS_VERSION_HIGH = NFS_V3;
+const NFS_VERSION_HIGH = NFS_V4;
 
 /** `(prog, vers)` read at their fixed offsets, or `undefined` for a short record. */
 function peekProgram(message: Uint8Array): { program: number; version: number } | undefined {
