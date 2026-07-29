@@ -339,15 +339,24 @@ fn walkTo(path: []const u8, follow: bool, depth: u32) p9.Error!Walked {
         count += 1;
     }
 
+    // Cleanup is explicit rather than an `errdefer`, and that is not a style
+    // choice. The symlink branch below clunks the fid *itself* before recursing
+    // — an `errdefer` then clunks it a second time on the way out of a failed
+    // resolution, the server answers `EBADF` for a fid it has already
+    // forgotten, and that errno overwrites the `ENOENT` the caller was about to
+    // report. A dangling symlink came back as `EBADF`. Witnessed.
     const fid = client.allocFid();
-    errdefer client.clunk(fid);
-    try client.walkOnce(client.root_fid, fid, "", null, null);
+    client.walkOnce(client.root_fid, fid, "", null, null) catch |err| {
+        client.freeFid(fid);
+        return err;
+    };
     var qid: p9.Qid = .{ .qtype = p9.P9_QTDIR, .version = 0, .path = 0 };
     if (count == 0) {
-        if (client.getattr(fid)) |attr| {
-            qid = attr.qid;
-        } else |err| return err;
-        return .{ .fid = fid, .qid = qid };
+        const attr = client.getattr(fid) catch |err| {
+            client.clunk(fid);
+            return err;
+        };
+        return .{ .fid = fid, .qid = attr.qid };
     }
 
     // The components consumed so far, which is the directory a relative link
@@ -356,11 +365,17 @@ fn walkTo(path: []const u8, follow: bool, depth: u32) p9.Error!Walked {
     var sofar_len: usize = 0;
     for (parts[0..count], 0..) |name, index| {
         const before = sofar_len;
-        try client.walkOnce(fid, fid, name, &qid, null);
+        client.walkOnce(fid, fid, name, &qid, null) catch |err| {
+            client.clunk(fid);
+            return err;
+        };
         const last = index + 1 == count;
         if ((qid.qtype & p9.P9_QTSYMLINK) != 0 and (follow or !last)) {
             var target: [4096]u8 = undefined;
-            const link = try client.readlink(fid, &target);
+            const link = client.readlink(fid, &target) catch |err| {
+                client.clunk(fid);
+                return err;
+            };
             client.clunk(fid);
             // An absolute target is resolved against the *virtual* root: the
             // tree is its own namespace here, and a link out of it has nowhere
