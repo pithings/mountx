@@ -485,6 +485,31 @@ export function conformance(target: ConformanceTarget): void {
         expect(await read("/dst/moved/deep/file")).toBe("payload");
       });
 
+      itNeeds("handles")("keeps an open file attached across rename", async () => {
+        await fs.writeFile("/from", "aaaa");
+        const handle = await fs.open("/from", "r+");
+        await handle.write(new TextEncoder().encode("bb"), 0, 2, 0);
+        await fs.rename("/from", "/to");
+        await handle.write(new TextEncoder().encode("cc"), 0, 2, 2);
+        await handle.close();
+
+        await rejects(fs.stat("/from"), "ENOENT");
+        expect(await read("/to")).toBe("bbcc");
+      });
+
+      itNeeds("handles")("keeps an open file attached across ancestor rename", async () => {
+        await fs.mkdir("/from");
+        await fs.writeFile("/from/file", "aaaa");
+        const handle = await fs.open("/from/file", "r+");
+        await handle.write(new TextEncoder().encode("bb"), 0, 2, 0);
+        await fs.rename("/from", "/to");
+        await handle.write(new TextEncoder().encode("cc"), 0, 2, 2);
+        await handle.close();
+
+        await rejects(fs.stat("/from"), "ENOENT");
+        expect(await read("/to/file")).toBe("bbcc");
+      });
+
       it("renames a directory onto an empty directory", async () => {
         await fs.mkdir("/a");
         await fs.writeFile("/a/f", "x");
