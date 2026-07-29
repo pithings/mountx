@@ -1,5 +1,5 @@
 /**
- * SPIKE — the in-namespace half of `execUserns()`. Not a shipping module yet.
+ * The in-namespace half of `execUserns()`.
  *
  * This file is the only thing that runs *inside* the user+mount namespace. It
  * exists because of one kernel rule: `unshare(CLONE_NEWUSER)` requires a
@@ -23,7 +23,17 @@
  * single `write(2)`; this side reassembles whole messages before writing, which
  * is what the `#pending` buffer is for.
  *
- * Usage: `node userns-relay.ts <socket> <mountpoint> -- <command> [args...]`
+ * **How a failure in here becomes an error out there.** Everything this process
+ * can fail at happens after `execUserns()` has already handed control to
+ * `unshare(1)`, so an exit status is the only channel back — and an exit status
+ * is exactly what the *command* is going to use too. Reporting `mount(8) never
+ * came up` as "the command exited 70" would be indistinguishable from a command
+ * that exited 70. So {@link fail} also writes its message to the file named by
+ * `$MOUNTX_RELAY_STATUS`, which the parent reads once the child is gone and
+ * turns into a thrown error; a run that never wrote the file ended for the
+ * command's own reasons.
+ *
+ * Usage: `node userns-relay.ts <socket> <mountpoint> <mount-options> -- <command> [args...]`
  */
 
 import { spawn } from "node:child_process";
@@ -38,8 +48,19 @@ const READ_BUFFER = 1024 * 1024 + 4096;
 /** Length prefix width: the `len` field at the head of every FUSE message. */
 const LEN_SIZE = 4;
 
+/** Where the parent reads a failure from. Absent when nobody is listening. */
+const statusPath = process.env.MOUNTX_RELAY_STATUS;
+
 function fail(message: string): never {
   process.stderr.write(`mountx-relay: ${message}\n`);
+  if (statusPath !== undefined) {
+    // Best effort by design: the parent falls back to the exit status, and a
+    // relay that cannot write a file in a directory the parent just made has
+    // worse problems than the message it was trying to leave.
+    try {
+      fs.writeFileSync(statusPath, `${message}\n`);
+    } catch {}
+  }
   process.exit(70);
 }
 
@@ -178,10 +199,11 @@ function run(): void {
   // This is the same rule for the command binary itself: a command that lives
   // on the mount deadlocks here and no amount of care on this side fixes it.
   // Only a relay whose pump is not on the spawning thread would.
-  const child = spawn(command[0]!, command.slice(1), {
-    stdio: "inherit",
-    env: { ...process.env, MOUNTX_ROOT: mountpoint },
-  });
+  // `MOUNTX_RELAY_STATUS` is this process's private channel back to the parent
+  // and means nothing to the command, so it does not travel any further.
+  const env: NodeJS.ProcessEnv = { ...process.env, MOUNTX_ROOT: mountpoint };
+  delete env.MOUNTX_RELAY_STATUS;
+  const child = spawn(command[0]!, command.slice(1), { stdio: "inherit", env });
   child.on("error", (error) => fail(`could not run ${command[0]}: ${error.message}`));
   child.on("exit", (code, signal) => {
     // `umount` here is uid 0 in the namespace, so it needs no helper either.
