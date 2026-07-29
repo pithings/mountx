@@ -26,11 +26,28 @@
  * why this path decodes the call it is about to refuse instead of answering
  * from the peek alone. That ordering is RFC 5531 §9's and is what the v3
  * dispatcher already did for these same records.
+ *
+ * **What the router owns.** One {@link FileHandleTable}, one `PathLock` and one
+ * counters object, constructed here and handed to both versioned sessions
+ * (`../util.ts`'s `NfsSharedState`). That is what makes a handle mean the same
+ * file whichever version a client obtained it through, a `RENAME` exclude
+ * readers on both, and `stats` add up across the pair. Each versioned session
+ * still builds its own when constructed alone, which is what its unit tests do.
+ *
+ * **Version 4, for now.** A record naming NFS version 4 reaches
+ * {@link Nfs4Session}, but the `PROG_MISMATCH` range this file advertises is
+ * still `{low: 3, high: 3}` — so a client that negotiates is told this server
+ * speaks v3 and nothing else, and v4 is reached only by a caller that already
+ * decided to send it, which today means the tests. Raising the advertised range
+ * is the version-switch step, and it is deliberately not this one: the mount
+ * options, the client probe and the range move together or a client is offered
+ * a version the mount command cannot ask for.
  */
 
 import type { Loopback } from "../harness.ts";
+import { PathLock } from "../lock.ts";
 import type { FsDriver } from "../types.ts";
-import type { FileHandleTable } from "./handles.ts";
+import { FileHandleTable } from "./handles.ts";
 import {
   AUTH_NONE,
   AUTH_SYS,
@@ -44,16 +61,27 @@ import {
   RPC_VERSION,
   type RpcCall,
 } from "./rpc.ts";
-import { MOUNT_PROGRAM, NFS_PROGRAM, NFS_V3 } from "./v3/constants.ts";
 import {
-  Nfs3Session,
+  newSessionStats,
   type NfsRequestContext,
   type NfsSessionOptions,
   type NfsSessionStats,
-} from "./v3/session.ts";
+  type NfsSharedState,
+} from "./util.ts";
+import { MOUNT_PROGRAM, NFS_PROGRAM, NFS_V3 } from "./v3/constants.ts";
+import { Nfs3Session } from "./v3/session.ts";
+import { NFS_V4 } from "./v4/constants.ts";
+import { Nfs4Session } from "./v4/session.ts";
 
-export { DEFAULT_DTPREF, DEFAULT_RTMAX, DEFAULT_WTMAX, MAX_OFFSET } from "./v3/session.ts";
-export type { NfsRequestContext, NfsSessionOptions, NfsSessionStats } from "./v3/session.ts";
+export { DEFAULT_DTPREF, DEFAULT_RTMAX, DEFAULT_WTMAX } from "./v3/session.ts";
+export { MAX_OFFSET } from "./util.ts";
+export type {
+  Nfs4StateKnobs,
+  NfsRequestContext,
+  NfsSessionOptions,
+  NfsSessionStats,
+  NfsSharedState,
+} from "./util.ts";
 
 /** Offset of `prog` in a `call_body` (RFC 5531 §9), counting the `xid`. */
 const PROGRAM_OFFSET = 12;
@@ -89,6 +117,11 @@ function servedByV3(program: number, version: number): boolean {
   return program === MOUNT_PROGRAM || (program === NFS_PROGRAM && version === NFS_V3);
 }
 
+/** Whether the v4 session owns this record. NFS only; there is no MOUNT in v4. */
+function servedByV4(program: number, version: number): boolean {
+  return program === NFS_PROGRAM && version === NFS_V4;
+}
+
 /**
  * An NFS server over a driver, with no socket.
  *
@@ -107,11 +140,28 @@ export class NfsSession {
   readonly stats: NfsSessionStats;
 
   readonly #v3: Nfs3Session;
+  readonly #v4: Nfs4Session;
+  readonly #shared: Required<NfsSharedState>;
 
   constructor(driver: FsDriver, options: NfsSessionOptions = {}) {
-    this.#v3 = new Nfs3Session(driver, options);
-    this.options = this.#v3.options;
-    this.stats = this.#v3.stats;
+    // Built here, once, and shared with both — see the module docs.
+    this.#shared = {
+      handles: new FileHandleTable({
+        useDriverIno: options.useDriverIno,
+        verifier: options.verifier,
+      }),
+      lock: new PathLock(),
+      stats: newSessionStats(),
+    };
+    this.#v3 = new Nfs3Session(driver, options, this.#shared);
+    this.#v4 = new Nfs4Session(driver, options, this.#shared);
+    this.options = options;
+    this.stats = this.#shared.stats;
+  }
+
+  /** The NFSv4.1 session, for the tests that drive it directly. */
+  get v4(): Nfs4Session {
+    return this.#v4;
   }
 
   /** The driver, wrapped so paths are normalized and gaps answer `ENOSYS`. */
@@ -121,7 +171,7 @@ export class NfsSession {
 
   /** The file handle table, shared by every version this server speaks. */
   get handles(): FileHandleTable {
-    return this.#v3.handles;
+    return this.#shared.handles;
   }
 
   /** The `writeverf3` every v3 `WRITE` and `COMMIT` reply carries. */
@@ -136,6 +186,11 @@ export class NfsSession {
 
   get destroyed(): boolean {
     return this.#v3.destroyed;
+  }
+
+  /** The v3 session, for the tests and the CLI that reach past the router. */
+  get v3(): Nfs3Session {
+    return this.#v3;
   }
 
   /**
@@ -156,12 +211,15 @@ export class NfsSession {
     if (peeked === undefined || servedByV3(peeked.program, peeked.version)) {
       return this.#v3.handleCall(message, context);
     }
+    if (servedByV4(peeked.program, peeked.version)) {
+      return this.#v4.handleCall(message, context);
+    }
     return this.#refuse(message);
   }
 
-  /** Drop every handle and cached listing. Idempotent. */
-  destroy(): Promise<void> {
-    return this.#v3.destroy();
+  /** Drop every handle and cached listing, in both versions. Idempotent. */
+  async destroy(): Promise<void> {
+    await Promise.all([this.#v3.destroy(), this.#v4.destroy()]);
   }
 
   /**

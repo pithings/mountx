@@ -178,10 +178,25 @@ import {
   type WccAttr,
   type WccData,
 } from "./protocol.ts";
+import {
+  type AccessRights,
+  allowedAccess,
+  MAX_OFFSET,
+  modeBitsOfFtype,
+  NAME_MAX,
+  newSessionStats,
+  type NfsRequestContext,
+  type NfsSessionOptions,
+  type NfsSessionStats,
+  type NfsSharedState,
+} from "../util.ts";
 import { XdrReader, XdrWriter, isXdrError, stringByteLength } from "../xdr.ts";
 
-/** Bytes in one path component, and the `name_max` `PATHCONF` reports. */
-const NAME_MAX = 255;
+// The session contract and the version-neutral helpers moved to `../util.ts`
+// when the v4 session needed them; they are re-exported here so that
+// `v3/session.ts` remains the import site it has always been.
+export { MAX_OFFSET } from "../util.ts";
+export type { NfsRequestContext, NfsSessionOptions, NfsSessionStats } from "../util.ts";
 
 /** Largest `READ` this server will answer, and `FSINFO`'s `rtmax`. */
 export const DEFAULT_RTMAX = 1024 * 1024;
@@ -189,62 +204,6 @@ export const DEFAULT_RTMAX = 1024 * 1024;
 export const DEFAULT_WTMAX = 1024 * 1024;
 /** Preferred `READDIR` reply size, and `FSINFO`'s `dtpref`. */
 export const DEFAULT_DTPREF = 32 * 1024;
-
-/**
- * The largest offset this server can name.
- *
- * `offset3` is 64 bits, but the driver interface takes `number` offsets, so
- * anything past `Number.MAX_SAFE_INTEGER` cannot be passed on and is refused
- * rather than silently rounded. It is also what `FSINFO` reports as
- * `maxfilesize`, so a client is told before it tries.
- */
-export const MAX_OFFSET = BigInt(Number.MAX_SAFE_INTEGER);
-
-export interface NfsSessionOptions {
-  /** Identify files by the driver's `(dev, ino)`, so hardlinks share a handle. Default `true`. */
-  useDriverIno?: boolean;
-  /** Boot verifier for file handles. Default: random, so restarts invalidate handles. */
-  verifier?: Uint8Array;
-  /** Largest `READ` answered. Default {@link DEFAULT_RTMAX}. */
-  rtmax?: number;
-  /** Largest `WRITE` accepted. Default {@link DEFAULT_WTMAX}. */
-  wtmax?: number;
-  /** Directory snapshots kept for readdir cookies. Default `64`. */
-  snapshotCache?: number;
-  /**
-   * `chown` a newly created entry to the `AUTH_SYS` uid/gid the request
-   * carried. Default `true`.
-   *
-   * The same problem the FUSE session solves the same way: the driver creates
-   * everything as the server process, while the requests arriving on it come
-   * from whoever mounted the share. Quiet when the driver has no `lchown`, or
-   * when the server is not privileged enough to hand ownership away — a driver
-   * with no concept of ownership is not thereby broken.
-   */
-  claimOwnership?: boolean;
-  /** Called for every request that ends in an error status. */
-  onError?: (error: unknown, call: RpcCall | undefined) => void;
-}
-
-/** Counters, all cheap, all useful in a test. */
-export interface NfsSessionStats {
-  /** RPC records handed to {@link Nfs3Session.handleCall}. */
-  requests: number;
-  /** Replies produced (successful or not). */
-  replies: number;
-  /** Of which replies carrying a non-`NFS3_OK` status. */
-  errors: number;
-  /** Records too malformed to answer at all. */
-  dropped: number;
-  /** Per-procedure counts, keyed `"NFS:LOOKUP"` / `"MOUNT:MNT"`. */
-  procedures: Map<string, number>;
-}
-
-/** What the caller of a request is, as far as `AUTH_SYS` can say. */
-export interface NfsRequestContext {
-  /** Remote address, for `DUMP` and for logging. */
-  peer?: string;
-}
 
 /** A `nfsstat3` carried out of a handler. */
 class NfsStatusError extends Error {
@@ -290,13 +249,7 @@ export class Nfs3Session {
   readonly driver: Loopback;
   readonly options: NfsSessionOptions;
   readonly handles: FileHandleTable;
-  readonly stats: NfsSessionStats = {
-    requests: 0,
-    replies: 0,
-    errors: 0,
-    dropped: 0,
-    procedures: new Map(),
-  };
+  readonly stats: NfsSessionStats;
   /**
    * The `writeverf3` every `WRITE` and `COMMIT` reply carries.
    *
@@ -309,17 +262,26 @@ export class Nfs3Session {
   readonly writeVerifier: Uint8Array;
 
   readonly #snapshots: DirectorySnapshots;
-  readonly #lock = new PathLock();
+  readonly #lock: PathLock;
   readonly #mounts: MountRecord[] = [];
   #destroyed = false;
 
-  constructor(driver: FsDriver, options: NfsSessionOptions = {}) {
+  /**
+   * `shared` is the router's: one handle table, one path lock and one stats
+   * object across every version this server speaks. Left out — which is what
+   * this session's own tests do — each is constructed here instead.
+   */
+  constructor(driver: FsDriver, options: NfsSessionOptions = {}, shared: NfsSharedState = {}) {
     this.driver = createLoopback(driver);
     this.options = options;
-    this.handles = new FileHandleTable({
-      useDriverIno: options.useDriverIno,
-      verifier: options.verifier,
-    });
+    this.stats = shared.stats ?? newSessionStats();
+    this.#lock = shared.lock ?? new PathLock();
+    this.handles =
+      shared.handles ??
+      new FileHandleTable({
+        useDriverIno: options.useDriverIno,
+        verifier: options.verifier,
+      });
     // Derived from the handle table's boot verifier, so both change together.
     this.writeVerifier = this.handles.verifier.slice(0, NFS3_WRITEVERFSIZE);
     this.#snapshots = new DirectorySnapshots(options.snapshotCache);
@@ -807,7 +769,7 @@ export class Nfs3Session {
       writeAccessRes(writer, {
         status: NFS3_OK,
         attributes: attr,
-        access: request.access & allowedAccess(stats, creds),
+        access: request.access & accessBits3(allowedAccess(stats, creds)),
       });
     } catch (error) {
       writeAccessRes(writer, {
@@ -1694,65 +1656,20 @@ function big(value: number): bigint {
   return Number.isFinite(value) ? BigInt(Math.max(0, Math.trunc(value))) : 0n;
 }
 
-/** The `S_IF*` bits `MKNOD` is asking for. */
-function modeBitsOfFtype(type: number): number {
-  switch (type) {
-    case 3: {
-      return 0o060_000; // S_IFBLK
-    }
-    case 4: {
-      return 0o020_000; // S_IFCHR
-    }
-    case 6: {
-      return 0o140_000; // S_IFSOCK
-    }
-    case 7: {
-      return 0o010_000; // S_IFIFO
-    }
-    /* v8 ignore next 3 -- MKNOD of a directory or a symlink is not a thing a
-       client asks for; the driver would refuse it anyway. */
-    default: {
-      return 0;
-    }
-  }
-}
-
 /**
- * The `ACCESS3_*` bits a caller with these credentials has on this object.
+ * {@link allowedAccess}'s answer as `ACCESS3_*` bits.
  *
- * Plain POSIX: owner, then group, then other; uid 0 gets everything except
- * `EXECUTE` on something with no execute bit at all, which is the one place
- * root is not omnipotent.
+ * The permission decision itself is version-neutral and lives in `../util.ts`;
+ * this is the half that is not — RFC 1813 §3.3.4's numbering, which the v4
+ * session spells with its own `ACCESS4_*` constants from RFC 8881 §18.1.1.
  */
-function allowedAccess(stats: StatsLike, creds: RpcCredentials): number {
-  const isDir = (stats.mode & S_IFMT) === S_IFDIR;
-  const mode = stats.mode & 0o777;
-  const uid = creds.uid ?? 0;
-  const gid = creds.gid ?? 0;
-  const root = uid === 0;
-  const bits = root
-    ? 0b111
-    : uid === stats.uid
-      ? (mode >> 6) & 0b111
-      : gid === stats.gid || creds.gids.includes(stats.gid)
-        ? (mode >> 3) & 0b111
-        : mode & 0b111;
-  const readable = (bits & 0b100) !== 0;
-  const writable = (bits & 0b010) !== 0;
-  const executable = root ? (mode & 0o111) !== 0 || isDir : (bits & 0b001) !== 0;
-
-  let access = 0;
-  if (readable) {
-    access |= ACCESS3_READ;
-  }
-  if (writable) {
-    access |= ACCESS3_MODIFY | ACCESS3_EXTEND;
-    if (isDir) {
-      access |= ACCESS3_DELETE;
-    }
-  }
-  if (executable) {
-    access |= isDir ? ACCESS3_LOOKUP : ACCESS3_EXECUTE;
-  }
-  return access;
+function accessBits3(rights: AccessRights): number {
+  return (
+    (rights.read ? ACCESS3_READ : 0) |
+    (rights.lookup ? ACCESS3_LOOKUP : 0) |
+    (rights.modify ? ACCESS3_MODIFY : 0) |
+    (rights.extend ? ACCESS3_EXTEND : 0) |
+    (rights.delete ? ACCESS3_DELETE : 0) |
+    (rights.execute ? ACCESS3_EXECUTE : 0)
+  );
 }
