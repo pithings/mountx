@@ -25,8 +25,8 @@
  * - **Decoding is total.** A truncated or malformed buffer throws
  *   {@link ProtocolError} and nothing else — never a `RangeError`, never silent
  *   garbage.
- * - **Decoders copy.** Byte payloads are `slice()`d out of the input so a
- *   transport can reuse its receive buffer.
+ * - **Decoders copy.** Byte payloads are copied out of the input so a transport
+ *   can reuse its receive buffer.
  * - Names are decoded as UTF-8 `string`s (lossy for names that are not valid
  *   UTF-8 — see IDEA.md's note that keys are really bytes) and may not contain
  *   a NUL.
@@ -201,6 +201,8 @@ export function readWriteInSize(minor: number): number {
 const textDecoder = new TextDecoder("utf-8");
 const textEncoder = new TextEncoder();
 const EMPTY_BYTES = new Uint8Array(0);
+const copyBytes = (bytes: Uint8Array, start?: number, end?: number): Uint8Array =>
+  Uint8Array.prototype.slice.call(bytes, start, end);
 
 /** A cursor over a request/reply body. Every read is bounds-checked. */
 class Reader {
@@ -255,7 +257,7 @@ class Reader {
   /** A copy of the next `size` bytes. */
   raw(size: number): Uint8Array {
     const at = this.take(size);
-    return this.bytes.slice(at, at + size);
+    return copyBytes(this.bytes, at, at + size);
   }
 
   /** A NUL-terminated name. */
@@ -782,7 +784,7 @@ export interface FuseRawData {
 }
 
 function decodeRawData(body: Uint8Array): FuseRawData {
-  return { data: body.slice() };
+  return { data: copyBytes(body) };
 }
 
 function encodeRawData(value: FuseRawData): Uint8Array {
@@ -2751,12 +2753,12 @@ export function decodeRequest(buffer: Uint8Array, ctx?: ProtocolContext): FuseRe
     );
   }
   const payload = buffer.subarray(FUSE_IN_HEADER_SIZE, bodyEnd);
-  const extensions = buffer.slice(bodyEnd, header.len);
+  const extensions = copyBytes(buffer, bodyEnd, header.len);
   const spec = OPCODES.get(header.opcode);
   return {
     header,
     name: opcodeName(header.opcode),
-    payload: payload.slice(),
+    payload: copyBytes(payload),
     extensions,
     body: spec === undefined ? undefined : spec.decodeRequest(payload, ctxOf(ctx)),
   };
@@ -2829,7 +2831,7 @@ export function decodeReply(buffer: Uint8Array, opcode: number, ctx?: ProtocolCo
       `fuse_out_header.len is ${header.len} but only ${buffer.length} byte(s) were read`,
     );
   }
-  const payload = buffer.slice(FUSE_OUT_HEADER_SIZE, header.len);
+  const payload = copyBytes(buffer, FUSE_OUT_HEADER_SIZE, header.len);
   const spec = OPCODES.get(opcode);
   return {
     header,

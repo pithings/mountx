@@ -102,6 +102,7 @@ interface Attributes {
 
 /** A file's contents while something has it open. Shared by every handle on the path. */
 interface OpenFile extends ByteHolder {
+  path: string;
   data: Uint8Array;
   /** Open handles. The write-back happens when this reaches zero. */
   refs: number;
@@ -223,7 +224,7 @@ export function createUnstorageDriver(
   function movePaths(from: string, to: string): void {
     const remap = (path: string): string => normalizePath(to + path.slice(from.length));
 
-    function move<T>(records: Map<string, T>): void {
+    function move<T>(records: Map<string, T>, moved?: (path: string, value: T) => void): void {
       const affected: [string, T][] = [];
       for (const record of records) {
         if (isPathInside(record[0], from)) {
@@ -231,12 +232,16 @@ export function createUnstorageDriver(
         }
       }
       for (const [path, value] of affected) {
+        const destination = remap(path);
         records.delete(path);
-        records.set(remap(path), value);
+        records.set(destination, value);
+        moved?.(destination, value);
       }
     }
 
-    move(openFiles);
+    move(openFiles, (path, entry) => {
+      entry.path = path;
+    });
     move(attributes);
 
     const directories: string[] = [];
@@ -472,39 +477,48 @@ export function createUnstorageDriver(
       raced.refs++;
       return raced;
     }
-    const entry: OpenFile = { data, refs: 1, dirty: false, orphan: false };
+    const entry: OpenFile = { path, data, refs: 1, dirty: false, orphan: false };
     openFiles.set(path, entry);
     return entry;
   }
 
-  async function flush(path: string, entry: OpenFile): Promise<void> {
+  async function flush(entry: OpenFile): Promise<void> {
     if (!entry.dirty || entry.orphan) {
       return;
     }
     entry.dirty = false;
-    await writeValue(path, entry.data, "fsync");
-  }
-
-  async function release(path: string, entry: OpenFile): Promise<void> {
-    entry.refs--;
     try {
-      await flush(path, entry);
-    } finally {
-      // Only once nothing else holds it: the buffer *is* the file's contents
-      // while it is open, and dropping it early would lose an unflushed write.
-      if (entry.refs === 0 && openFiles.get(path) === entry) {
-        openFiles.delete(path);
-      }
+      await writeValue(entry.path, entry.data, "fsync");
+    } catch (error) {
+      entry.dirty = true;
+      throw error;
     }
   }
 
-  function createFileHandle(path: string, entry: OpenFile, flags: OpenFlags): FileHandleLike {
+  function removeClosed(entry: OpenFile): void {
+    if (entry.refs === 0 && (!entry.dirty || entry.orphan) && openFiles.get(entry.path) === entry) {
+      openFiles.delete(entry.path);
+    }
+  }
+
+  async function release(entry: OpenFile): Promise<void> {
+    entry.refs--;
+    try {
+      await flush(entry);
+    } finally {
+      // Only once nothing else holds it: the buffer *is* the file's contents
+      // while it is open, and dropping it early would lose an unflushed write.
+      removeClosed(entry);
+    }
+  }
+
+  function createFileHandle(entry: OpenFile, flags: OpenFlags): FileHandleLike {
     let position = 0;
     let closed = false;
 
     function begin(syscall: string, write: boolean): void {
       if (closed || (write ? !flags.write : !flags.read)) {
-        throw fsError("EBADF", { syscall, path });
+        throw fsError("EBADF", { syscall, path: entry.path });
       }
     }
 
@@ -537,30 +551,30 @@ export function createUnstorageDriver(
           position = from + count;
         }
         entry.dirty = true;
-        touch(path);
+        touch(entry.path);
         return { bytesWritten: count, buffer };
       },
 
       async stat() {
         if (closed) {
-          throw fsError("EBADF", { syscall: "fstat", path });
+          throw fsError("EBADF", { syscall: "fstat", path: entry.path });
         }
-        return fileStats(path, "fstat", entry);
+        return fileStats(entry.path, "fstat", entry);
       },
 
       async truncate(length = 0) {
         begin("ftruncate", true);
         resizeBytes(entry, length);
         entry.dirty = true;
-        touch(path);
+        touch(entry.path);
       },
 
       async sync() {
-        await flush(path, entry);
+        await flush(entry);
       },
 
       async datasync() {
-        await flush(path, entry);
+        await flush(entry);
       },
 
       async close() {
@@ -568,7 +582,7 @@ export function createUnstorageDriver(
           return;
         }
         closed = true;
-        await release(path, entry);
+        await release(entry);
       },
     };
   }
@@ -697,7 +711,7 @@ export function createUnstorageDriver(
         // The file exists from here on, not from the first flush: `open(O_CREAT)`
         // is what creates it, and everything else asking has to see that.
         await writeValue(resolved, EMPTY, "open");
-        return createFileHandle(resolved, await acquire(resolved, EMPTY), parsed);
+        return createFileHandle(await acquire(resolved, EMPTY), parsed);
       }
       if (parsed.exclusive) {
         throw fsError("EEXIST", { syscall: "open", path: resolved });
@@ -714,7 +728,7 @@ export function createUnstorageDriver(
         entry.dirty = true;
         touch(resolved);
       }
-      return createFileHandle(resolved, entry, parsed);
+      return createFileHandle(entry, parsed);
     },
 
     async mkdir(path, mkdirOptions: MkdirOptions = {}) {
@@ -855,7 +869,14 @@ export function createUnstorageDriver(
         // happens on flush like every other change made through a handle.
         resizeBytes(entry, length);
         entry.dirty = true;
-        touch(resolved);
+        touch(entry.path);
+        if (entry.refs === 0) {
+          try {
+            await flush(entry);
+          } finally {
+            removeClosed(entry);
+          }
+        }
         return;
       }
       const holder: ByteHolder = { data: copyOf(await readValue(resolved, "truncate")) };

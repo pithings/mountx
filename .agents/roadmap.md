@@ -63,6 +63,82 @@ results.
   It buys exactly one thing, `/Volumes` mountpoints, and costs FFI; see
   "Future / deferred".
 
+- **S3 gateway transport, `mountx/s3`** (commits `3d582b7..4cd9d64`, 2026-07-28/29,
+  plan in `.agents/s3-plan.md`). A transport over the same `FsDriver`,
+  and the first that is not a mount: `createS3Server(driver, opts?)` — or
+  `createS3Server({ buckets: { name: driver, ... } })` for several — serves it
+  to any S3 client (`rclone`, the AWS CLI, an SDK, a presigned URL) over
+  path-style HTTP. Layered the way FUSE and NFS are (`sigv4.ts`, `xml.ts`,
+  `chunked.ts`, `protocol.ts`, `session.ts`, `server.ts`), every constant and
+  error code transcribed from Amazon's own docs since there is no RFC for S3.
+  SigV4 is signed _and_ verified, both the header and presigned-query forms,
+  against the official `aws-sig-v4-test-suite` goldens. Ships with a Tier-1
+  conformance column (`test/s3/conformance.test.ts`: a signing JS client plus an
+  `FsDriver` adapter over it, no sockets, folded into `pnpm matrix`) and a
+  no-root oracle (`test/s3/oracle.test.ts`) that drives real `rclone` and `curl`
+  binaries — gated on both being on `PATH`, needing no root — through
+  copy/sync/check/multipart/presigned-URL round trips against a real `node-fs`
+  driver.
+
+  Design decisions worth restating, each a place a client could see a
+  difference from Amazon's own service:
+  - **Gateway, not mount** — kept out of `mountx/auto` on purpose: auto's
+    whole contract is a mountpoint, and this transport never produces one.
+  - **Derived ETags** — first 32 hex characters of sha256 over
+    `dev:ino:size:mtimeMs`, suffixed `-1` so the shape itself says "not an
+    MD5"; `rclone check` reads it exactly that way and falls back to
+    size/modtime instead of reporting a mismatch.
+  - **Multipart staging is invisible** — parts live under
+    `.mountx-multipart/<uploadId>/`, a 404 to every other operation and absent
+    from every listing, swept on abort and on `close()`.
+  - **Write-in-place, first-byte atomic only** — the driver interface has no
+    primitive to stage a whole object elsewhere first; a rejection at or
+    before the first byte leaves the bucket untouched, one after leaves a
+    partial object where a whole one used to be.
+
+  What was _not_ done, deliberately: `mountx/drivers/s3` (mounting a real
+  bucket as a driver, reusing `test/s3/client.ts`'s signing client rather than
+  writing a second one) is a named follow-up, not part of this effort; no
+  bench column (perf claims come only from `.agents/benchmarks.md`, so the
+  docs for this transport make none); `ListObjects` (V1), bucket ACLs/policies
+  and versioning all answer a well-formed `NotImplemented` rather than being
+  faked.
+
+- **The 9P2000.L transport, `mountx/9p`** (2026-07-29). A third transport
+  beside FUSE and NFS, over the same `FsDriver`: wire primitives and the whole
+  `.L` message set both directions (`src/9p/wire.ts`/`constants.ts`/
+  `protocol.ts`, transcribed from `include/net/9p/9p.h` v6.12), a fid table
+  (keyed by fid; qid identity is what is keyed `(dev, ino)`, `fids.ts`), a
+  session with no I/O
+  (`session.ts`), and `createP9Server` — TCP, unix-socket and an
+  `attach(duplex)` mode for embedders, one session per connection. `mount9p()`
+  mounts locally over `trans=unix` — a private `mkdtemp` socket the kernel
+  connects to itself, needing no native code — and `trans=tcp` reaches
+  external clients, the VM-guest case, gated to dotted-quad IPv4 by the
+  kernel's own `valid_ipaddr4()`. `mountx/auto`'s Linux preference is now
+  `["fuse", "9p", "nfs"]`: 9P beats NFS whenever both need root, because it is
+  **stateful** — a fid survives an unlink (no `ESTALE`), `close()`/`fsync()`
+  reach the driver for real, and the fid table cannot leak the way NFSv3's
+  handle table does. `-t 9p` works from the CLI, and `p9ClientProbe()` +
+  `p9ModuleRefusal()` keep `auto` from choosing 9P on a virtio-only guest
+  where the mount would fail. **Witnessed real, locally, under sudo on this
+  dev host** the same day the code landed (`.agents/environment.md`'s "9P
+  mounting" section): a 3 MiB byte-exact round trip, unlink-while-open, locks,
+  a 1500-entry directory, rename-with-open-fd, executing a binary off the
+  mount, clean teardown across three mount/unmount cycles, no leaks. An
+  independent tshark oracle (`test/9p/dissect.test.ts`) found one defect —
+  Wireshark's own 9P dissector, not this transport's (`Tgetlock`/`Rgetlock`
+  misaligned by a phantom field `Tlock` has and they don't).
+  What was deliberately **not** done: `trans=fd` (a real socketpair, which
+  Node cannot make without native code — deferred to a relay mode that
+  already holds a descriptor; `trans=unix` is the identical kernel transport
+  module and was judged to buy the same no-exposure property with no native
+  code at all); a real multi-client lock table (`Tlock`/`Tgetlock` grant
+  unconditionally, honest for the one local client this transport is built
+  for and not for two attached to one `createP9Server`); and a benchmark
+  column (no host could mount 9P when the benchmark suite was last run — see
+  "Future / deferred", now that one can).
+
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
@@ -91,7 +167,32 @@ rather than by accident.
   ships async main-thread mode only. Relay would take `/dev/fuse` off the
   libuv threadpool entirely (removing the self-client hazard); sync-worker
   is the mode `IDEA.md` expects to scale with worker count. Both are
-  unmeasured — see the "known gaps" in `.agents/benchmarks.md`.
+  unmeasured — see the "known gaps" in `.agents/benchmarks.md`. A relay mode
+  is also where `src/9p/`'s deferred `trans=fd` would finally earn its keep:
+  it wants a descriptor the relay already holds, where `mount9p()`'s own
+  `trans=unix` has nothing to relay to.
+- **A 9P bench column.** `bench/` has loopback and NFS columns and a
+  sudo-gated FUSE one; 9P has none yet, and unlike when the transport was
+  designed, a host that can mount it now exists (`.agents/environment.md`).
+  Worth its own pass rather than folding into step 12's docs work: `msize`
+  and `maxInFlight` (`DEFAULT_MAX_IN_FLIGHT = 16`, `src/9p/server.ts`) are
+  both real tuning knobs with no measured numbers behind them yet, and the
+  invariant that perf claims come only from `.agents/benchmarks.md` means
+  none of this can be said in prose until the column exists.
+- **A real multi-client lock table for 9P.** `Tlock`/`Tgetlock` grant
+  unconditionally today (`src/9p/session.ts`), which is honest for the one
+  local client `mount9p()` serves and not for a second one attached to a
+  `createP9Server` over TCP. Worth doing only if TCP serving — multiple VM
+  guests, or several processes against one `attach()`ed server — grows real
+  users; until then it is a documented gap, not a silent one.
+- **9P has no FUSE-style invalidation channel.** `notify_inval_inode`/
+  `notify_inval_entry` have no 9P analogue — nothing in the protocol lets a
+  server tell a client that something it cached has changed — which is why
+  `cache=none` is `mount9p()`'s default rather than a tuning suggestion:
+  every mode above it (`readahead`, `mmap`, `loose`, `fscache`) is a bet that
+  nothing but the mount itself changes the driver, with no way to walk that
+  bet back after the fact the way FUSE's `notifyInvalInode()` can. Worth
+  revisiting only alongside a concrete driver that wants the tradeoff.
 - **macOS NFS mounting is witnessed** (2026-07-28, macOS 26.6 arm64 — see
   `.agents/environment.md`). `pnpm test:nfs:mount` passes there: mounts, appears
   in `mount(8)`'s table, carries the full workload, refuses to stack, reports
@@ -161,6 +262,11 @@ rather than by accident.
   the numbers — but it is the best-supported open question in the repo.
 - **unstorage driver adapter** — deferred per the drivers-in-v1 decision
   above; would make 30+ storage backends mountable with no new code.
+- **`mountx/drivers/s3`** — an `FsDriver` over a real S3-compatible bucket,
+  mounting one rather than serving one. Named as the natural follow-up to the
+  S3 gateway transport (see "Shipped since v1"); it would reuse
+  `test/s3/client.ts`'s signing client instead of writing a second one. Not
+  started.
 - **Negative-entry caching.** Nothing currently populates FUSE's negative
   dentry cache for lookups that miss, so a repeated failed `LOOKUP` always
   reaches the driver.

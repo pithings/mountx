@@ -81,6 +81,182 @@
   codecs, which is exactly what the Tier-1 JS client — built from the server's
   own codecs — cannot give. `tshark` dissects the exchange to confirm.
 
+## 9P mounting (verified 2026-07-29, this Linux host)
+
+Kernel `6.12.96+deb13-amd64` (Debian 13). `9p` is in `/proc/filesystems`, and
+`/sys/module` has `9p`, `9pnet`, `9pnet_fd` and `9pnet_virtio` — `9pnet_fd` is
+the one `trans=unix`/`tcp`/`fd` live in, and it is pinned by
+`/etc/modules-load.d/9p.conf`, so nothing depends on `mount(8)` autoloading it.
+`pnpm test:9p:mount` **passes** as root: 9 passed, 2 skipped, ~0.8 s.
+
+- **The mount that works**, verbatim (`mount9p()` builds it):
+
+  ```sh
+  mount -i -t 9p -o trans=unix,version=9p2000.L,msize=131096,access=client,\
+  cache=none,uname=nobody,aname=/ -- /tmp/mountx-9p-XXXXXX/9p.sock /mnt/point
+  ```
+
+  and the line it leaves in `/proc/self/mounts`:
+
+  ```
+  /tmp/mountx-9p-XXXXXX/9p.sock /tmp/mountx-9p-mnt-XXXXXX 9p rw,relatime,aname=/,access=client,trans=unix 0 0
+  ```
+
+- **`msize` is invisible in the mount table at the default, and that absence is
+  the proof it landed.** `p9_show_client_options()` prints `msize=` only when it
+  differs from `DEFAULT_MSIZE` — which is `(128 * 1024) + P9_IOHDRSZ` = **131096**,
+  character for character what this transport asks for. Mounting with
+  `{ mountMsize: 16384 }` makes `msize=16384` appear in the same line, and
+  `connection.session.msize` agreed to both (131096 and 16384). Same rule
+  elsewhere in that line: `uname=nobody` is omitted because it _is_ `V9FS_DEFUSER`,
+  while `aname=/` is printed because `V9FS_DEFANAME` is the empty string.
+- **There is no `dmesg` on this host.** `kernel.dmesg_restrict=1`, the container's
+  `CapBnd` has no `CAP_SYSLOG`, and there is no `/dev/kmsg`; `sudo dmesg` answers
+  `Operation not permitted`. So the usual "read what v9fs logged" route does not
+  exist here. What replaces it, and is better: `connection.session.version` /
+  `.msize` (the server's own view of the negotiation — witnessed `9P2000.L` and
+  131096), the mount-table line above, and an **opcode census** taken by shadowing
+  `connection.session.handleCall` on the live mount.
+- **What v9fs actually sends.** One full workload (3 MiB file, metadata, links,
+  a 1500-entry directory, locks, removal):
+
+  ```
+  Twalk=9073 Tclunk=7562 Tgetattr=6062 Twrite=1530 Txattrwalk=1513 Tlcreate=1505
+  Tunlinkat=1504 Tread=30 Tlopen=13 Treaddir=13 Tlock=8 Tsetattr=3 Tfsync=3
+  Treadlink=2 Tstatfs=2 Tlink=1 Tsymlink=1 Trenameat=1 Tmkdir=1 Tgetlock=1
+  ```
+
+  Three things to keep from that. No legacy 9P2000 opcode ever arrives, so the
+  `Topen`/`Tcreate`/`Tstat`/`Twstat` → `ENOTSUP` path is unreachable from a real
+  client. There is **one `Txattrwalk` per created file** (1513 against 1505
+  `Tlcreate`) — the `security.*` probe, exactly as hot as the plan assumed, which
+  is why its refusal is kept cheap. And walk/clunk dominate everything: v9fs
+  clones a fid per operation, so `FidTable` is the hot data structure, not the
+  codec.
+
+- **`access=client` is enforced by the client, and costs one `Tattach` per uid.**
+  A file `0600 root:root` is `Permission denied` to uid 1000 through the mount and
+  readable at `0644`; the first access by a new uid produced a fresh `Tattach`
+  (`v9fs_fid_lookup` attaches per `fsuid` under `V9FS_ACCESS_CLIENT`).
+- **Locks work and always grant**, per the transport's decision. `flock -x -w 5`
+  exits 0; Python `fcntl.lockf` `LOCK_EX`/`LOCK_UN`/`LOCK_SH` all succeed;
+  `F_GETLK` reports `F_UNLCK` (2). The kernel really puts them on the wire — 8
+  `Tlock` and 1 `Tgetlock` for that shape — so this is the server answering, not
+  the client keeping it local.
+- **`statfs` passes the driver's `f_type` through verbatim.** `v9fs_statfs()`
+  assigns `buf->f_type = rs.type`, so `stat -f` prints whatever the driver
+  declares: the memory driver's `TMPFS_MAGIC` (`0x01021994`) makes it say
+  `Type: tmpfs`. Not a bug, but do not read it as "9P is not mounted".
+- **Witnessed by hand, all passing**: a 3 MiB write/read byte-exact through a
+  131096 `msize` (and 1 MiB through a 16384 one, so it really pages), the same
+  bytes on the driver side; `chmod`/`chown`/`utimes`; `st_ino` stable across
+  stats, distinct per file, matching through `fstat` and shared by a hardlink
+  (v9fs derives it from `qid.path` via `QID2INO`); `nlink` 2 then 1;
+  symlink/`readlink`/`lstat`/read-through; rename with an open fd, and read+write
+  through that fd afterwards; **unlink-while-open** then read, write, `fstat` and
+  `fsync` through the fd — the stateful-9P claim, and the reason 9P beats NFS
+  when both need root; `fsync`/`fdatasync` and `sync -f`; a 1500-entry directory
+  with 200-byte names (~360 KB of dirents, ~3 `Treaddir` pages) listed complete
+  and duplicate-free by both `readdir` and `ls -1`; `.` and `..` (the server
+  synthesizes them — `v9fs_dir_readdir_dotl` never calls `dir_emit_dots`) and
+  `cd ..` out of the mount; `ENOENT`/`ENOTDIR`/`ENOTEMPTY`/`EISDIR`/`EEXIST`/
+  `ENAMETOOLONG`; `O_APPEND`, `O_TRUNC`, rename-over and cross-directory rename;
+  255-byte and UTF-8 names; executing a binary copied onto the mount (`cache=none`
+  gives read-only `mmap`, which is enough); 24 concurrent 512 KiB write+read
+  round-trips and 16 concurrent `pread()`s, all byte-exact.
+- **Teardown is uneventful.** Plain `umount` every time, table clear afterwards,
+  the private socket directory removed with it; three mount/unmount rounds leave
+  nothing in `/proc/self/mounts`. Somebody else's `umount` resolves
+  `connection.closed`, flips `mount.active` to `false`, drops
+  `server.connections` to 0, and a following `unmount()` is a no-op.
+- **A killed server does not wedge anything** — the opposite of FUSE. `SIGKILL`
+  the serving process and the mount stays in the table, but the first access
+  fails `ECONNRESET` and every one after it `EIO`, _immediately_, with no
+  timeout to wait out; a **plain `umount` then clears it**. Nothing needs
+  forcing. The one leak is the `mkdtemp` socket directory: there is no process
+  left to remove it, so `/tmp/mountx-9p-*` wants a `sudo rm -rf` after a kill.
+- **The one real wedge is self-inflicted: spawning a binary that lives on the
+  mount, from the process serving it.** `uv_spawn` holds the parent's main thread
+  until the child execs, and the child parks in
+  `p9_client_rpc ← p9_client_walk ← v9fs_vfs_atomic_open_dotl ← do_open_execat`
+  waiting for the thread it is blocking. `umount -f` answers `target is busy`,
+  and killing the _server_ does not help — `fork` gave the child a copy of the
+  server socket, so the connection outlives the server process. What works:
+  `kill -9` on the parked child (`p9_client_rpc` is a `wait_event_killable`, so
+  `D` state does die), then a plain `umount`. Same class as the `spawn(…, { cwd })`
+  hazard already documented, and both are avoided by letting `sh -c` do the exec.
+
+## rclone, the S3 oracle (installed 2026-07-29)
+
+- **`~/.local/bin/rclone`, rclone v1.74.4** (linux/amd64, go1.26.5, statically
+  linked). Installed **user-level, no root and no package manager**: the
+  official static zip, one binary extracted out of it. `~/.local/bin` is already
+  on this host's `PATH`, so `command -v rclone` answers without any further
+  setup. Reinstall in one line:
+
+  ```sh
+  curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+    && unzip -qo /tmp/rclone.zip -d /tmp && install -m 755 /tmp/rclone-v*-linux-amd64/rclone ~/.local/bin/rclone
+  ```
+
+- **It exists for exactly one thing:** `test/s3/oracle.test.ts`, the S3
+  gateway's foreign-client column. Everything else under `test/s3/` is written
+  from this repository's own codecs (`test/s3/client.ts` signs with
+  `src/s3/sigv4.ts` and parses with `src/s3/xml.ts`), so a symmetric
+  encoder/decoder mistake is invisible to it; rclone shares none of that code
+  and is the client whose `x-amz-meta-mtime` convention the gateway was built
+  against. `curl` (already present) plays the same role for presigned URLs.
+  The file skips itself cleanly when either binary is absent, the way
+  `test/nfs/mount.test.ts` skips on `nfsClientProbe()` — **verified both ways**:
+  15 passed with it on `PATH`, 15 skipped with `PATH` stripped of
+  `~/.local/bin`.
+
+- **Nothing is written to `~/.config/rclone`.** The test runs rclone with
+  `RCLONE_CONFIG=""` (no config file at all) and defines the remote entirely in
+  `RCLONE_CONFIG_MX_*` environment variables, so a developer's own remotes are
+  neither read nor touched. The connection-string form
+  (`:s3,provider=Other,endpoint=…:bucket`) is the wrong tool here: it splits on
+  `,` and `:`, so an unquoted endpoint URL is parsed as the scheme alone
+  (`Custom endpoint 'http' was not a valid URI`).
+
+- **Two settings rclone needs against this gateway, both real limitations:**
+  - `list_version=2` — rclone uses ListObjects **V1** for every provider except
+    `AWS`, including `Other`, and the gateway implements V2 only. Without it the
+    first listing is `501 NotImplemented: ListObjects (V1) …`.
+  - `no_check_bucket=true` — rclone sends `CreateBucket` before an upload unless
+    a _successful listing earlier in the same process_ has marked the bucket as
+    existing. There is no `HeadBucket` probe (verified with `--dump headers`),
+    so `copy`/`sync` never send it and `copyto`, `rcat` and directory-marker
+    `Mkdir` always do. The gateway's buckets are the drivers it was constructed
+    with, so it answers `501 NotImplemented`.
+
+  A third is informational: `rclone purge` asks `GET /bucket?versioning`, is
+  refused, logs `Failed to read versioning status, assuming unversioned`, and
+  then purges correctly.
+
+- **Empty directories need two flags, not one.** `--create-empty-src-dirs`
+  alone is not enough (rclone's S3 backend has no way to represent one) and
+  `--s3-directory-markers` alone is not enough (rclone's _local_ backend does
+  not offer empty directories to a sync). With both, rclone sends
+  `PUT prefix/emptydir/` — the gateway's own directory-marker convention — and
+  the directory round-trips.
+
+- **mtime survives to the millisecond and no further.** `x-amz-meta-mtime`
+  carries epoch seconds — a bare integer when whole, three decimal places when
+  fractional (`formatMetaMtime`) — so a local file's sub-millisecond mtime
+  quantises on the way through. rclone's default tolerance between a
+  local and an S3 remote is 1 ns, so a tree whose mtimes are not on whole
+  milliseconds re-transfers in full on the second `sync`
+  (`Modification times differ by -478.92µs`). `--modify-window 1ms` is the fix
+  in practice; the test stamps its fixtures on whole milliseconds and asserts
+  the drift case separately.
+
+- **`rclone check` cannot compare hashes here.** The gateway's ETag is the
+  first 32 hex of sha256 over `dev:ino:size:mtimeMs` with a `-1` suffix, which
+  rclone reads as "not a plain MD5": it reports `N hashes could not be checked`
+  and falls back to **size plus modification time**. `--size-only` is the
+  comparison with no hash in it at all.
+
 ## macOS host (verified 2026-07-28)
 
 macOS 26.6 (build 25G72), arm64 (`VirtualMac2,1`), Node v24.18.0, passwordless

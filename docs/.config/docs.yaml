@@ -2,7 +2,7 @@
 name: mountx
 url: https://mountx.vercel.app
 shortDescription: Write a filesystem in JavaScript, mount it as a real folder.
-description: Mount a JavaScript filesystem — one driver interface shaped like node:fs/promises, served to the kernel over FUSE or NFS, with zero runtime dependencies.
+description: Mount a JavaScript filesystem — one driver interface shaped like node:fs/promises, served to the kernel over FUSE, 9P or NFS, with zero runtime dependencies.
 
 themeColor: amber
 automd: true
@@ -32,10 +32,10 @@ landing:
       // A driver is any object with stat(), readdir() and open().
       const driver = createMemoryDriver();
 
-      // FUSE on Linux (no root needed), NFSv3 on macOS.
+      // FUSE (no root needed) then 9P on Linux, NFSv3 on macOS.
       await using mounted = await mount(driver, "/mnt/point");
 
-      mounted.transport; // "fuse" | "nfs"
+      mounted.transport; // "fuse" | "9p" | "nfs"
 
       // $ echo hi > /mnt/point/hello.txt
       // $ cat /mnt/point/hello.txt
@@ -46,15 +46,15 @@ landing:
     - title: A real folder
       icon: lucide:hard-drive
       description: Every program on the machine sees an ordinary path. Shell tools, editors, build systems and agents need to know nothing about it.
-    - title: One API, two transports
+    - title: One API, three transports
       icon: lucide:git-fork
-      description: FUSE where FUSE works, NFS everywhere else. `mountx/auto` probes the host, picks one, and hands back that transport's own mount object.
+      description: FUSE where FUSE works, then 9P, then NFS everywhere else. `mountx/auto` probes the host, picks one, and hands back that transport's own mount object.
     - title: No root on Linux
       icon: lucide:user-check
-      description: Unprivileged mounting through `fusermount3`, the setuid helper FUSE already ships. Serving never needs privileges on either transport.
+      description: Unprivileged mounting through `fusermount3`, the setuid helper FUSE already ships. Serving never needs privileges on any transport.
     - title: Pure JavaScript
       icon: lucide:feather
-      description: Zero runtime dependencies, both protocols implemented from the specs. The one native piece is a ~7 KB helper that only unprivileged FUSE mounts load.
+      description: Zero runtime dependencies, all three protocols implemented from the specs. The one native piece is a ~7 KB helper that only unprivileged FUSE mounts load.
     - title: Develop without mounting
       icon: lucide:flask-conical
       description: "`createLoopback(driver)` runs your driver like `fs/promises` in-process — no kernel, no privileges, every platform. Where drivers get written and tested."

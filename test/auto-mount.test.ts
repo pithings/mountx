@@ -88,6 +88,11 @@ describe.skipIf(here.chosen === undefined || !roomToRun)("mount() with no transp
         expect(typeof it.fd).toBe("number");
         expect(it.session.destroyed).toBe(false);
         expect(typeof it.notifyInvalInode).toBe("function");
+      } else if (it.transport === "9p") {
+        // 9P keeps a session per connection rather than one per server, and
+        // the mount holds the kernel's.
+        expect(it.trans).toBe("unix");
+        expect(it.connection.session.destroyed).toBe(false);
       } else {
         expect(it.port).toBeGreaterThan(0);
         expect(it.server.session.destroyed).toBe(false);
@@ -108,7 +113,7 @@ describe.skipIf(here.chosen === undefined || !roomToRun)("mount() with no transp
       await it.unmount();
       expect(it.active).toBe(false);
       expect((await liveMounts()).map((entry) => entry.mountpoint)).not.toContain(at);
-      // Idempotent, as both transports' own `unmount()` are.
+      // Idempotent, as every transport's own `unmount()` is.
       await it.unmount();
     },
     SLOW,

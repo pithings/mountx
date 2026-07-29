@@ -130,7 +130,10 @@ export function decodeNotify(message: Uint8Array): FuseNotification {
       `fuse_out_header.len is ${len} but only ${message.length} byte(s) were read`,
     );
   }
-  return { code, body: message.slice(FUSE_OUT_HEADER_SIZE, len) };
+  return {
+    code,
+    body: Uint8Array.prototype.slice.call(message, FUSE_OUT_HEADER_SIZE, len),
+  };
 }
 
 /** Decode a `FUSE_NOTIFY_INVAL_INODE` body. */
