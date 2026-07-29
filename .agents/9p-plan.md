@@ -166,7 +166,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       (idempotent, safe with requests in flight — there is no DESTROY message;
       same rule as the FUSE `-t fuse` invariant). Tests: JS client over a real
       TCP socket and a unix socket. Commit.
-- [ ] **8. Independent wire oracle** — a gated test (skips without `tshark`)
+- [x] **8. Independent wire oracle** — a gated test (skips without `tshark`)
       that captures one JS-client-over-TCP exchange covering version/attach/
       walk/lopen/read/readdir/clunk and asserts tshark's 9P dissector agrees
       with our field values (`tshark -d tcp.port==<p>,9p -T fields …`). This is
@@ -347,3 +347,19 @@ deferred)
   Step-12 notes: teardown is a reset not a flush (peer can see ECONNRESET
   with replies queued — say so in docs); bench should record
   `maxInFlight` rather than discover it.
+- 2026-07-29 step 8: `test/9p/dissect.test.ts` + `test/9p/pcap.ts` — a
+  70-message client↔server exchange recorded off the real duplex, wrapped
+  in a JS-built pcap (fabricated Ethernet/IPv4/TCP, computed checksums,
+  seq/ack continuity, port 564 so dissection auto-engages) and fed to
+  tshark 4.6.7's 9P dissector; 31 tests, three TCP-reassembly cases (one
+  frame cut inside its own size field). Verifier PASS after independently
+  confirming the headline finding: **a Wireshark defect, not ours** —
+  Tgetlock/Rgetlock are dissected with Tlock's phantom `flags[4]`
+  (kernel: `"dbdqqds"` vs `"dbqqds"`), misaligning everything after
+  `type` and flagging exactly those two frames malformed; the test pins
+  the shifted reading and passes either way once upstream fixes it.
+  Learned: a positional dissector cannot see symmetric field swaps —
+  closed with literal qid-path/uid-gid/statfs-all-nine assertions
+  (mutation-checked). tshark has no field for Rlerror's ecode, Tfsync's
+  datasync, or Rreaddir entries; covered via message_data bytes and a
+  hand-written unpacker.
