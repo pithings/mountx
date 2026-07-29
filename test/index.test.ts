@@ -159,4 +159,51 @@ describe("harness", () => {
     await fs.writeFile("/bytes", new Uint8Array([1, 2, 3]));
     expect([...(await fs.readFile("/bytes"))]).toEqual([1, 2, 3]);
   });
+
+  it("completes short writes", async () => {
+    const backing = createMemoryDriver();
+    const calls: [number, number, number | null][] = [];
+    const fs = createLoopback({
+      ...backing,
+      async open(path, flags, mode) {
+        const handle = await backing.open(path, flags, mode);
+        return {
+          ...handle,
+          async write(buffer, offset, length, position) {
+            const start = offset ?? 0;
+            const count = Math.min(length ?? buffer.byteLength - start, 2);
+            calls.push([start, count, position ?? null]);
+            return handle.write(buffer, start, count, position);
+          },
+        };
+      },
+    });
+
+    await fs.writeFile("/short", "abcde");
+
+    expect(new TextDecoder().decode(await fs.readFile("/short"))).toBe("abcde");
+    expect(calls).toEqual([
+      [0, 2, 0],
+      [2, 2, 2],
+      [4, 1, 4],
+    ]);
+  });
+
+  it.each([0, -1, 0.5, 5])("rejects invalid write progress: %s", async (bytesWritten) => {
+    const backing = createMemoryDriver();
+    const fs = createLoopback({
+      ...backing,
+      async open(path, flags, mode) {
+        const handle = await backing.open(path, flags, mode);
+        return {
+          ...handle,
+          async write(buffer) {
+            return { bytesWritten, buffer };
+          },
+        };
+      },
+    });
+
+    await expect(fs.writeFile("/stalled", "data")).rejects.toMatchObject({ code: "EIO" });
+  });
 });
