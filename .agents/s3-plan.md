@@ -142,7 +142,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       cleanup, part-list validation (ETag echo, part numbering). Tests extend
       `session.test.ts`. Verify: staging never leaks into any listing or
       GET/PUT/DELETE; interrupted upload leaves no debris after close.
-- [ ] **7. `src/s3/server.ts` + `src/s3/index.ts` + wiring** — `node:http`
+- [x] **7. `src/s3/server.ts` + `src/s3/index.ts` + wiring** — `node:http`
       binding, loopback/credential gate, both `createS3Server` call shapes,
       `close()` (drains, cleans staging), subpath export `mountx/s3` in
       `package.json` + obuild config; `index.ts` re-exports by name (NFS

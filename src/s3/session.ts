@@ -1065,8 +1065,12 @@ export class S3Session {
     }
     /* Opened here rather than inside the generator, so that a failure to open
        is an S3 error instead of a stream that dies after the status line. The
-       generator owns the handle from now on and closes it in a `finally`,
-       which runs on early abandonment too (`generator.return()`). */
+       generator owns the handle from now on and closes it in a `finally` —
+       which runs when a consumer that has **started** the generator abandons it
+       (`generator.return()`), and *not* on a generator that was never stepped:
+       its body never ran, so there is no `finally` to unwind. A transport that
+       may drop a reply without reading it has to step it once before closing
+       it, which is what `server.ts`'s `closeBody()` does and why it does it. */
     const handle = await driver.open(route.path, "r");
     return { status, headers, body: streamHandle(handle, start, length, this.#readChunkBytes) };
   }
