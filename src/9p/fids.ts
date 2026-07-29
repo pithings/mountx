@@ -35,6 +35,7 @@
 
 import { fsError } from "../errors.ts";
 import { isPathInside, joinPath } from "../path.ts";
+import { remapSubtree, type SubtreeRemapOps } from "../subtree.ts";
 import {
   S_IFDIR,
   S_IFLNK,
@@ -317,6 +318,15 @@ export class FidTable<TDirent = DirentLike> {
   /** `${dev}:${ino}` → identity. Only holds identities with at least one path. */
   readonly #qidByKey = new Map<string, QidIdentity>();
   #nextQidPath = FIRST_QID_PATH;
+  /**
+   * The pair {@link FidTable.remap} hands to `remapSubtree`. Built once rather
+   * than per rename, and pointing at the same two private methods every other
+   * qid mutation here goes through — the walk is shared, the meaning is not.
+   */
+  readonly #remapOps: SubtreeRemapOps<QidIdentity> = {
+    detach: (identity, path) => this.#detachQid(identity, path),
+    attach: (identity, path) => this.#attachQid(identity, path),
+  };
 
   constructor(options: FidTableOptions = {}) {
     this.#useDriverIno = options.useDriverIno ?? true;
@@ -620,31 +630,24 @@ export class FidTable<TDirent = DirentLike> {
    * The qid identities under the destination are released outright, because the
    * files they identified are gone and reusing an id for the replacement would
    * alias two different files in the client's inode cache.
+   *
+   * The identity half of that is `src/subtree.ts`'s walk — the same one
+   * `InodeTable` and `FileHandleTable` do — driven by *this* table's
+   * {@link FidTable.detachQid} and {@link FidTable.attachQid}, so releasing the
+   * replaced identities outright stays this transport's meaning and no other's.
+   * The fid half below is 9P's alone: no other transport has a client-chosen
+   * name for a path, or a readdir cursor pinned to one.
+   *
+   * Three full scans per rename, then — two of the qid map and one of the fid
+   * map — i.e. O(tracked paths) rather than O(subtree). See `src/subtree.ts`
+   * for why a prefix tree is the fix and why it is a benchmark-milestone
+   * concern, not a v1 one.
    */
   remap(from: string, to: string): void {
     if (from === to) {
       return;
     }
-    for (const [path, identity] of this.#qidByPath) {
-      if (isPathInside(path, to)) {
-        this.#detachQid(identity, path);
-      }
-    }
-    // Two passes, here and below: a one-pass rewrite would clobber a
-    // destination that is also a source (`mv a b` inside the same subtree).
-    const moved: { identity: QidIdentity; from: string; to: string }[] = [];
-    for (const [path, identity] of this.#qidByPath) {
-      if (isPathInside(path, from)) {
-        moved.push({ identity, from: path, to: to + path.slice(from.length) });
-      }
-    }
-    for (const move of moved) {
-      this.#qidByPath.delete(move.from);
-      move.identity.paths.delete(move.from);
-    }
-    for (const move of moved) {
-      this.#attachQid(move.identity, move.to);
-    }
+    remapSubtree(this.#qidByPath, from, to, this.#remapOps);
 
     for (const entry of this.#fids.values()) {
       if (isPathInside(entry.path, from)) {

@@ -36,7 +36,7 @@
 
 import { randomFillSync } from "node:crypto";
 import { fsError } from "../errors.ts";
-import { isPathInside } from "../path.ts";
+import { remapSubtree, type SubtreeRemapOps } from "../subtree.ts";
 import type { StatsLike } from "../types.ts";
 import { NFS3_COOKIEVERFSIZE, NFS3_FHSIZE } from "./v3/constants.ts";
 
@@ -101,6 +101,15 @@ export class FileHandleTable {
   /** Only holds entries with at least one path — see {@link FileHandleTable.detachPath}. */
   readonly #byKey = new Map<string, HandleEntry>();
   #nextId = ROOT_HANDLE_ID + 1n;
+  /**
+   * The pair {@link FileHandleTable.remap} hands to `remapSubtree`. Built once
+   * rather than per rename, and pointing at the same two private methods every
+   * other mutation here goes through — the walk is shared, the meaning is not.
+   */
+  readonly #remapOps: SubtreeRemapOps<HandleEntry> = {
+    detach: (entry, path) => this.#detachPath(entry, path),
+    attach: (entry, path) => this.#attachPath(entry, path),
+  };
 
   constructor(options: FileHandleTableOptions = {}) {
     this.#useDriverIno = options.useDriverIno ?? true;
@@ -286,30 +295,18 @@ export class FileHandleTable {
    * This is what makes a handle survive a rename — including a handle to
    * something *inside* a renamed directory, which a client will go on using
    * with no idea anything moved.
+   *
+   * The walk itself is `src/subtree.ts`'s — the same one `InodeTable` and
+   * `FidTable` do — driven by *this* table's {@link FileHandleTable.detachPath}
+   * and {@link FileHandleTable.attachPath}, so what a replaced destination
+   * means here is unchanged: the entry loses its identity key and its id, and
+   * the handle the client still holds answers `ESTALE`. It costs two full scans
+   * of the path map per rename, i.e. O(tracked paths) rather than O(subtree);
+   * see that module for why a prefix tree is the fix and why it is a
+   * benchmark-milestone concern, not a v1 one.
    */
   remap(from: string, to: string): void {
-    if (from !== to) {
-      this.unbind(to);
-      for (const path of this.#byPath.keys()) {
-        if (path !== to && isPathInside(path, to)) {
-          this.unbind(path);
-        }
-      }
-    }
-    const moved: { entry: HandleEntry; from: string; to: string }[] = [];
-    for (const [path, entry] of this.#byPath) {
-      if (isPathInside(path, from)) {
-        moved.push({ entry, from: path, to: to + path.slice(from.length) });
-      }
-    }
-    // Two passes, so a destination that is also a source is not clobbered.
-    for (const move of moved) {
-      this.#byPath.delete(move.from);
-      move.entry.paths.delete(move.from);
-    }
-    for (const move of moved) {
-      this.#attachPath(move.entry, move.to);
-    }
+    remapSubtree(this.#byPath, from, to, this.#remapOps);
   }
 
   /** Forget everything but the root. Teardown, and tests. */
