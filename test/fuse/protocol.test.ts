@@ -5,6 +5,7 @@ import {
   FUSE_GETXATTR,
   FUSE_IN_HEADER_SIZE,
   FUSE_LOOKUP,
+  FUSE_NOTIFY_INVAL_INODE,
   FUSE_OPEN,
   FUSE_OUT_HEADER_SIZE,
   FUSE_READ,
@@ -14,6 +15,7 @@ import {
   OPCODE_NAMES,
   opcodeName,
 } from "../../src/fuse/constants.ts";
+import { decodeNotify, encodeNotify } from "../../src/fuse/notify.ts";
 import {
   attrOutSize,
   attrSize,
@@ -59,7 +61,7 @@ import {
   SUPPORTED_OPCODES,
   UNIMPLEMENTED_OPCODES,
 } from "../../src/fuse/protocol.ts";
-import type { ProtocolContext } from "../../src/fuse/protocol.ts";
+import type { FuseRawData, FuseWriteIn, ProtocolContext } from "../../src/fuse/protocol.ts";
 import {
   randomAttr,
   randomAttrOut,
@@ -249,6 +251,68 @@ describe("round-trips", () => {
       expect(decoded.header).toEqual({ len: message.length, error: 0, unique });
       expect(decoded.body).toEqual(entry);
     }
+  });
+});
+
+describe("retained bytes", () => {
+  it("copies Buffer-backed request bytes before the transport reuses them", () => {
+    const data = new Uint8Array([1, 2, 3, 4]);
+    const extensions = new Uint8Array([5, 6, 7, 8, 9, 10, 11, 12]);
+    const encoded = encodeRequest({
+      opcode: FUSE_WRITE,
+      unique: 1n,
+      nodeid: 2n,
+      body: {
+        fh: 3n,
+        offset: 4n,
+        size: data.length,
+        writeFlags: 0,
+        lockOwner: 5n,
+        flags: 0,
+        data,
+      } satisfies FuseWriteIn,
+      extensions,
+    });
+    const message = Buffer.allocUnsafe(encoded.length);
+    message.set(encoded);
+    const decoded = decodeRequest(message);
+    const payload = new Uint8Array(decoded.payload);
+
+    message.fill(0xaa);
+
+    expect([...decoded.payload]).toEqual([...payload]);
+    expect([...decoded.extensions]).toEqual([...extensions]);
+    expect([...(decoded.body as FuseWriteIn).data]).toEqual([...data]);
+  });
+
+  it("copies Buffer-backed reply bytes before the caller reuses them", () => {
+    const data = new Uint8Array([13, 14, 15, 16]);
+    const message = Buffer.from(encodeReplyFor(6n, FUSE_READ, { data } satisfies FuseRawData));
+    const decoded = decodeReply(message, FUSE_READ);
+
+    message.fill(0xbb);
+
+    expect([...decoded.payload]).toEqual([...data]);
+    expect([...(decoded.body as FuseRawData).data]).toEqual([...data]);
+  });
+
+  it("copies a directly decoded Buffer-backed raw body", () => {
+    const message = Buffer.from([17, 18, 19, 20]);
+    const decoded = decodeReplyBody(FUSE_READ, message) as FuseRawData;
+
+    message.fill(0xcc);
+
+    expect([...decoded.data]).toEqual([17, 18, 19, 20]);
+  });
+
+  it("copies a Buffer-backed notification body", () => {
+    const body = new Uint8Array([21, 22, 23, 24]);
+    const message = Buffer.from(encodeNotify(FUSE_NOTIFY_INVAL_INODE, body));
+    const decoded = decodeNotify(message);
+
+    message.fill(0xdd);
+
+    expect([...decoded.body]).toEqual([...body]);
   });
 });
 
