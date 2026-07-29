@@ -92,7 +92,16 @@
 import * as fs from "node:fs";
 import { realpath, stat as statPath } from "node:fs/promises";
 import { resolve as resolveNative } from "node:path";
-import { describe, errorMessage, run, type RunOptions, type SpawnResult } from "../fuse/exec.ts";
+import {
+  type Deadline,
+  deadlineIn,
+  delay,
+  describe,
+  errorMessage,
+  run,
+  type RunOptions,
+  type SpawnResult,
+} from "../fuse/exec.ts";
 import type { FsDriver } from "../types.ts";
 import { nfsClientProbe, type NfsPlatform, nfsPlatform } from "./probe.ts";
 import { createNfsServer, type NfsServer, type NfsServerOptions } from "./server.ts";
@@ -125,7 +134,32 @@ export interface MountNfsOptions extends NfsServerOptions {
   version?: NfsVersion;
   /** Serve an existing server instead of creating one. Its `listen()` is still called. */
   server?: NfsServer;
-  /** Directory of the driver to export. Default `"/"`. */
+  /**
+   * Directory of the driver the client starts at. Default `"/"`.
+   *
+   * **This selects a starting point. It is not a boundary, and it confines
+   * nothing** — anything reachable from the driver's root is reachable by a
+   * client whatever this is set to. It goes into the `host:path` source
+   * argument and nowhere else; no part of the server records which export a
+   * file handle came from.
+   *
+   * Two ways out, and neither is a bug being papered over:
+   *
+   * - On v3, `LOOKUP` of `..` at the export root resolves to its parent, and
+   *   goes on doing so until it reaches the driver's root, where `../path.ts`
+   *   clamps it the same way it clamps every other path.
+   * - On v4.1 no `..` is needed at all: `PUTROOTFH` and `PUTPUBFH` are the
+   *   protocol's own "start at the top of this server's tree", and this server
+   *   has one tree — the driver's.
+   *
+   * That is the design rather than a hole in it, because there is no privilege
+   * to escalate: the MOUNT program is unauthenticated, so anything that can
+   * reach the socket can ask for `MNT "/"` and be given the driver root
+   * outright. **The socket is the boundary.** If a subtree is what you mean to
+   * serve, serve a driver rooted at that subtree — `createNodeFsDriver` takes
+   * a root and resolves every component against it — rather than exporting a
+   * path out of a wider one.
+   */
   exportPath?: string;
   /** Mount read-only (`-o ro`). */
   readOnly?: boolean;
@@ -156,6 +190,11 @@ export interface MountNfsOptions extends NfsServerOptions {
   /**
    * Milliseconds {@link NfsMount.unmount} may spend before it forces the mount
    * down. Default `10_000`; `0` or `Infinity` waits forever.
+   *
+   * It bounds each of the two phases, not their sum: asking nicely gets this
+   * long — mount-table reads included — and the forcing that follows gets its
+   * own budget of the same size, so a teardown that has to escalate settles in
+   * at most twice it.
    */
   unmountTimeout?: number;
   /** Called for transport-level failures, and for a forced teardown. */
@@ -176,7 +215,8 @@ export interface NfsMount extends AsyncDisposable {
   readonly active: boolean;
   /**
    * Unmount and shut the server down. Idempotent, concurrency-safe, retryable
-   * after a failure. Always settles, within `unmountTimeout`.
+   * after a failure. Always settles: within `unmountTimeout` when asking nicely
+   * works, and within twice it when the mount has to be forced down instead.
    */
   unmount(): Promise<void>;
 }
@@ -370,15 +410,24 @@ export function parseMountTable(platform: NfsPlatform, table: string): MountEntr
  * How long `mount(8)` gets to print the table on macOS before it is written
  * off as unreadable. It reads the kernel's list without contacting any server,
  * so this is a backstop, not a timeout anything is expected to reach.
+ *
+ * A caller in the middle of a teardown passes its own budget as well, and the
+ * smaller of the two wins: five seconds is the right backstop for a table read
+ * standing on its own, and far too much to spend out of a ten-second deadline
+ * that still has a `umount(8)` to run.
  */
 const MOUNT_TABLE_TIMEOUT = 5000;
 
 /** The mount table, or `undefined` if it could not be read. */
-async function mountTable(platform: NfsPlatform): Promise<MountEntry[] | undefined> {
+async function mountTable(
+  platform: NfsPlatform,
+  budget?: Deadline,
+): Promise<MountEntry[] | undefined> {
   if (platform === "darwin") {
-    const result = await run("mount", [], { stdio: CAPTURE, timeout: MOUNT_TABLE_TIMEOUT }).catch(
-      () => undefined,
-    );
+    const remaining = budget?.remaining();
+    const timeout =
+      remaining === undefined ? MOUNT_TABLE_TIMEOUT : Math.min(MOUNT_TABLE_TIMEOUT, remaining);
+    const result = await run("mount", [], { stdio: CAPTURE, timeout }).catch(() => undefined);
     return result === undefined || result.status !== 0
       ? undefined
       : parseMountTable(platform, result.stdout);
@@ -405,8 +454,9 @@ async function mountTable(platform: NfsPlatform): Promise<MountEntry[] | undefin
 export async function mountEntryAt(
   target: string,
   platform: NfsPlatform,
+  budget?: Deadline,
 ): Promise<MountEntry | undefined | null> {
-  const table = await mountTable(platform);
+  const table = await mountTable(platform, budget);
   if (table === undefined) {
     return null;
   }
@@ -428,8 +478,12 @@ export async function mountEntryAt(
  * is still live — the one outcome that leaves the caller's processes hanging
  * on a mountpoint whose server has just been shut down underneath them.
  */
-async function isMounted(target: string, platform: NfsPlatform): Promise<boolean | undefined> {
-  const entry = await mountEntryAt(target, platform);
+async function isMounted(
+  target: string,
+  platform: NfsPlatform,
+  budget?: Deadline,
+): Promise<boolean | undefined> {
+  const entry = await mountEntryAt(target, platform, budget);
   return entry === null ? undefined : entry !== undefined;
 }
 
@@ -625,12 +679,6 @@ export function nfsMountOptions(
   return parts.join(",");
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => {
-    setTimeout(resolvePromise, ms).unref();
-  });
-}
-
 class NfsMountImpl implements NfsMount {
   readonly mountpoint: string;
   readonly server: NfsServer;
@@ -699,9 +747,15 @@ class NfsMountImpl implements NfsMount {
     }
   }
 
-  /** Is the mountpoint still in the table? `undefined` if the table would not say. */
-  #mounted(): Promise<boolean | undefined> {
-    return isMounted(this.mountpoint, this.#platform);
+  /**
+   * Is the mountpoint still in the table? `undefined` if the table would not say.
+   *
+   * `budget` is the caller's remaining teardown time, because on macOS this
+   * spawns `mount(8)` — a step of the phase, and one that has to be paid for
+   * out of the same budget as the `umount(8)` it brackets.
+   */
+  #mounted(budget?: Deadline): Promise<boolean | undefined> {
+    return isMounted(this.mountpoint, this.#platform, budget);
   }
 
   async unmount(): Promise<void> {
@@ -723,14 +777,26 @@ class NfsMountImpl implements NfsMount {
    * The deadline is not paranoia: `umount(8)` flushes the filesystem before it
    * detaches, so a driver that has stopped answering blocks it — and on a
    * `hard` mount, blocks it forever.
+   *
+   * **One budget per phase, shared by its steps.** A phase here is two or three
+   * spawns on macOS — read the table, `umount(8)`, read it again — and handing
+   * each of them the whole `unmountTimeout` is how a documented ten seconds
+   * became, at the default, a possible **thirty on Linux** (a 10 s `umount`,
+   * then a two-rung ladder of 10 s each) and a possible **twenty-five on
+   * macOS** (the race below capped the graceful phase at 10 s even though its
+   * own steps could run 5 + 10 + 5, then a one-rung ladder of 5 + 10). Neither
+   * number is the deadline anyone was told about. `deadlineIn` is built once at
+   * the top and asked for what is *left* at each step, so the race below is a
+   * backstop for the phase rather than the only thing bounding it. The
+   * escalation then gets a budget of its own, because it runs only once the
+   * first one is spent — which is where the surviving factor of two comes from.
    */
   async #unmount(): Promise<void> {
     const timeout = this.#options.unmountTimeout ?? 10_000;
     const bounded = Number.isFinite(timeout) && timeout > 0;
+    const budget = deadlineIn(bounded ? timeout : undefined);
     let failure: unknown;
-    // Bounded, `umount(8)` gets the whole deadline: the race below is what
-    // covers the mount-table reads around it, not the unmount itself.
-    const steps = this.#unmountSteps(bounded ? timeout : undefined).then(
+    const steps = this.#unmountSteps(budget).then(
       (outcome) => outcome,
       (error: unknown) => {
         failure = error;
@@ -744,7 +810,7 @@ class NfsMountImpl implements NfsMount {
         // hangs. `unmount()` is retryable for exactly this case.
         throw failure;
       }
-      await this.#finish();
+      await this.#settle(budget);
       return;
     }
     let timer: NodeJS.Timeout | undefined;
@@ -765,21 +831,27 @@ class NfsMountImpl implements NfsMount {
       // failed unmount, so the server stays up for the retry.
       throw failure;
     }
-    await this.#finish();
+    // Whatever the steps left of the budget is what shutting the server down
+    // gets — the phase is one budget, and this is the last step in it.
+    await this.#settle(budget);
   }
 
   /**
-   * `umount(8)`, under `deadline`. `"timeout"` means it never answered — the
-   * caller escalates; anything genuinely wrong throws.
+   * `umount(8)`, under `deadline` — which every step here shares, table reads
+   * included. `"timeout"` means it never answered: the caller escalates, and
+   * anything genuinely wrong throws.
    */
-  async #unmountSteps(deadline: number | undefined): Promise<"done" | "timeout"> {
-    if ((await this.#mounted()) === false) {
+  async #unmountSteps(deadline: Deadline): Promise<"done" | "timeout"> {
+    if ((await this.#mounted(deadline)) === false) {
       // Someone else already unmounted us.
       return "done";
     }
     let result: SpawnResult;
     try {
-      result = await run("umount", [this.mountpoint], { stdio: CAPTURE, timeout: deadline });
+      result = await run("umount", [this.mountpoint], {
+        stdio: CAPTURE,
+        timeout: deadline.remaining(),
+      });
     } catch (error) {
       throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
     }
@@ -788,7 +860,7 @@ class NfsMountImpl implements NfsMount {
     }
     // A failure that raced an external unmount is not a failure. A table that
     // will not say is not that race: the mount is presumed live.
-    if (result.status === 0 || (await this.#mounted()) === false) {
+    if (result.status === 0 || (await this.#mounted(deadline)) === false) {
       return "done";
     }
     throw new Error(
@@ -826,6 +898,10 @@ class NfsMountImpl implements NfsMount {
    * The exit statuses are not believed; the mount table is.
    */
   async #force(timeout: number): Promise<void> {
+    // The escalation's own budget, shared by the whole ladder: two rungs, each
+    // a table read plus a `umount`, given the full `timeout` apiece is how this
+    // path used to cost more than the deadline that sent us here.
+    const budget = deadlineIn(timeout);
     const darwin = this.#platform === "darwin";
     const lazy = darwin ? "-f" : "-l";
     const error = new Error(
@@ -848,20 +924,25 @@ class NfsMountImpl implements NfsMount {
     let denied: SpawnResult | undefined;
     for (const args of ladder) {
       // Only a table that says it is gone stops the ladder — see `isMounted`.
-      if ((await this.#mounted()) === false) {
+      if ((await this.#mounted(budget)) === false) {
         break;
       }
       // Bounded for the same reason the first `umount` is: a step that never
       // returns must not outlive the ladder it is a step of.
-      const result = await run("umount", args, { stdio: CAPTURE, timeout }).catch(() => undefined);
+      const result = await run("umount", args, {
+        stdio: CAPTURE,
+        timeout: budget.remaining(),
+      }).catch(() => undefined);
       if (result !== undefined && isConsentDenial(this.#platform, result.stderr)) {
         denied = result;
       }
     }
     // Dropping the connections is itself a way out — a `soft` mount gives up
     // once the server stops answering — so the server goes down either way.
-    await this.#finish();
-    await delay(0);
+    // Under the ladder's own budget, not unbounded: see `#settle`, and note
+    // that the driver this is closing handles through is by hypothesis the one
+    // that stopped answering.
+    await this.#settle(budget);
     if (denied !== undefined) {
       // Not a guess: `umount -f` said `EPERM` while the mount was plainly
       // still listed, which is the one outcome the ladder cannot recover from.
@@ -873,6 +954,40 @@ class NfsMountImpl implements NfsMount {
       );
     }
     throw error;
+  }
+
+  /**
+   * {@link NfsMountImpl.#finish}, and stop waiting when the phase's budget runs
+   * out. This is what makes "settles within twice `unmountTimeout`" true.
+   *
+   * `#finish()` is not the quick bookkeeping it looks like. `server.close()`
+   * ends with `NfsSession.destroy()`, which closes every file handle the
+   * sessions still hold **one at a time, through the driver**, with no bound —
+   * and a driver that has stopped answering is the stated premise of every path
+   * that gets here. Awaiting that unconditionally would hand back the hang the
+   * deadline exists to prevent, one step further down.
+   *
+   * Abandoning it is safe in the way that matters, because of the order
+   * `NfsServerImpl.#close()` works in: the listener is closed and every
+   * accepted socket destroyed *before* the session teardown begins, and both of
+   * those are awaited inside the first turn. So what a lapsed budget walks away
+   * from is only the driver's own `close()` calls — precisely what the FUSE
+   * transport's `#finish(true)` skips for the same reason. The close keeps
+   * running; nothing can reach it.
+   */
+  async #settle(budget: Deadline): Promise<void> {
+    // Started before the budget is read, so an already-spent one still gets the
+    // synchronous half — the listener closing and the sockets going down.
+    const finished = this.#finish().catch((error: unknown) => {
+      this.#options.onTransportError?.(error, undefined);
+    });
+    const remaining = budget.remaining();
+    if (remaining === undefined) {
+      // No deadline at all, which is what `unmountTimeout: 0` asked for.
+      await finished;
+      return;
+    }
+    await Promise.race([finished, delay(remaining)]);
   }
 
   /** Stop serving and forget the mount. Idempotent. */

@@ -27,13 +27,13 @@
  * never touches the mountpoint.
  */
 
-import { spawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { mount, probeTransports, type Transport } from "../auto.ts";
 import { createMemoryDriver } from "../drivers/memory.ts";
+import { run } from "../fuse/exec.ts";
 import { createLoopback } from "../harness.ts";
 import type { FsDriver } from "../types.ts";
 import { bold, cyan, dim, green, red, yellow } from "./color.ts";
@@ -367,7 +367,10 @@ async function unmountStale(target: string): Promise<void> {
   console.log(`${yellow("!")} ${bold("unmounting stale")} ${cyan(target)} ${dim(`(${type})`)}`);
   // Not fatal, whatever happens: `mount()` refuses to stack and its message
   // says the rest, so this reports and gets out of the way.
-  const result = await run(command!, args, STALE_TIMEOUT).catch((error: unknown) => {
+  const result = await run(command!, args, {
+    stdio: ["ignore", "ignore", "pipe"],
+    timeout: STALE_TIMEOUT,
+  }).catch((error: unknown) => {
     console.error(red(`could not run ${command}: ${(error as Error).message}`));
     return undefined;
   });
@@ -386,47 +389,4 @@ async function unmountStale(target: string): Promise<void> {
     const { consentAdvice } = await import("../nfs/mount.ts");
     console.error(dim(consentAdvice(target)));
   }
-}
-
-interface RunResult {
-  status: number | null;
-  stderr: string;
-  /** The deadline passed with the child still running. */
-  timedOut: boolean;
-}
-
-/**
- * Run a command, bounded by `timeout`.
- *
- * The timeout **settles** rather than rejecting or waiting, and the child is
- * let go of completely — same reasoning as `src/nfs/mount.ts`'s `run`, which is
- * where it is written out in full: a `umount(8)` blocked inside the kernel
- * survives `SIGKILL`, so waiting for `close` would never return and holding on
- * to the child would keep this process's event loop alive after it has been
- * given up on.
- */
-function run(command: string, args: readonly string[], timeout: number): Promise<RunResult> {
-  return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, [...args], { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      child.stderr?.destroy();
-      child.unref();
-      resolvePromise({ status: null, stderr: stderr.trim(), timedOut: true });
-    }, timeout);
-    timer.unref();
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      rejectPromise(error);
-    });
-    child.once("close", (status) => {
-      clearTimeout(timer);
-      resolvePromise({ status, stderr: stderr.trim(), timedOut: false });
-    });
-  });
 }

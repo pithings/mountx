@@ -1,11 +1,21 @@
 /**
- * Running one command to completion.
+ * Running one command to completion, and the clock the teardown paths keep.
  *
  * Mounting is the one thing this library cannot do from JS alone, and every way
  * of doing it ends in a child process — `mount(8)` as root, `fusermount3` as
  * anyone, `mount -t 9p` for the 9P transport. This is the small piece they
  * share; `mount.ts`, `fusermount.ts` and `src/9p/mount.ts` are where the
  * interesting decisions live.
+ *
+ * {@link Deadline} and {@link delay} are here for the same reason {@link run}
+ * is. Unmounting is a *sequence* of spawns — read the mount table, ask nicely,
+ * escalate — and AGENTS.md's teardown invariant is about the sequence, not
+ * about any one of them: "Every spawned `umount` is bounded by that deadline
+ * and abandoned if it outlives it." A per-call timeout cannot say that, because
+ * three calls each given the whole budget spend three times it. One `Deadline`
+ * built at the top of a phase and asked for what is *left* at each step is what
+ * makes the documented bound the real one, and having it here means the three
+ * transports cannot drift apart on it the way the three `run()`s once did.
  *
  * It lives under `src/fuse/` because that is where it was first needed and
  * moving it would churn three files for a rename. `src/9p/mount.ts` imports it
@@ -48,9 +58,10 @@ export interface RunOptions {
    * The kill is sent because usually it works; the result is reported either
    * way, with {@link SpawnResult.timedOut} saying which happened.
    *
-   * The FUSE paths do not pass one — their teardown deadline lives one level up,
-   * in `mount.ts` — so the behaviour with no `timeout` is exactly what it was
-   * before this option existed.
+   * Every teardown spawn passes one, derived from a {@link Deadline} so the
+   * steps of one phase share a budget rather than each getting the whole of it.
+   * The mount paths do not: a `mount(8)` that hangs has produced no mount to
+   * clean up, and there is no invariant about how long it may take.
    */
   timeout?: number;
 }
@@ -106,6 +117,56 @@ export function run(
       clearTimeout(timer);
       resolvePromise({ status, signal, stdout, stderr: stderr.trim(), timedOut: false });
     });
+  });
+}
+
+/**
+ * One wall-clock budget, shared by every step of one phase of a teardown.
+ *
+ * Handed to each step in turn, so what the second one gets is whatever the
+ * first one left. An unbounded deadline answers `undefined`, which is exactly
+ * what {@link RunOptions.timeout} means by "wait forever", so the two compose
+ * with no branch at the call site.
+ */
+export interface Deadline {
+  /**
+   * Milliseconds left: `0` once the budget is spent, `undefined` when there
+   * never was one.
+   *
+   * Zero is deliberately not `undefined`. A step that starts with nothing left
+   * gets a `timeout` of `0` and is killed on the next turn of the timer queue,
+   * which is the honest answer — the phase it belongs to has already used
+   * everything it was given, and letting it run anyway is how the bound gets
+   * exceeded.
+   */
+  remaining(): number | undefined;
+}
+
+/**
+ * A budget of `timeout` milliseconds starting now.
+ *
+ * Anything that is not a positive finite number — `undefined`, `0`, `Infinity`,
+ * `NaN` — is "no deadline at all", the same opt-out the `unmountTimeout` option
+ * documents on all three transports.
+ */
+export function deadlineIn(timeout: number | undefined): Deadline {
+  if (timeout === undefined || !Number.isFinite(timeout) || timeout <= 0) {
+    return { remaining: () => undefined };
+  }
+  const end = Date.now() + timeout;
+  return { remaining: () => Math.max(0, end - Date.now()) };
+}
+
+/**
+ * Sleep, without holding the process open.
+ *
+ * `unref` because every caller is on a teardown path: a delay nobody is waiting
+ * for must not be the reason Node stays alive, and a process that is exiting
+ * anyway has already answered whatever this was waiting for.
+ */
+export function delay(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => {
+    setTimeout(resolvePromise, ms).unref();
   });
 }
 
