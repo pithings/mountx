@@ -119,6 +119,87 @@ describe.skipIf(!live)("execUserns", () => {
   );
 
   it(
+    "removes, renames and links entries that were in the driver before the mount",
+    async () => {
+      // **The regression this file exists for most.** Every one of these
+      // answered `EOVERFLOW` ("Value too large for defined data type") until the
+      // session learned the mount's id space, and the discriminator was not the
+      // operation but how the kernel had learned about the inode: a file the
+      // command had itself created could be removed, a file that arrived via
+      // `LOOKUP` could not. Both are the same driver, the same session and the
+      // same syscall — what differed was that the created one had already been
+      // chowned to the caller, and so carried an id the namespace maps.
+      //
+      // The VFS refuses these in `may_delete()` and `may_linkat()` before the
+      // request reaches the server at all, so nothing on the mountx side sees
+      // an error; the mount reads perfectly and simply cannot be changed.
+      const driver = createMemoryDriver();
+      const fs = createLoopback(driver);
+      await fs.writeFile("/gone.txt", "delete me\n");
+      await fs.mkdir("/gone-dir");
+      await fs.writeFile("/from.txt", "rename me\n");
+      await fs.writeFile("/linked.txt", "link me\n");
+      await fs.writeFile("/grow.txt", "truncate me\n");
+      await fs.writeFile("/mode.txt", "chmod me\n");
+      await fs.symlink("mode.txt", "/gone-link");
+      // A whole pre-existing subtree, which is the realistic shape of this:
+      // `rm -rf` walks in and every inode it meets arrived through `LOOKUP`.
+      await fs.mkdir("/tree/deep", { recursive: true });
+      await fs.writeFile("/tree/deep/leaf.txt", "leaf\n");
+
+      const ran = await execUserns(driver, [
+        "sh",
+        "-c",
+        'set -e; cd /; R="$MOUNTX_ROOT"; ' +
+          'rm "$R/gone.txt"; rmdir "$R/gone-dir"; rm "$R/gone-link"; rm -rf "$R/tree"; ' +
+          'mv "$R/from.txt" "$R/to.txt"; ' +
+          'ln "$R/linked.txt" "$R/linked2.txt"; printf short > "$R/grow.txt"; ' +
+          'chmod 600 "$R/mode.txt"; ls "$R" > "$R/listing"',
+      ]);
+      expect(ran.code).toBe(0);
+
+      // Asserted against the driver, never against the exit status — the whole
+      // point of the original bug is that plenty of it looked like it worked.
+      const names = (await fs.readdir("/", { withFileTypes: true })).map((entry) => entry.name);
+      expect(names).not.toContain("gone.txt");
+      expect(names).not.toContain("gone-dir");
+      expect(names).not.toContain("gone-link");
+      expect(names).not.toContain("tree");
+      expect(names).not.toContain("from.txt");
+      expect(names).toContain("to.txt");
+      expect(names).toContain("linked2.txt");
+      expect((await fs.lstat("/linked.txt")).nlink).toBe(2);
+      expect(Buffer.from(await fs.readFile("/grow.txt")).toString("utf8")).toBe("short");
+      expect((await fs.stat("/mode.txt")).mode & 0o777).toBe(0o600);
+      // And a plain `readdir` of pre-existing entries, which never broke, so a
+      // fix that traded it away would be caught here.
+      const listing = Buffer.from(await fs.readFile("/listing")).toString("utf8");
+      expect(listing).toContain("to.txt");
+      expect(listing).toContain("linked2.txt");
+    },
+    SLOW,
+  );
+
+  it(
+    "leaves files the command created owned by whoever ran mountx",
+    async () => {
+      // The other half of the same crossing. `fuse_in_header.uid` is in the
+      // mount's id space, so a caller who is in fact this process arrives as 0;
+      // read raw, the session's ownership hand-off saw a stranger and chowned
+      // every new file to a uid 0 that means nothing on this side of the
+      // namespace. Reading the id back through the map makes the caller
+      // recognizable again.
+      const driver = await demo();
+      const ran = await execUserns(driver, ["sh", "-c", 'printf x > "$MOUNTX_ROOT/mine.txt"']);
+      expect(ran.code).toBe(0);
+      const stats = await createLoopback(driver).lstat("/mine.txt");
+      expect(stats.uid).toBe(process.getuid?.());
+      expect(stats.gid).toBe(process.getgid?.());
+    },
+    SLOW,
+  );
+
+  it(
     "mounts where it was told, and leaves nothing behind",
     async () => {
       const mountpoint = join(await scratch(), "deep", "mnt");
