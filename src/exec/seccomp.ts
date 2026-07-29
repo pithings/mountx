@@ -18,7 +18,7 @@
  * compares against a specific syscall table.
  */
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn, type StdioOptions } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +32,20 @@ export interface ExecSeccompOptions extends P9ServerOptions {
   trace?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * How the command's standard streams are wired, as `child_process` spells it.
+   * Defaults to `"inherit"`, which is what a command run for its output wants.
+   */
+  stdio?: StdioOptions;
+  /**
+   * The child, the moment it exists.
+   *
+   * `execSeccomp` resolves when the command has *exited*, which is the wrong
+   * shape for a command that is being driven — a helper answering requests on
+   * its standard input, say. This is the handle for that: whatever it is given
+   * has already been spawned, and the promise is still outstanding.
+   */
+  onSpawn?: (child: ChildProcess) => void;
 }
 
 export interface ExecSeccompResult {
@@ -69,10 +83,11 @@ export async function execSeccomp(
 
   try {
     const child = spawn(trace, [socketPath, root, "--", ...argv], {
-      stdio: "inherit",
+      stdio: options.stdio ?? "inherit",
       cwd: options.cwd ?? process.cwd(),
       env: { ...(options.env ?? process.env), MOUNTX_ROOT: root },
     });
+    options.onSpawn?.(child);
     const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolveExit, rejectExit) => {
         child.on("error", rejectExit);
