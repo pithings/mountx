@@ -125,11 +125,11 @@ import {
   credentialsOf,
   decodeCall,
   encodeAcceptError,
-  encodeAcceptedReply,
   encodeAuthError,
   encodeRpcMismatch,
   type RpcCall,
   type RpcCredentials,
+  writeAcceptedReplyHeader,
 } from "../rpc.ts";
 import {
   entryPlusSize,
@@ -204,6 +204,32 @@ export const DEFAULT_RTMAX = 1024 * 1024;
 export const DEFAULT_WTMAX = 1024 * 1024;
 /** Preferred `READDIR` reply size, and `FSINFO`'s `dtpref`. */
 export const DEFAULT_DTPREF = 32 * 1024;
+
+/**
+ * Starting size of the one buffer a reply is built in.
+ *
+ * Every fixed-shape reply this server sends fits: the largest is `FSINFO`'s at
+ * 128 bytes on top of the 24-byte accepted-reply header. The three that do not
+ * have a fixed shape — `READ`, `READDIR`, `READDIRPLUS` — call
+ * `XdrWriter.ensure()` once they know what they are about to write, and are
+ * allocated exactly once. That is the whole of it: sizing a reply writer by
+ * procedure was guesswork that got `READ` wrong by three orders of magnitude.
+ */
+const REPLY_CAPACITY = 256;
+
+/**
+ * Everything a `READ3resok` carries besides the payload: `status`, a
+ * `post_op_attr` (its `bool` plus a 84-byte `fattr3`), `count`, `eof`, and the
+ * `data<>` length word — 104 bytes at most, plus three of alignment.
+ *
+ * Rounded up to a flat 128 rather than computed exactly, which is a trade worth
+ * naming now that `XdrWriter.view()` means reserved-and-unused capacity is
+ * *retained*: under-reserving costs the grow this constant exists to avoid, and
+ * over-reserving costs bytes held until the reply flushes. At 24 bytes on a
+ * reply of any size that is the right side to err on — unlike reserving from
+ * the client's `rsize`, where the error is the whole request.
+ */
+const READ_RES_OVERHEAD = 128;
 
 /**
  * How many entries of one `READDIR`/`READDIRPLUS` page are resolved at once.
@@ -332,6 +358,11 @@ export class Nfs3Session {
    * Resolves to the encoded reply, or `null` for a record too damaged to carry
    * an xid — there is nothing to address a reply to. **Never rejects.**
    *
+   * What comes back is a **view of the one buffer this call built its reply
+   * in**, not a copy: the caller owns it outright, and nothing here writes
+   * to it again. `../xdr.ts`'s `XdrWriter.view()` states the rule the
+   * sessions keep to earn that.
+   *
    * A direct caller must not overwrite `message` while the promise is
    * outstanding; everything the session *keeps* — names, `WRITE` payloads,
    * file handles — is copied out of it by the decoders. The transport never
@@ -398,16 +429,29 @@ export class Nfs3Session {
     this.#count(call);
 
     const creds = credentialsOf(call.cred);
-    let results: Uint8Array;
+    // One buffer for the whole reply: the accepted-reply header goes in first
+    // and the handler appends its results straight after it, so what comes back
+    // is a view of a single buffer rather than three of them concatenated. A
+    // handler that knows the size of what it is about to write — `READ` once
+    // the driver has answered, `READDIR` once its page is chosen — says so with
+    // `writer.ensure()` and it is allocated exactly once. Each of those sizes
+    // from the bytes it *has*, never from the ceiling the client named: this
+    // buffer is handed to the socket as a view, so unused capacity is retained
+    // rather than dropped.
+    const writer = new XdrWriter(REPLY_CAPACITY);
+    writeAcceptedReplyHeader(writer, call.xid);
     try {
-      results =
-        call.program === NFS_PROGRAM
-          ? await this.#nfs(call, args, creds)
-          : await this.#mount(call, args, context);
+      if (call.program === NFS_PROGRAM) {
+        await this.#nfs(call, args, creds, writer);
+      } else {
+        await this.#mount(call, args, context, writer);
+      }
     } catch (error) {
       // Only two things reach here: a decoder failure (every procedure handler
       // turns a *driver* error into a status of its own) and a procedure number
-      // that does not exist. Both are answered at the RPC level.
+      // that does not exist. Both are answered at the RPC level — and with a
+      // *fresh* buffer, because an accepted reply's header is not an error
+      // reply's and whatever the handler managed to write is not part of one.
       if (isXdrError(error)) {
         this.options.onError?.(error, call);
         this.stats.errors++;
@@ -419,7 +463,9 @@ export class Nfs3Session {
       }
       throw error;
     }
-    return encodeAcceptedReply(call.xid, results);
+    // A view, not a copy: `writer` is this call's alone and nothing writes to
+    // it after this point. See `XdrWriter.view()` for the rule in full.
+    return writer.view();
   }
 
   #count(call: RpcCall): void {
@@ -445,77 +491,82 @@ export class Nfs3Session {
   // the NFS program
   // -------------------------------------------------------------------------
 
-  async #nfs(call: RpcCall, args: XdrReader, creds: RpcCredentials): Promise<Uint8Array> {
+  async #nfs(
+    call: RpcCall,
+    args: XdrReader,
+    creds: RpcCredentials,
+    writer: XdrWriter,
+  ): Promise<void> {
     switch (call.procedure) {
       case NFSPROC3_NULL: {
         args.end("NULL arguments");
-        return new Uint8Array(0);
+        return;
       }
       case NFSPROC3_GETATTR: {
-        return this.#read(() => this.#getattr(args));
+        return this.#read(() => this.#getattr(args, writer));
       }
       case NFSPROC3_SETATTR: {
-        return this.#read(() => this.#setattr(args));
+        return this.#read(() => this.#setattr(args, writer));
       }
       case NFSPROC3_LOOKUP: {
-        return this.#read(() => this.#lookup(args));
+        return this.#read(() => this.#lookup(args, writer));
       }
       case NFSPROC3_ACCESS: {
-        return this.#read(() => this.#access(args, creds));
+        return this.#read(() => this.#access(args, creds, writer));
       }
       case NFSPROC3_READLINK: {
-        return this.#read(() => this.#readlink(args));
+        return this.#read(() => this.#readlink(args, writer));
       }
       // READ and WRITE stay outside the lock: they are the two requests a
       // driver can block on for an unbounded time, and holding a reader across
       // one would let a single stuck read freeze every rename behind it.
       case NFSPROC3_READ: {
-        return this.#readFile(args);
+        return this.#readFile(args, writer);
       }
       case NFSPROC3_WRITE: {
-        return this.#write(args);
+        return this.#write(args, writer);
       }
       case NFSPROC3_CREATE: {
-        return this.#read(() => this.#create(args, creds));
+        return this.#read(() => this.#create(args, creds, writer));
       }
       case NFSPROC3_MKDIR: {
-        return this.#read(() => this.#mkdir(args, creds));
+        return this.#read(() => this.#mkdir(args, creds, writer));
       }
       case NFSPROC3_SYMLINK: {
-        return this.#read(() => this.#symlink(args, creds));
+        return this.#read(() => this.#symlink(args, creds, writer));
       }
       case NFSPROC3_MKNOD: {
-        return this.#read(() => this.#mknod(args, creds));
+        return this.#read(() => this.#mknod(args, creds, writer));
       }
       case NFSPROC3_REMOVE: {
-        return this.#read(() => this.#remove(args, false));
+        return this.#read(() => this.#remove(args, false, writer));
       }
       case NFSPROC3_RMDIR: {
-        return this.#read(() => this.#remove(args, true));
+        return this.#read(() => this.#remove(args, true, writer));
       }
       case NFSPROC3_RENAME: {
-        return this.#lock.write(() => this.#rename(args));
+        return this.#lock.write(() => this.#rename(args, writer));
       }
       case NFSPROC3_LINK: {
-        return this.#read(() => this.#link(args));
+        return this.#read(() => this.#link(args, writer));
       }
       case NFSPROC3_READDIR: {
-        return this.#read(() => this.#readdir(args));
+        return this.#read(() => this.#readdir(args, writer));
       }
       case NFSPROC3_READDIRPLUS: {
-        return this.#read(() => this.#readdirplus(args));
+        return this.#read(() => this.#readdirplus(args, writer));
       }
       case NFSPROC3_FSSTAT: {
-        return this.#read(() => this.#fsstat(args));
+        return this.#read(() => this.#fsstat(args, writer));
       }
       case NFSPROC3_FSINFO: {
-        return this.#read(() => this.#fsinfo(args));
+        return this.#read(() => this.#fsinfo(args, writer));
       }
       case NFSPROC3_PATHCONF: {
-        return this.#read(() => this.#pathconf(args));
+        return this.#read(() => this.#pathconf(args, writer));
       }
       case NFSPROC3_COMMIT: {
-        return this.#read(() => this.#commit(args));
+        return this.#read(() => this.#commit(args, writer));
       }
       default: {
         throw new ProcedureUnavailable(call.program, call.procedure);
@@ -524,7 +575,7 @@ export class Nfs3Session {
   }
 
   /** Run a handler as a reader: concurrent with everything but `RENAME`. */
-  #read(fn: () => Promise<Uint8Array>): Promise<Uint8Array> {
+  #read(fn: () => Promise<void>): Promise<void> {
     return this.#lock.read(fn);
   }
 
@@ -639,10 +690,9 @@ export class Nfs3Session {
   // GETATTR / SETATTR
   // -------------------------------------------------------------------------
 
-  async #getattr(args: XdrReader): Promise<Uint8Array> {
+  async #getattr(args: XdrReader, writer: XdrWriter): Promise<void> {
     const fh = args.varOpaque(64, "nfs_fh3");
     args.end("GETATTR arguments");
-    const writer = new XdrWriter(128);
     try {
       const { attr } = await this.#attrOf(this.#pathOf(fh));
       writeGetattrRes(writer, { status: NFS3_OK, attributes: attr });
@@ -652,13 +702,12 @@ export class Nfs3Session {
         attributes: undefined,
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #setattr(args: XdrReader): Promise<Uint8Array> {
+  async #setattr(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readSetattrArgs(args);
     args.end("SETATTR arguments");
-    const writer = new XdrWriter(160);
     let path: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -682,7 +731,7 @@ export class Nfs3Session {
         wcc: { before, after: await this.#postOp(path) },
       });
     }
-    return writer.bytes();
+    return;
   }
 
   /**
@@ -763,10 +812,9 @@ export class Nfs3Session {
   // LOOKUP / ACCESS / READLINK
   // -------------------------------------------------------------------------
 
-  async #lookup(args: XdrReader): Promise<Uint8Array> {
+  async #lookup(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readDirOp(args);
     args.end("LOOKUP arguments");
-    const writer = new XdrWriter(256);
     let dir: string | undefined;
     try {
       dir = this.#pathOf(request.dir);
@@ -794,7 +842,7 @@ export class Nfs3Session {
         dirAttributes: await this.#postOp(dir),
       });
     }
-    return writer.bytes();
+    return;
   }
 
   /**
@@ -808,10 +856,9 @@ export class Nfs3Session {
    * model reports mode `0` for everything, and then this correctly says "no",
    * which is why the bits are only masked *down* from what was asked.
    */
-  async #access(args: XdrReader, creds: RpcCredentials): Promise<Uint8Array> {
+  async #access(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readAccessArgs(args);
     args.end("ACCESS arguments");
-    const writer = new XdrWriter(128);
     try {
       const { attr, stats } = await this.#attrOf(this.#pathOf(request.object));
       writeAccessRes(writer, {
@@ -826,13 +873,12 @@ export class Nfs3Session {
         access: 0,
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #readlink(args: XdrReader): Promise<Uint8Array> {
+  async #readlink(args: XdrReader, writer: XdrWriter): Promise<void> {
     const fh = args.varOpaque(64, "nfs_fh3");
     args.end("READLINK arguments");
-    const writer = new XdrWriter(256);
     let path: string | undefined;
     try {
       path = this.#pathOf(fh);
@@ -849,7 +895,7 @@ export class Nfs3Session {
         target: undefined,
       });
     }
-    return writer.bytes();
+    return;
   }
 
   // -------------------------------------------------------------------------
@@ -882,10 +928,9 @@ export class Nfs3Session {
     }
   }
 
-  async #readFile(args: XdrReader): Promise<Uint8Array> {
+  async #readFile(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readReadArgs(args);
     args.end("READ arguments");
-    const writer = new XdrWriter(1024);
     let path: string | undefined;
     try {
       path = this.#pathOf(request.file);
@@ -896,6 +941,13 @@ export class Nfs3Session {
         handle.read(buffer, 0, count, offset),
       );
       const read = Math.max(0, bytesRead);
+      // Sized from what the file *gave*, not from what the client asked for,
+      // and only once that is known. The two differ by the whole request on a
+      // short read — a 1 MiB `rsize` against the last 200 bytes of a file — and
+      // `handleCall` returns a view of this buffer, so the difference would be
+      // held by the socket's write queue until the reply flushed rather than
+      // freed at the end of the call.
+      writer.ensure(read + READ_RES_OVERHEAD);
       const attributes = await this.#postOp(path);
       writeReadRes(writer, {
         status: NFS3_OK,
@@ -915,13 +967,12 @@ export class Nfs3Session {
         data: new Uint8Array(0),
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #write(args: XdrReader): Promise<Uint8Array> {
+  async #write(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readWriteArgs(args, this.#wtmax());
     args.end("WRITE arguments");
-    const writer = new XdrWriter(160);
     let path: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -948,7 +999,7 @@ export class Nfs3Session {
         verf: this.writeVerifier,
       });
     }
-    return writer.bytes();
+    return;
   }
 
   /**
@@ -959,10 +1010,9 @@ export class Nfs3Session {
    * close, on `fsync`, at the end of a writeback run), and a server that
    * answered `NFS3ERR_NOTSUPP` would make every one of those fail.
    */
-  async #commit(args: XdrReader): Promise<Uint8Array> {
+  async #commit(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readCommitArgs(args);
     args.end("COMMIT arguments");
-    const writer = new XdrWriter(160);
     let path: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -980,7 +1030,7 @@ export class Nfs3Session {
         verf: this.writeVerifier,
       });
     }
-    return writer.bytes();
+    return;
   }
 
   // -------------------------------------------------------------------------
@@ -1046,10 +1096,9 @@ export class Nfs3Session {
     }
   }
 
-  async #create(args: XdrReader, creds: RpcCredentials): Promise<Uint8Array> {
+  async #create(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readCreateArgs(args);
     args.end("CREATE arguments");
-    const writer = new XdrWriter(256);
     let dir: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -1081,13 +1130,12 @@ export class Nfs3Session {
     } catch (error) {
       await this.#createFailed(writer, dir, before, error);
     }
-    return writer.bytes();
+    return;
   }
 
-  async #mkdir(args: XdrReader, creds: RpcCredentials): Promise<Uint8Array> {
+  async #mkdir(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readMkdirArgs(args);
     args.end("MKDIR arguments");
-    const writer = new XdrWriter(256);
     let dir: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -1102,13 +1150,12 @@ export class Nfs3Session {
     } catch (error) {
       await this.#createFailed(writer, dir, before, error);
     }
-    return writer.bytes();
+    return;
   }
 
-  async #symlink(args: XdrReader, creds: RpcCredentials): Promise<Uint8Array> {
+  async #symlink(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readSymlinkArgs(args);
     args.end("SYMLINK arguments");
-    const writer = new XdrWriter(256);
     let dir: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -1128,7 +1175,7 @@ export class Nfs3Session {
     } catch (error) {
       await this.#createFailed(writer, dir, before, error);
     }
-    return writer.bytes();
+    return;
   }
 
   /**
@@ -1139,10 +1186,9 @@ export class Nfs3Session {
    * express, so the driver interface has no way to ask for one. Saying so is
    * the whole implementation.
    */
-  async #mknod(args: XdrReader, creds: RpcCredentials): Promise<Uint8Array> {
+  async #mknod(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readMknodArgs(args);
     args.end("MKNOD arguments");
-    const writer = new XdrWriter(256);
     let dir: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -1162,17 +1208,16 @@ export class Nfs3Session {
     } catch (error) {
       await this.#createFailed(writer, dir, before, error);
     }
-    return writer.bytes();
+    return;
   }
 
   // -------------------------------------------------------------------------
   // REMOVE / RMDIR / RENAME / LINK
   // -------------------------------------------------------------------------
 
-  async #remove(args: XdrReader, directory: boolean): Promise<Uint8Array> {
+  async #remove(args: XdrReader, directory: boolean, writer: XdrWriter): Promise<void> {
     const request = readDirOp(args);
     args.end(`${directory ? "RMDIR" : "REMOVE"} arguments`);
-    const writer = new XdrWriter(160);
     let dir: string | undefined;
     let before: WccAttr | undefined;
     try {
@@ -1197,14 +1242,13 @@ export class Nfs3Session {
         wcc: { before, after: await this.#postOp(dir) },
       });
     }
-    return writer.bytes();
+    return;
   }
 
   /** `RENAME`. The one operation that holds the writer lock. */
-  async #rename(args: XdrReader): Promise<Uint8Array> {
+  async #rename(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readRenameArgs(args);
     args.end("RENAME arguments");
-    const writer = new XdrWriter(256);
     let fromDir: string | undefined;
     let toDir: string | undefined;
     let fromBefore: WccAttr | undefined;
@@ -1239,13 +1283,12 @@ export class Nfs3Session {
         toWcc: { before: toBefore, after: await this.#postOp(toDir) },
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #link(args: XdrReader): Promise<Uint8Array> {
+  async #link(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readLinkArgs(args);
     args.end("LINK arguments");
-    const writer = new XdrWriter(256);
     let dir: string | undefined;
     let file: string | undefined;
     let before: WccAttr | undefined;
@@ -1272,7 +1315,7 @@ export class Nfs3Session {
         linkdirWcc: { before, after: await this.#postOp(dir) },
       });
     }
-    return writer.bytes();
+    return;
   }
 
   // -------------------------------------------------------------------------
@@ -1321,10 +1364,9 @@ export class Nfs3Session {
     return { names: snapshot.names, verf: snapshot.cookieverf, from };
   }
 
-  async #readdir(args: XdrReader): Promise<Uint8Array> {
+  async #readdir(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readReaddirArgs(args);
     args.end("READDIR arguments");
-    const writer = new XdrWriter(4096);
     let path: string | undefined;
     try {
       const entry = this.handles.decode(request.dir);
@@ -1354,6 +1396,11 @@ export class Nfs3Session {
       if (chosen.length === 0 && index < page.names.length) {
         throw new NfsStatusError(NFS3ERR_TOOSMALL, `count ${request.count} fits no entry`);
       }
+      // `used` is the page that was chosen; `budget` is what the client would
+      // have allowed. Reserving the second would leave the difference pinned in
+      // the socket's write queue, because the reply goes out as a view of this
+      // buffer — see `#readFile`, where the gap is far wider.
+      writer.ensure(used + 128);
       const fileids = await mapPage(chosen, (name) => this.#fileid(dir, name));
       const entries: Entry3[] = chosen.map((name, offset) => ({
         fileid: fileids[offset]!,
@@ -1376,13 +1423,12 @@ export class Nfs3Session {
         eof: false,
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #readdirplus(args: XdrReader): Promise<Uint8Array> {
+  async #readdirplus(args: XdrReader, writer: XdrWriter): Promise<void> {
     const request = readReaddirplusArgs(args);
     args.end("READDIRPLUS arguments");
-    const writer = new XdrWriter(8192);
     let path: string | undefined;
     try {
       const entry = this.handles.decode(request.dir);
@@ -1418,6 +1464,9 @@ export class Nfs3Session {
           `dircount ${request.dircount} / maxcount ${request.maxcount} fits no entry`,
         );
       }
+      // The page that was chosen, not the `maxcount` that bounded it — as in
+      // `#readdir`, and for the same reason.
+      writer.ensure(maxUsed + 128);
       const entries: EntryPlus3[] = await mapPage(chosen, async (name, offset) => {
         const child = joinPath(dir, name);
         const cookie = BigInt(page.from + offset + 1);
@@ -1452,7 +1501,7 @@ export class Nfs3Session {
         eof: false,
       });
     }
-    return writer.bytes();
+    return;
   }
 
   /**
@@ -1490,10 +1539,9 @@ export class Nfs3Session {
   // FSSTAT / FSINFO / PATHCONF
   // -------------------------------------------------------------------------
 
-  async #fsstat(args: XdrReader): Promise<Uint8Array> {
+  async #fsstat(args: XdrReader, writer: XdrWriter): Promise<void> {
     const fh = args.varOpaque(64, "nfs_fh3");
     args.end("FSSTAT arguments");
-    const writer = new XdrWriter(160);
     let path: string | undefined;
     try {
       path = this.#pathOf(fh);
@@ -1525,13 +1573,12 @@ export class Nfs3Session {
         invarsec: 0,
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #fsinfo(args: XdrReader): Promise<Uint8Array> {
+  async #fsinfo(args: XdrReader, writer: XdrWriter): Promise<void> {
     const fh = args.varOpaque(64, "nfs_fh3");
     args.end("FSINFO arguments");
-    const writer = new XdrWriter(160);
     let path: string | undefined;
     try {
       path = this.#pathOf(fh);
@@ -1576,13 +1623,12 @@ export class Nfs3Session {
         properties: 0,
       });
     }
-    return writer.bytes();
+    return;
   }
 
-  async #pathconf(args: XdrReader): Promise<Uint8Array> {
+  async #pathconf(args: XdrReader, writer: XdrWriter): Promise<void> {
     const fh = args.varOpaque(64, "nfs_fh3");
     args.end("PATHCONF arguments");
-    const writer = new XdrWriter(160);
     let path: string | undefined;
     try {
       path = this.#pathOf(fh);
@@ -1610,29 +1656,33 @@ export class Nfs3Session {
         casePreserving: false,
       });
     }
-    return writer.bytes();
+    return;
   }
 
   // -------------------------------------------------------------------------
   // the MOUNT program
   // -------------------------------------------------------------------------
 
-  async #mount(call: RpcCall, args: XdrReader, context: NfsRequestContext): Promise<Uint8Array> {
-    const writer = new XdrWriter(128);
+  async #mount(
+    call: RpcCall,
+    args: XdrReader,
+    context: NfsRequestContext,
+    writer: XdrWriter,
+  ): Promise<void> {
     switch (call.procedure) {
       case MOUNTPROC3_NULL: {
         args.end("MOUNT NULL arguments");
-        return new Uint8Array(0);
+        return;
       }
       case MOUNTPROC3_MNT: {
         const dirpath = args.string(MNT3_PATHLEN, "dirpath");
         args.end("MNT arguments");
-        return this.#read(() => this.#mnt(dirpath, context));
+        return this.#read(() => this.#mnt(dirpath, context, writer));
       }
       case MOUNTPROC3_DUMP: {
         args.end("DUMP arguments");
         writeMountList(writer, this.#mounts);
-        return writer.bytes();
+        return;
       }
       case MOUNTPROC3_UMNT: {
         const dirpath = normalizePath(args.string(MNT3_PATHLEN, "dirpath"));
@@ -1644,7 +1694,7 @@ export class Nfs3Session {
         if (index >= 0) {
           this.#mounts.splice(index, 1);
         }
-        return new Uint8Array(0);
+        return;
       }
       case MOUNTPROC3_UMNTALL: {
         args.end("UMNTALL arguments");
@@ -1654,7 +1704,7 @@ export class Nfs3Session {
             this.#mounts.splice(index, 1);
           }
         }
-        return new Uint8Array(0);
+        return;
       }
       case MOUNTPROC3_EXPORT: {
         args.end("EXPORT arguments");
@@ -1662,7 +1712,7 @@ export class Nfs3Session {
         // socket. The access list is empty because there is nothing to list:
         // this is a loopback server, and the socket is the boundary.
         writeExportList(writer, [{ directory: "/", groups: [] }]);
-        return writer.bytes();
+        return;
       }
       default: {
         throw new ProcedureUnavailable(call.program, call.procedure);
@@ -1683,8 +1733,7 @@ export class Nfs3Session {
    * answers `GARBAGE_ARGS` before any of this runs. The status still exists in
    * {@link mountStatusOf}, where a driver's own `ENAMETOOLONG` reaches it.
    */
-  async #mnt(dirpath: string, context: NfsRequestContext): Promise<Uint8Array> {
-    const writer = new XdrWriter(128);
+  async #mnt(dirpath: string, context: NfsRequestContext, writer: XdrWriter): Promise<void> {
     const path = normalizePath(dirpath);
     try {
       const { entry, stats } = await this.#attrOf(path);
@@ -1704,7 +1753,7 @@ export class Nfs3Session {
         authFlavors: [],
       });
     }
-    return writer.bytes();
+    return;
   }
 }
 

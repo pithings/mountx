@@ -30,7 +30,7 @@
 
 import * as net from "node:net";
 import type { FsDriver } from "../types.ts";
-import { RecordAssembler, frameRecord } from "./rpc.ts";
+import { RecordAssembler, recordMark } from "./rpc.ts";
 import { NfsSession, type NfsSessionOptions } from "./session.ts";
 import { isXdrError } from "./xdr.ts";
 
@@ -137,9 +137,8 @@ export interface NfsServerOptions extends NfsSessionOptions {
  * *produced*, never awaited from inside itself. Ordering the await instead
  * collapsed every in-flight call to the latency of the slowest — with the
  * default `soft,timeo=50,retrans=2` that manufactures retransmits — and it
- * bought nothing, because each reply is one contiguous `frameRecord()` buffer
- * handed to one `socket.write()` and Node's writable queue never interleaves
- * chunks from separate `write()` calls.
+ * bought nothing, because each reply leaves as one corked `writev` and Node's
+ * writable queue never interleaves chunks from separate `write()` calls.
  *
  * **Reading is paused, not buffered.** A connection that is congested — the
  * socket full, or {@link NfsServerOptions.maxInFlight} calls already being
@@ -326,7 +325,7 @@ class NfsConnection {
         !this.#stopped &&
         !this.#socket.destroyed &&
         !this.#socket.writableEnded &&
-        !this.#socket.write(frameRecord(reply))
+        !this.#writeRecord(reply)
       ) {
         this.#congested = true;
         this.#pauseReads();
@@ -343,6 +342,35 @@ class NfsConnection {
     } finally {
       this.#inflight--;
       this.#pump();
+    }
+  }
+
+  /**
+   * One record onto the socket: the 4-byte mark, then the reply, corked.
+   *
+   * Two `write()`s inside a `cork()`/`uncork()` leave as one `writev`, which is
+   * one record on the wire exactly as `frameRecord(reply)` was — and the same
+   * bytes in the same order — without the copy. At a 1 MiB `READ` that copy was
+   * ~100 µs, and it was the *last* full-size pass over the payload: the reply a
+   * session hands back is a view of the one buffer it built, so nothing between
+   * the encoder and the kernel touches those bytes now.
+   *
+   * The reply is only ever read from, never written into, which is what makes
+   * a view safe to have been handed: `../xdr.ts`'s `XdrWriter.view()` gives one
+   * out on the promise that nothing writes to that buffer afterwards, and this
+   * is the last thing that touches it. Framing in place would have broken that
+   * promise for every reply, cached or not.
+   *
+   * Answers the *last* write's backpressure, the one that actually carries the
+   * payload; the mark ahead of it is 4 bytes and always fits.
+   */
+  #writeRecord(reply: Uint8Array): boolean {
+    this.#socket.cork();
+    try {
+      this.#socket.write(recordMark(reply.byteLength));
+      return this.#socket.write(reply);
+    } finally {
+      this.#socket.uncork();
     }
   }
 

@@ -301,18 +301,54 @@ export function decodeReply(bytes: Uint8Array): { reply: RpcReply; results: XdrR
   return { reply, results: reader };
 }
 
-/** `MSG_ACCEPTED` with `SUCCESS`, then the encoded results. */
-export function encodeAcceptedReply(xid: number, results?: Uint8Array): Uint8Array {
-  const writer = new XdrWriter(32 + (results?.byteLength ?? 0));
+/**
+ * Bytes an accepted reply's header occupies: `xid`, `mtype`, `reply_stat`, the
+ * `AUTH_NULL` verifier (a flavor and a zero length, no body) and `accept_stat`.
+ *
+ * Fixed, which is what lets a session write it into the front of the same
+ * writer its results go into instead of concatenating two buffers afterwards.
+ */
+export const ACCEPTED_REPLY_HEADER_SIZE = 24;
+
+/**
+ * Write `MSG_ACCEPTED` / `SUCCESS` into `writer`, results to follow.
+ *
+ * The header for the reply a *handler* is about to append. Callers that have
+ * the results already should use {@link encodeAcceptedReply}; callers that are
+ * about to produce them start here, so the whole reply is built once in one
+ * buffer. {@link ACCEPTED_REPLY_HEADER_SIZE} is how many bytes this adds.
+ */
+export function writeAcceptedReplyHeader(writer: XdrWriter, xid: number): XdrWriter {
   writer.u32(xid);
   writer.u32(RPC_REPLY);
   writer.u32(MSG_ACCEPTED);
   writeAuth(writer, AUTH_NULL);
   writer.u32(RPC_SUCCESS);
+  return writer;
+}
+
+/**
+ * `MSG_ACCEPTED` with `SUCCESS`, then the encoded results.
+ *
+ * For a caller holding results it did not write into a reply writer itself —
+ * NFSv4.1's replay cache, whose bytes come back from `./v4/state.ts` and must
+ * not be written into. One allocation and one copy of `results`; building it
+ * through an `XdrWriter` cost two.
+ */
+export function encodeAcceptedReply(xid: number, results?: Uint8Array): Uint8Array {
+  const out = new Uint8Array(ACCEPTED_REPLY_HEADER_SIZE + (results?.byteLength ?? 0));
+  const view = new DataView(out.buffer);
+  view.setUint32(0, xid >>> 0, false);
+  view.setUint32(4, RPC_REPLY, false);
+  view.setUint32(8, MSG_ACCEPTED, false);
+  view.setUint32(12, AUTH_NONE, false);
+  // The `AUTH_NULL` verifier's body is empty, so its length word is the zero
+  // `out` already holds; `accept_stat` follows it.
+  view.setUint32(20, RPC_SUCCESS, false);
   if (results !== undefined) {
-    writer.raw(results);
+    out.set(results, ACCEPTED_REPLY_HEADER_SIZE);
   }
-  return writer.bytes();
+  return out;
 }
 
 /** `MSG_ACCEPTED` with an error status (`PROG_UNAVAIL`, `GARBAGE_ARGS`, …). */
@@ -372,6 +408,20 @@ export function encodeRpcMismatch(xid: number, low = RPC_VERSION, high = RPC_VER
  * across fragments exist and a receiver that assumed otherwise would corrupt
  * them silently.
  */
+/**
+ * Just the 4-byte header for a `length`-byte last fragment.
+ *
+ * For a sender that would rather put the mark and the message on the socket as
+ * two chunks than copy the message to put them on as one — which is what
+ * `server.ts` does, since a corked pair leaves as one `writev` and a
+ * {@link frameRecord} of a 1 MiB `READ` is a 1 MiB `memcpy`.
+ */
+export function recordMark(length: number): Uint8Array {
+  const mark = new Uint8Array(4);
+  new DataView(mark.buffer).setUint32(0, RM_LAST_FRAGMENT | length, false);
+  return mark;
+}
+
 export function frameRecord(message: Uint8Array): Uint8Array {
   const framed = new Uint8Array(4 + message.byteLength);
   new DataView(framed.buffer).setUint32(0, RM_LAST_FRAGMENT | message.byteLength, false);

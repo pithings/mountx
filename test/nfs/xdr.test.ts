@@ -21,6 +21,7 @@ import {
   RPC_VERSION,
 } from "../../src/nfs/v3/constants.ts";
 import {
+  ACCEPTED_REPLY_HEADER_SIZE,
   authSys,
   credentialsOf,
   decodeAuthSys,
@@ -35,6 +36,8 @@ import {
   frameFragments,
   frameRecord,
   RecordAssembler,
+  recordMark,
+  writeAcceptedReplyHeader,
 } from "../../src/nfs/rpc.ts";
 import {
   decodeXdr,
@@ -253,6 +256,68 @@ describe("the writer", () => {
     });
     expect(() => decodeXdr(bytes, (reader) => reader.u32())).toThrow(XdrError);
   });
+
+  it("reserves capacity ahead of a payload without writing anything", () => {
+    // What a `READ` does once the driver has answered: one allocation instead
+    // of the ten a megabyte costs doubling up from a few hundred bytes.
+    const writer = new XdrWriter(64);
+    writer.u32(7);
+    writer.ensure(1 << 20);
+    expect(writer.length).toBe(4);
+    const payload = new Uint8Array(1 << 20).fill(9);
+    writer.varOpaque(payload);
+    expect(writer.length).toBe(4 + 4 + payload.byteLength);
+    const reader = new XdrReader(writer.view());
+    expect(reader.u32()).toBe(7);
+    expect(reader.varOpaque()).toHaveLength(payload.byteLength);
+    reader.end();
+  });
+
+  it("reserves exactly what it was asked for, so a view pins nothing extra", () => {
+    // `view()` hands out the buffer, so slack capacity is retained for as long
+    // as the caller holds the view — a socket write queue, in this server. A
+    // doubling `ensure` would make a 1 MiB reply pin 2 MiB.
+    const writer = new XdrWriter(256);
+    writer.ensure(1 << 20);
+    expect(writer.view().buffer.byteLength).toBe(1 << 20);
+    writer.raw(new Uint8Array(1 << 20));
+    expect(writer.view().buffer.byteLength).toBe(1 << 20);
+    // Growth nobody predicted still doubles: that is what keeps appending
+    // amortized, and it lands within 2x of what was actually written.
+    writer.u32(1);
+    expect(writer.view().buffer.byteLength).toBe(2 << 20);
+  });
+
+  it("hands out a view that aliases the writer, and a copy that does not", () => {
+    const writer = new XdrWriter(64);
+    writer.u32(0xab_cd_ef_01);
+    const view = writer.view();
+    const copy = writer.bytes();
+    expect([...view]).toEqual([...copy]);
+    // The view really is the writer's buffer: a further write is visible in it,
+    // which is exactly why `view()` may only be called when nothing follows.
+    writer.u32(2);
+    expect(view.buffer).toBe(writer.view().buffer);
+    expect([...copy]).toEqual([0xab, 0xcd, 0xef, 0x01]);
+  });
+
+  it("truncates back to a mark and re-encodes over the discarded bytes", () => {
+    // NFSv4.1's `NFS4ERR_REP_TOO_BIG_TO_CACHE` path: encode a reply, find it
+    // too big, rewind to the RPC header and encode a different one.
+    const writer = new XdrWriter(64);
+    writer.u32(0x11_22_33_44);
+    const mark = writer.length;
+    writer.string("a reply that turned out to be too long for the slot");
+    writer.u64(0xff_ff_ff_ff_ff_ff_ff_ffn);
+    writer.truncate(mark);
+    // The short value must still be zero-padded over bytes the long one wrote:
+    // `fixedOpaque` covers its whole span rather than trusting the buffer.
+    writer.fixedOpaque(new Uint8Array([1, 2, 3]), 8);
+    expect(writer.length).toBe(mark + 8);
+    expect([...writer.view().subarray(mark)]).toEqual([1, 2, 3, 0, 0, 0, 0, 0]);
+    expect(() => writer.truncate(writer.length + 1)).toThrow(XdrError);
+    expect(() => writer.truncate(-1)).toThrow(XdrError);
+  });
 });
 
 describe("auth", () => {
@@ -311,6 +376,30 @@ describe("RPC messages", () => {
     expect(() => decodeCall(reply)).toThrow(XdrError);
   });
 
+  it("builds the same accepted reply whether the results arrive before or after", () => {
+    // The reply path has two entry points now: a session that writes the header
+    // into the writer its handler is about to append to
+    // (`writeAcceptedReplyHeader`), and one that already holds the results and
+    // has to wrap them (`encodeAcceptedReply`, which NFSv4.1's replay cache
+    // needs because those bytes must not be written into). They must agree byte
+    // for byte, or a reply's shape would depend on which path produced it.
+    for (const results of [
+      new Uint8Array(0),
+      encoder.encode("some results"),
+      new Uint8Array(5000).fill(0xa5),
+    ]) {
+      const writer = new XdrWriter(16);
+      writeAcceptedReplyHeader(writer, 0x0a_0b_0c_0d);
+      expect(writer.length).toBe(ACCEPTED_REPLY_HEADER_SIZE);
+      writer.raw(results);
+      expect([...writer.view()]).toEqual([...encodeAcceptedReply(0x0a_0b_0c_0d, results)]);
+    }
+    // And the header alone is what a results-less reply is.
+    const bare = new XdrWriter(16);
+    writeAcceptedReplyHeader(bare, 1);
+    expect([...bare.view()]).toEqual([...encodeAcceptedReply(1)]);
+  });
+
   it("round-trips every reply shape", () => {
     const success = decodeReply(
       encodeAcceptedReply(
@@ -350,6 +439,26 @@ describe("record marking", () => {
     const header = new DataView(framed.buffer).getUint32(0, false);
     expect((header & RM_LAST_FRAGMENT) >>> 0).toBe(RM_LAST_FRAGMENT);
     expect(header & ~RM_LAST_FRAGMENT).toBe(8);
+  });
+
+  it("marks a record the same whether the mark is copied in or written beside it", () => {
+    // `server.ts` puts the mark and the reply on the socket as two corked
+    // writes rather than copying a megabyte to join them. What leaves must be
+    // the bytes `frameRecord` would have produced, and the assembler must not
+    // be able to tell.
+    for (const message of [
+      new Uint8Array(0),
+      encoder.encode("split framing"),
+      new Uint8Array(70_000),
+    ]) {
+      const joined = new Uint8Array(4 + message.byteLength);
+      joined.set(recordMark(message.byteLength), 0);
+      joined.set(message, 4);
+      expect([...joined]).toEqual([...frameRecord(message)]);
+      const records = new RecordAssembler().push(joined);
+      expect(records).toHaveLength(1);
+      expect(records[0]!.byteLength).toBe(message.byteLength);
+    }
   });
 
   it("reassembles a record delivered whole", () => {

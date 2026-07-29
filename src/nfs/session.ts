@@ -211,6 +211,12 @@ export class NfsSession {
    * handles — is copied out of it by the decoders. The transport never has to
    * think about it: `./rpc.ts`'s `RecordAssembler` hands over a record copied
    * out of the socket's buffers rather than a view of them.
+   *
+   * The **reply** travels the other way: this forwards whichever versioned
+   * session answered, and both hand back a view of the one `XdrWriter` they
+   * built for that call. Write it to the wire before yielding — the writer is
+   * dropped at `return` so nothing will overwrite it, but nothing copies it for
+   * you either. See `XdrWriter.view()` for the rule.
    */
   async handleCall(
     message: Uint8Array,

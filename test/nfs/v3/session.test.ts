@@ -48,6 +48,8 @@ import {
   NFS_V3,
   NFSPROC3_LOOKUP,
   NFSPROC3_NULL,
+  NFSPROC3_READ,
+  NFSPROC3_READDIRPLUS,
   RPC_GARBAGE_ARGS,
   RPC_PROC_UNAVAIL,
   RPC_PROG_MISMATCH,
@@ -55,6 +57,7 @@ import {
 } from "../../../src/nfs/v3/constants.ts";
 import { NFS_V4 } from "../../../src/nfs/v4/constants.ts";
 import { decodeReply, encodeCall, frameFragments } from "../../../src/nfs/rpc.ts";
+import { encodeXdr } from "../../../src/nfs/xdr.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
 import type { FsDriver } from "../../../src/types.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
@@ -767,6 +770,57 @@ describe("individual procedures", () => {
     // Past the end is zero bytes and EOF, not an error.
     const past = check(await client.read(file, 100n, 8), "read");
     expect(past).toMatchObject({ count: 0, eof: true });
+  });
+
+  it("sizes a READ reply from what was read, not from what was asked for", async () => {
+    // `handleCall` returns a *view* of the buffer it built the reply in, and
+    // `server.ts` hands that straight to `socket.write` — so the buffer lives
+    // until the write flushes. Reserving from `rsize` rather than from the
+    // bytes the driver returned made a 200-byte reply pin megabytes, once per
+    // call in flight.
+    const { server, client, fs, root } = await serve();
+    await fs.writeFile("/short", "0123456789");
+    const file = check(await client.lookup(root, "short"), "lookup").object!;
+    const reply = (await server.session.handleCall(
+      encodeCall({
+        xid: 41,
+        program: NFS_PROGRAM,
+        version: NFS_V3,
+        procedure: NFSPROC3_READ,
+        args: encodeXdr((writer) => {
+          writer.varOpaque(file);
+          writer.u64(0n);
+          writer.u32(1024 * 1024);
+        }),
+      }),
+    ))!;
+    expect(reply.byteLength).toBeLessThan(512);
+    // The whole allocation, not just the part in use.
+    expect(reply.buffer.byteLength).toBeLessThan(1024);
+  });
+
+  it("sizes a READDIRPLUS reply from the page it chose, not from maxcount", async () => {
+    const { server, client, fs, root } = await serve();
+    await fs.mkdir("/d");
+    await fs.writeFile("/d/one", "x");
+    const dir = check(await client.lookup(root, "d"), "lookup").object!;
+    const reply = (await server.session.handleCall(
+      encodeCall({
+        xid: 42,
+        program: NFS_PROGRAM,
+        version: NFS_V3,
+        procedure: NFSPROC3_READDIRPLUS,
+        args: encodeXdr((writer) => {
+          writer.varOpaque(dir);
+          writer.u64(0n);
+          writer.raw(new Uint8Array(8));
+          writer.u32(32 * 1024);
+          writer.u32(1024 * 1024);
+        }),
+      }),
+    ))!;
+    expect(reply.byteLength).toBeLessThan(2048);
+    expect(reply.buffer.byteLength).toBeLessThan(4096);
   });
 
   it("computes ACCESS from the mode bits", async () => {

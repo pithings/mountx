@@ -82,6 +82,7 @@ import {
   sameVerifier,
 } from "../handles.ts";
 import {
+  ACCEPTED_REPLY_HEADER_SIZE,
   AUTH_NONE,
   AUTH_SYS,
   AUTH_TOOWEAK,
@@ -97,6 +98,7 @@ import {
   RPC_PROG_UNAVAIL,
   RPC_SYSTEM_ERR,
   RPC_VERSION,
+  writeAcceptedReplyHeader,
   type RpcCall,
   type RpcCredentials,
 } from "../rpc.ts";
@@ -616,8 +618,7 @@ function statusResop(op: number, status: number): Resop4 {
  * for the same reason {@link failureRes} is: a failed `XXX4res` is one status
  * word, whatever the operation.
  */
-function encodeCompoundRes(res: Compound4res): Uint8Array {
-  const writer = new XdrWriter(512);
+function writeCompoundRes(writer: XdrWriter, res: Compound4res): void {
   writer.u32(res.status);
   writer.string(res.tag);
   writer.u32(res.resarray.length);
@@ -630,7 +631,41 @@ function encodeCompoundRes(res: Compound4res): Uint8Array {
       codec.writeRes(writer, resop.res);
     }
   }
-  return writer.bytes();
+}
+
+/** A resop with no bulk on it, generously: the largest is a full `GETATTR`. */
+const RESOP_ALLOWANCE = 256;
+
+/**
+ * A starting size for the buffer one COMPOUND reply is built in.
+ *
+ * `new XdrWriter(512)` for every compound meant a 1 MiB `READ` doubling its way
+ * up from 512 bytes — eleven grow-and-copies, about 2 MiB of `memcpy` to
+ * deliver 1 MiB. The encoder cannot ask the *request* how big its answer will
+ * be, because it never sees the request; but the results are in hand by then,
+ * so it can ask them.
+ *
+ * **This covers `READ` and nothing else, deliberately.** `READ4resok.data` is
+ * the one result whose bulk is a byte string already sized — and sized by what
+ * the driver *returned*, not by what the client asked for, which is the
+ * distinction that matters (see `XdrWriter.ensure`). The other bulky results
+ * are not: `READDIR4resok` carries an entry list, `READLINK4resok` a string,
+ * `GETATTR4resok` an attribute set, and the encoded length of each is not known
+ * without encoding it. Guessing generously would be worse than not guessing,
+ * because {@link Nfs4Session.#reply} hands the socket a **view** of this buffer
+ * — so capacity reserved and not used stays pinned in the write queue, where
+ * unpredicted geometric growth merely costs a copy and lands within 2× of the
+ * bytes actually written. A 32 KiB `READDIR` doubling six times from here is
+ * the accepted price of not over-reserving on every compound that is not one.
+ */
+function compoundCapacity(tag: string, resarray: readonly Resop4[]): number {
+  let capacity =
+    ACCEPTED_REPLY_HEADER_SIZE + 12 + xdrAlign(stringByteLength(tag)) + RESOP_ALLOWANCE;
+  for (const resop of resarray) {
+    const data = resop.op === OP_READ ? (resop.res as Read4res).data : undefined;
+    capacity += RESOP_ALLOWANCE + (data === undefined ? 0 : xdrAlign(data.byteLength));
+  }
+  return capacity;
 }
 
 /** One `nfs_resop4` as bytes, so a reply can be measured before it is built. */
@@ -914,6 +949,11 @@ export class Nfs4Session {
    *
    * Resolves to the encoded reply, or `null` for a record too damaged to carry
    * an xid — there is nothing to address a reply to. **Never rejects.**
+   *
+   * What comes back is a **view of the one buffer this call built its reply
+   * in**, not a copy: the caller owns it outright, and nothing here writes
+   * to it again. `../xdr.ts`'s `XdrWriter.view()` states the rule the
+   * sessions keep to earn that.
    *
    * A direct caller must not overwrite `message` while the promise is
    * outstanding; everything this session *keeps* — names, file handles,
@@ -1288,8 +1328,19 @@ export class Nfs4Session {
     return this.#reply(call, tag, this.#failed(status), resarray);
   }
 
+  /**
+   * One COMPOUND reply, built in one buffer.
+   *
+   * The accepted-reply header goes in first and the `COMPOUND4res` straight
+   * after it, so what comes back is a view of a single writer rather than two
+   * buffers concatenated. Nothing writes to it once this returns — see
+   * `XdrWriter.view()` for the rule that makes the view safe to hand out.
+   */
   #reply(call: RpcCall, tag: string, status: number, resarray: Resop4[]): Uint8Array {
-    return encodeAcceptedReply(call.xid, encodeCompoundRes({ status, tag, resarray }));
+    const reply = new XdrWriter(compoundCapacity(tag, resarray));
+    writeAcceptedReplyHeader(reply, call.xid);
+    writeCompoundRes(reply, { status, tag, resarray });
+    return reply.view();
   }
 
   /**
@@ -1366,19 +1417,34 @@ export class Nfs4Session {
   ): Uint8Array {
     const cache = outcome.cachethis && cacheable;
     let results = resarray;
-    let body = encodeCompoundRes({ status, tag, resarray: results });
-    if (cache && body.byteLength > outcome.ticket.maxCachedBytes) {
+    const reply = new XdrWriter(compoundCapacity(tag, resarray));
+    writeAcceptedReplyHeader(reply, call.xid);
+    writeCompoundRes(reply, { status, tag, resarray: results });
+    if (cache && reply.length - ACCEPTED_REPLY_HEADER_SIZE > outcome.ticket.maxCachedBytes) {
       const trimmed = trimForCache(tag, results, outcome.ticket.maxCachedBytes);
       if (trimmed !== undefined) {
         results = trimmed;
         status = this.#failed(NFS4ERR_REP_TOO_BIG_TO_CACHE);
-        body = encodeCompoundRes({ status, tag, resarray: results });
+        // The shorter reply replaces the over-sized one in the same buffer:
+        // rewinding to the RPC header and encoding again is what the second
+        // `encodeCompoundRes` was doing, minus a second allocation.
+        reply.truncate(ACCEPTED_REPLY_HEADER_SIZE);
+        writeCompoundRes(reply, { status, tag, resarray: results });
       }
     }
+    const framed = reply.view();
     // The ticket is handed back whether or not there are bytes to store —
-    // `./state.ts` needs to know the request finished either way.
-    this.state.cacheReply(outcome.ticket, cache ? body : undefined);
-    return encodeAcceptedReply(call.xid, body);
+    // `./state.ts` needs to know the request finished either way. What it is
+    // handed is a *view* of this reply, which is safe because `cacheReply`
+    // copies on insert. That asymmetry is one-way: it hands its copy back
+    // **uncopied** on replay, which is why the replay path above wraps those
+    // bytes with `encodeAcceptedReply` — a fresh buffer — instead of appending
+    // to a writer that already holds them.
+    this.state.cacheReply(
+      outcome.ticket,
+      cache ? framed.subarray(ACCEPTED_REPLY_HEADER_SIZE) : undefined,
+    );
+    return framed;
   }
 
   /**
