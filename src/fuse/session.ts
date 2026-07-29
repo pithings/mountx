@@ -166,6 +166,51 @@ export const DEFAULT_ENTRY_TIMEOUT = 10;
 /** `RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT` — none supported. */
 const RENAME_FLAGS_UNSUPPORTED = 0b111;
 
+/**
+ * How a uid or gid crosses between the driver's id space and the mount's.
+ *
+ * **The two are not always the same space.** Every `uid`/`gid` on the FUSE wire
+ * — `fuse_attr.uid` outbound, `fuse_in_header.uid` and `fuse_setattr_in.uid`
+ * inbound — is named in the id space of the *mount's* user namespace, which the
+ * kernel keeps as `fuse_conn.user_ns` (`fs/fuse/inode.c`, from `sb->s_user_ns`)
+ * and resolves every attribute through: `inode->i_uid = make_kuid(fc->user_ns,
+ * attr->uid)`. A driver, meanwhile, deals in whatever `process.getuid()` means
+ * here. Mount from the same user namespace the server runs in — which is every
+ * mount `mountx/fuse` makes on its own — and the two spaces are identical, so
+ * the default map is the identity and this option is one nobody needs.
+ *
+ * `mountx/exec` is the case where they are not. Its mount is made inside an
+ * `unshare -U -r` user namespace, whose entire id space is `{0}`, mapped to the
+ * invoking user on the host. An id the namespace does not map becomes
+ * `INVALID_UID`, and the VFS refuses an inode carrying one — **before** the
+ * request ever reaches this session:
+ *
+ * - `may_delete()` answers `-EOVERFLOW` ("Inode writeback is not safe when the
+ *   uid or gid are invalid"), which takes out `unlink`, `rmdir` and `rename` on
+ *   both the source and an existing destination;
+ * - `may_linkat()` answers `-EOVERFLOW` too, taking out `link`;
+ * - `inode_permission()` answers `-EACCES` for any `MAY_WRITE` via
+ *   `HAS_UNMAPPED_ID()`, taking out opening a file for writing.
+ *
+ * Reads, `stat` and `readdir` are unaffected, which is what makes the failure
+ * so confusing to meet: the mount looks entirely healthy until something tries
+ * to change it. See `src/exec/userns.ts`'s `usernsIdMap()` for the map that
+ * fixes it, and the reasoning about which ids it can possibly answer with.
+ *
+ * Both hooks are synchronous and must be total: they sit on the encode path of
+ * every `LOOKUP` reply, so a throw here is an error reply for a request that
+ * had nothing wrong with it.
+ */
+export interface FuseIdMap {
+  /** A driver-side uid (or gid, when `group`) as the mount's namespace names it. */
+  toMount: (id: number, group: boolean) => number;
+  /** A uid (or gid, when `group`) off the wire, in the driver's own id space. */
+  fromMount: (id: number, group: boolean) => number;
+}
+
+/** The map for a mount in the server's own user namespace: no translation at all. */
+const IDENTITY_IDS: FuseIdMap = { toMount: (id) => id, fromMount: (id) => id };
+
 export interface FuseSessionOptions {
   /** Passed to `negotiateInit` when the kernel's `FUSE_INIT` arrives. */
   init?: InitPreferences;
@@ -187,6 +232,12 @@ export interface FuseSessionOptions {
   negativeTimeout?: number;
   /** Identify files by the driver's `(dev, ino)`, so hardlinks share a nodeid. Default `true`. */
   useDriverIno?: boolean;
+  /**
+   * Translate uids and gids between the driver's id space and the mount's.
+   * Default: the identity, which is right for every mount made from the user
+   * namespace the server runs in. See {@link FuseIdMap} for the one that is not.
+   */
+  idmap?: FuseIdMap;
   /** Run the reply-exactly-once assertions. Default on outside production. */
   debug?: boolean;
   /** Called for every request that ends in an error reply. */
@@ -405,6 +456,7 @@ export class FuseSession {
   readonly #filesByInode = new Map<Inode, Set<OpenFile>>();
   readonly #inflight = new Set<bigint>();
   readonly #lock = new PathLock();
+  readonly #ids: FuseIdMap;
   readonly #debug: boolean;
   #negotiated: NegotiatedSession | undefined;
   #destroyed = false;
@@ -414,6 +466,7 @@ export class FuseSession {
     this.driver = createLoopback(driver);
     this.options = options;
     this.#inodes = new InodeTable({ useDriverIno: options.useDriverIno });
+    this.#ids = options.idmap ?? IDENTITY_IDS;
     this.#debug = options.debug ?? process.env.NODE_ENV !== "production";
   }
 
@@ -785,8 +838,11 @@ export class FuseSession {
       // the mount disagree with every real filesystem for the whole
       // `mkstemp`+`unlink` pattern (found by the differential suite).
       nlink: toUnsigned(stats.nlink),
-      uid: toUnsigned(stats.uid),
-      gid: toUnsigned(stats.gid),
+      // The mount's id space, not the driver's — the identity unless the mount
+      // lives in another user namespace. See {@link FuseIdMap}: an id this
+      // mount cannot map is an inode the *kernel* refuses to unlink or write.
+      uid: toUnsigned(this.#ids.toMount(stats.uid, false)),
+      gid: toUnsigned(this.#ids.toMount(stats.gid, true)),
       rdev: toUnsigned(stats.rdev),
       blksize: toUnsigned(stats.blksize),
       flags: 0,
@@ -873,13 +929,20 @@ export class FuseSession {
    * set-gid directory rule that gives a new entry its parent's group.
    */
   async #claim(path: string, header: FuseInHeader): Promise<void> {
+    // Both sides of the comparison in the *driver's* id space: `header.uid` is
+    // the mount's, and on a mount in another user namespace the caller who is
+    // in fact this process arrives as some other number (0, under `unshare -r`).
+    // Comparing the raw wire value there would hand every created file to an id
+    // the driver has never heard of.
+    const caller = this.#ids.fromMount(header.uid, false);
+    const callerGroup = this.#ids.fromMount(header.gid, true);
     const uid = process.getuid?.() ?? -1;
     const gid = process.getgid?.() ?? -1;
-    if (header.uid === uid && header.gid === gid) {
+    if (caller === uid && callerGroup === gid) {
       return;
     }
     try {
-      await this.driver.lchown(path, header.uid, header.gid);
+      await this.driver.lchown(path, caller, callerGroup);
     } catch (error) {
       const code = (error as { code?: string }).code;
       if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
@@ -977,10 +1040,12 @@ export class FuseSession {
     }
     if ((valid & (FATTR_UID | FATTR_GID)) !== 0) {
       // `-1` is POSIX for "leave this one alone", and every driver's `chown`
-      // inherits that from `node:fs`.
+      // inherits that from `node:fs` — so it stays `-1` rather than being run
+      // through the id map, which has no reason to have an opinion about a
+      // sentinel.
       const [uid, gid] = [
-        (valid & FATTR_UID) === 0 ? -1 : body.uid,
-        (valid & FATTR_GID) === 0 ? -1 : body.gid,
+        (valid & FATTR_UID) === 0 ? -1 : this.#ids.fromMount(body.uid, false),
+        (valid & FATTR_GID) === 0 ? -1 : this.#ids.fromMount(body.gid, true),
       ];
       await this.#nofollow(
         () => this.driver.lchown(path(), uid, gid),
