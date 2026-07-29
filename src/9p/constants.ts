@@ -310,3 +310,53 @@ export const P9_READDIRHDRSZ = 24;
  * `rmdir`.
  */
 export const P9_DOTL_AT_REMOVEDIR = 0x200;
+
+// ---------------------------------------------------------------------------
+// Values the wire carries that `9p.h` does not hold
+//
+// Four more transcriptions, each from the file that owns it rather than from
+// the header the rest of this module comes from. They are here and not in the
+// session because they are facts about the protocol — what a version string
+// looks like, what a client refuses — and not policy the session invents.
+// ---------------------------------------------------------------------------
+
+/**
+ * The dialect string, **exactly as it appears on the wire**.
+ *
+ * From `p9_client_version()` in `net/9p/client.c` (v6.12), which sends
+ * `"9P2000.L"` and matches the reply with `strncmp(version, "9P2000.L", 8)`.
+ *
+ * Note the capital `P`: the *mount option* is spelled `version=9p2000.L`
+ * (`get_protocol_version()` in `fs/9p/v9fs.c` accepts `9p2000.L` and
+ * `9p2000.l`), and the plan and docs use that spelling, but nothing with a
+ * lowercase `p` is ever put on a socket. The comparison here is exact and
+ * case-sensitive because there is exactly one string the kernel sends.
+ */
+export const P9_VERSION_DOTL = "9P2000.L";
+
+/**
+ * The reply that means "I do not speak that" — from the 9P2000 specification
+ * (`version(5)`), and the string `p9_client_version()` falls off the end of its
+ * comparison chain into (`-EREMOTEIO`). It is a normal `Rversion`, never an
+ * error reply.
+ */
+export const P9_VERSION_UNKNOWN = "unknown";
+
+/**
+ * The smallest `msize` the Linux client will work with.
+ *
+ * `net/9p/client.c` (v6.12) enforces `4096` in three places — `parse_opts()`,
+ * `p9_client_create()` and, the one that binds a *server*,
+ * `p9_client_version()`: "server returned a msize < 4096". So a negotiation
+ * that lands below this is one the client will refuse whatever we say, which is
+ * why the session refuses it first.
+ */
+export const P9_MIN_MSIZE = 4096;
+
+/**
+ * `f_type` for a 9P mount — `V9FS_MAGIC` in `include/uapi/linux/magic.h`.
+ *
+ * `v9fs_statfs()` copies `Rstatfs.type` into `statfs(2)`'s `f_type` verbatim, so
+ * this is what userspace sees for a driver with no magic number of its own.
+ */
+export const V9FS_MAGIC = 0x01_02_19_97;

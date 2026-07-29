@@ -10,7 +10,9 @@ is done when its checkbox is checked **and** its commit exists.
   `test/9p/`. Identifiers use a `P9` prefix (`P9Session`, `createP9Server`,
   `mount9p`, `p9ClientProbe`) — mirrors the kernel's own `p9_*` naming.
   The `mountx/auto` options escape hatch is the quoted key `"9p"`.
-- **Version:** `9p2000.L` only. Any other `Tversion` string answers
+- **Version:** 9P2000.L only, and the wire string is **`"9P2000.L"`** —
+  capital P, what `p9_client_version()` sends; `9p2000.L` is only the mount
+  option spelling (`fs/9p/v9fs.c`). Any other `Tversion` string answers
   `Rversion` with `"unknown"` per spec. Legacy 9P2000 opcodes
   (`Topen`/`Tcreate`/`Tstat`/`Twstat`) answer `Rlerror ENOTSUP`.
 - **Locks:** `Tlock` always grants (`P9_LOCK_SUCCESS`), `Tgetlock` always
@@ -117,7 +119,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       out in `Rgetattr`, not `qid.path` — the FUSE nodeid/`st_ino` split).
       `..` clamps at the root (`src/path.ts` semantics). Tests
       `test/9p/fids.test.ts`. Commit.
-- [ ] **4. Session core + JS client** — `src/9p/session.ts`: `P9Session
+- [x] **4. Session core + JS client** — `src/9p/session.ts`: `P9Session
 (driver, options)` with `handleCall(bytes): Promise<Uint8Array | null>`
       shape mirroring `NfsSession`; this step implements version negotiation
       (msize = min(client, cap 1 MiB); reject non-`9p2000.L`), attach (aname
@@ -142,15 +144,15 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       rename**, subtree fid-path remap on rename like `InodeTable` does),
       xattrwalk/xattrcreate → ENOTSUP (Linux clients probe `security.*` on
       write — the refusal path is hot, keep it cheap), lock/getlock per the
-      grant-all decision, legacy opcodes → ENOTSUP. Carry-forwards from the
-      step-3 verification: fill `Rgetattr.st_ino` from `stats.ino` with a
-      fallback to the fid's `qid.path` when `ino === 0` (the exact FUSE
-      pattern, `src/fuse/session.ts` attr fill) and document what it reports
-      under `useDriverIno: false`; call `FidTable.release(path)` on
-      Tremove/Tunlinkat and on create-over so a recreated path never inherits
-      the dead file's identity; refuse Twalk from an OPEN fid (`EINVAL` — 9P
-      forbids it, the table leaves enforcement to the session). Extend session
-      tests. Commit.
+      grant-all decision, legacy opcodes → ENOTSUP. Notes settled by step 4's
+      verification: `Rgetattr` has NO `st_ino` field — v9fs derives `st_ino`
+      from `qid.path` (`QID2INO`), so the driver's `ino` never reaches the
+      wire and `useDriverIno` only picks the identity key (documented in
+      session.ts; the step-3 carry-forward about an st_ino fill was based on
+      a wrong premise). Walk-from-open-fid refusal is already implemented.
+      Remaining carry-forward: call `FidTable.release(path)` on
+      Tremove/Tunlinkat and on create-over so a recreated path never
+      inherits the dead file's identity. Extend session tests. Commit.
 - [ ] **6. Conformance column + session fuzz** — `test/9p/conformance.test.ts`
       runs `test/conformance.ts` through the JS client against `P9Session` over
       memory + node-fs (rooted oracle), like the NFS column. A session fuzz
@@ -272,3 +274,19 @@ deferred)
   st_ino fill, `release()` on remove/create-over, refuse walk-from-open-fid.
   Lesson for later steps: verify with plain `node`, not only the test
   runner.
+- 2026-07-29 step 4: `session.ts` (version/attach/walk/clunk/getattr/statfs/
+  readdir/flush), `test/9p/client.ts` (Tier-1 client), 60 session tests.
+  Corrections to the plan discovered against kernel sources: the wire
+  version string is `"9P2000.L"` (capital P); `Rgetattr` has no `st_ino` —
+  v9fs derives it from `qid.path`, so the step-3 carry-forward died. The
+  server must synthesize `.`/`..` (`v9fs_dir_readdir_dotl` never calls
+  `dir_emit_dots`). Verifier round 1 FAILED: readdir byte budget read after
+  an await went NaN when a reset landed mid-request (NaN disables the
+  packer's budget check → over-msize reply → `p9_conn_cancel()` kills the
+  connection), and in-flight requests crossed destroy()/re-version
+  unnoticed. Fixed: budget captured in the synchronous prologue, `#msize`
+  never undefined, generation counter discards overtaken replies (ENODEV
+  after destroy, EIO after re-version). Round 2 PASS, all reproductions
+  re-run. Nit carried: destroyed-session getters can report an msize if
+  destroy() interleaves inside a parked Tversion reset (cosmetic, gate
+  still refuses requests).
