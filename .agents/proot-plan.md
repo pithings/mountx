@@ -226,17 +226,30 @@ What the spike also measured:
   file. Both spikes now use a minor under 256. (Spike B had the same latent
   bug and was fixed alongside.)
 
-Costs, stated rather than hidden:
+Costs as first spiked, and what became of each:
 
-- **A file open copies the whole file into a `memfd`.** That is what buys native
-  `read`/`lseek`/`mmap` afterwards with no further interception, and it is
-  wrong for large files and for anything that writes. Streaming instead means
-  trapping `read`/`write`/`lseek` per descriptor and answering them the way
-  `getdents64` already is.
-- **Read-only as spiked.** No write-back, no `unlink`/`rename`/`mkdir`.
-- **x86-64 only as spiked**, since the filter compares against one syscall
-  table. arm64 is a second table, not a redesign.
-- One supervisor thread, one request in flight, tag always zero.
+- ~~A file open copies the whole file into a `memfd`.~~ **Closed.** I/O is
+  streamed per open-file-description now — `read`/`pread64`/`readv` and the
+  `write` family and `lseek` are all trapped, with an offset that `dup` shares
+  — and no copy is made. The one thing the `memfd` bought and streaming cannot
+  is `mmap` of a file on the tree, which now answers `ENODEV` rather than
+  silently mapping a stale copy.
+- ~~Read-only as spiked.~~ **Closed, and this was the important one.** The
+  read-only version did not fail cleanly: `memfd`s are always writable and
+  `write` was untrapped, so a program's writes landed in the in-memory copy and
+  vanished. Measured at the time: `dd conv=notrunc` reported success and left
+  the file unchanged; `rm -f` reported success and left the file in place. That
+  is the same silent-wrong-answer failure class this document rejects spike B
+  for, and it is why `test/exec/compare.sh` grew a write-back row that asserts
+  against the driver rather than against an exit status.
+- **x86-64 only**, since the filter compares against one syscall table. arm64 is
+  a second table, not a redesign.
+- **Still one notification at a time**, tag always zero, one 9P request in
+  flight. Multi-threaded and multi-process tracees are correct — the tables are
+  keyed on the thread group behind `seccomp_notif.pid`, which is a _thread_ id,
+  and they grow — but they serialize.
+- **`execve` of a binary living on the tree is not supported** and was never in
+  scope; it fails at 127 rather than hanging.
 
 ## Portability: what each one actually needs on a bare system
 
@@ -316,11 +329,16 @@ that motivated the question in the first place.
    namespaces, and say plainly that it is a namespace-private kernel mount
    rather than no mount.
 
-3. **Pursue spike C as the real no-mount transport**, with the next milestone
-   being streaming rather than slurping — trap `read`/`write`/`lseek` per
-   descriptor and drop the `memfd` copy — plus a supervisor that can trap
-   `close` (which means not sharing a filter with the tracee, i.e. the
-   `SCM_RIGHTS` shape after all, for which `native/` already has `recvFd`).
+3. **Pursue spike C as the real no-mount transport.** ~~Next milestone:
+   streaming rather than slurping, plus a supervisor that can trap `close`.~~
+   **Both done.** I/O streams per descriptor, and `close` is trapped, which
+   required exactly the predicted change — the supervisor no longer shares its
+   filter with the tracee; the child installs it and passes the listener back
+   over `SCM_RIGHTS`, reusing `native/src/main.zig`'s cmsg transcription. It
+   carries the full conformance column (`test/exec/seccomp-conformance.test.ts`,
+   65 of 66 cases, the one skip being the root-only `lchown` case every column
+   skips). What is left is concurrent dispatch, `mmap`, `execve` off the tree,
+   and arm64.
 
 4. **Keep `p9.zig` as the shared asset** whichever way this goes. It is the part
    that made both spikes small, and it is the reason neither one contains a
@@ -336,11 +354,11 @@ that motivated the question in the first place.
 sh test/exec/compare.sh              # builds all three, runs the matrix, no root
 node src/exec/demo-userns.ts  <cmd>  # userns + FUSE
 MOUNTX_SHIM=…  node src/exec/demo-preload.ts <cmd>
-MOUNTX_TRACE=… node src/exec/spike-c.ts <cmd>
+MOUNTX_TRACE=… node src/exec/demo-seccomp.ts <cmd>
 MOUNTX_TRACE_DEBUG=1                 # per-syscall tracing for the supervisor
 ```
 
 The runners were `spike-a.ts`/`spike-b.ts`/`spike-c.ts` when the measurements
-below were taken; the first two are now named after their mechanisms.
+below were taken; all three are now named after their mechanisms.
 
 The command sees the driver at `$MOUNTX_ROOT`, which all three set.

@@ -52,15 +52,17 @@ probe() { # <spike-runner> <probe>
   fi
 }
 
-for spike in a b c; do
+# Each column is one *named* mechanism, run through its own demo runner, so the
+# comparison never depends on what the picker in `mountx/exec` would have chosen.
+for spike in userns preload seccomp; do
   case $spike in
-    a) name="A  userns + FUSE" ;;
-    b) name="B  LD_PRELOAD" ;;
-    c) name="C  seccomp notify" ;;
+    userns)  name="A  userns + FUSE" ;;
+    preload) name="B  LD_PRELOAD" ;;
+    seccomp) name="C  seccomp notify" ;;
   esac
   say "spike $name"
   for p in probe-glibc probe-musl probe-raw; do
-    row "$p" "$(probe "src/exec/spike-$spike.ts" "$p")"
+    row "$p" "$(probe "src/exec/demo-$spike.ts" "$p")"
   done
 done
 
@@ -75,10 +77,10 @@ WORK='
   find "$MOUNTX_ROOT" -type f | wc -l
   du -s "$MOUNTX_ROOT" | cut -f1
 '
-for spike in a b c; do
-  printf '  spike %s: ' "$spike"
-  timeout 90 node "src/exec/spike-$spike.ts" sh -c "$WORK" 2>&1 |
-    grep -v '^\[spike' | tr '\n' ' '
+for spike in userns preload seccomp; do
+  printf '  %-8s: ' "$spike"
+  timeout 90 node "src/exec/demo-$spike.ts" sh -c "$WORK" 2>&1 |
+    grep -vE '^\[(userns|preload|seccomp)' | tr '\n' ' '
   printf '\n'
 done
 
@@ -98,10 +100,10 @@ WRITES='
   rm -f "$MOUNTX_ROOT/w.txt"
   test -e "$MOUNTX_ROOT/w.txt" && echo "STILL THERE" || echo removed
 '
-for spike in a b c; do
-  printf '  spike %s: ' "$spike"
-  timeout 90 node "src/exec/spike-$spike.ts" sh -c "$WRITES" 2>&1 |
-    grep -v '^\[spike' | tr '\n' ' '
+for spike in userns preload seccomp; do
+  printf '  %-8s: ' "$spike"
+  timeout 90 node "src/exec/demo-$spike.ts" sh -c "$WRITES" 2>&1 |
+    grep -vE '^\[(userns|preload|seccomp)' | tr '\n' ' '
   printf '\n'
 done
 
