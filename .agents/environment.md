@@ -240,10 +240,13 @@ session scratchpad, and this section is the record.
   itself, so a Tier-2 v4.1 file would have to carry a VM, which is a bigger
   decision than this note.
 
-- **`node src/…` runs the 9P server directly, but not the NFS one.** Node 24's
-  type stripping refuses `src/nfs/v4/state.ts` (`ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`
-  — a TS parameter property). `pnpm build` and importing `dist/nfs/index.mjs` is
-  the way to drive NFS from a scratch script.
+- **`node src/…` drives any transport directly, including NFS.** It did not when
+  this work was done — Node 24's type stripping refused `src/nfs/v4/state.ts`
+  with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` over a TS parameter property, so the
+  harnesses here imported `dist/nfs/index.mjs` after a `pnpm build`. `fix: keep
+every entry point loadable by node's type stripping` has since removed that
+  constraint; re-verified after rebasing onto it. A scratch script can import
+  `src/` for either transport now.
 
 ### Firecracker (verified 2026-07-29, `v1.16.1`)
 
