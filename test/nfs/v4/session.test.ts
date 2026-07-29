@@ -1491,6 +1491,206 @@ describe("READDIR", () => {
     expect(new Set(names).size).toBe(12);
   });
 
+  /**
+   * What a page costs the driver.
+   *
+   * v4 folds v3's READDIR and READDIRPLUS into one operation, so every entry
+   * costs an `lstat` whatever the client asked for — and they used to be
+   * awaited one after another, with a `driver.statfs` per entry on top whenever
+   * the request named any of the six `statfs` attributes. With the memory
+   * driver that second one is a whole-tree walk per name.
+   */
+  it("resolves a page concurrently and asks the filesystem about itself once", async () => {
+    const base = createMemoryDriver();
+    for (let index = 0; index < 40; index++) {
+      await base.mkdir(`/entry-${String(index).padStart(3, "0")}`);
+    }
+    let lstats = 0;
+    let statfs = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const counted: FsDriver = {
+      ...base,
+      async lstat(path) {
+        lstats++;
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        try {
+          return await base.lstat(path);
+        } finally {
+          inFlight--;
+        }
+      },
+      async statfs(path) {
+        statfs++;
+        return base.statfs(path);
+      },
+    };
+    const session = new Nfs4Session(counted);
+    const client = await Client.open(session);
+    const reply = await client.run([
+      { op: OP_PUTROOTFH },
+      readdir(0n, new Uint8Array(8), 1 << 20, [FATTR4_TYPE, FATTR4_FILEID, FATTR4_SPACE_TOTAL]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    const res = reply.compound.resarray[2]!.res as Readdir4res;
+    expect(res.reply.entries).toHaveLength(40);
+    expect(res.reply.eof).toBe(true);
+    // On base this peaks at exactly 1 — one entry's `lstat` awaited before the
+    // next one starts.
+    expect(peak).toBeGreaterThan(1);
+    // And one `statfs` for the whole page. On base, one per entry.
+    expect(statfs).toBe(1);
+    expect(lstats).toBeGreaterThanOrEqual(40);
+  });
+
+  /**
+   * The snapshot invalidation rule, stated on `DirectorySnapshots` in
+   * `src/nfs/handles.ts` and obeyed identically by both versions.
+   *
+   * It used to be two contradictory halves: RENAME threw away *every* cached
+   * listing in the server, and CREATE threw away none — so a resuming client
+   * was served names from before a create it had itself asked for, under a
+   * verifier that still matched and gave it no way to tell.
+   */
+  it("drops the cached listing of a directory it changed, and of no other", async () => {
+    const driver = createMemoryDriver();
+    await driver.mkdir("/dir");
+    for (let index = 0; index < 12; index++) {
+      await driver.mkdir(`/dir/e${String(index).padStart(2, "0")}`);
+    }
+    await driver.mkdir("/other");
+    await driver.mkdir("/other/a");
+    let readdirs = 0;
+    const counted: FsDriver = {
+      ...driver,
+      async readdir(path, options) {
+        readdirs++;
+        return driver.readdir(path, options as never) as never;
+      },
+    };
+    const session = new Nfs4Session(counted);
+    const client = await Client.open(session);
+    const handleOf = async (name: string): Promise<Uint8Array> => {
+      const reply = await client.run([
+        { op: OP_PUTROOTFH },
+        { op: OP_LOOKUP, args: { objname: name } },
+        { op: OP_GETFH },
+      ]);
+      expect(reply.compound.status).toBe(NFS4_OK);
+      return (reply.compound.resarray[3]!.res as Getfh4res).object!;
+    };
+    const dir = await handleOf("dir");
+    const other = await handleOf("other");
+    const putDir = { op: OP_PUTFH, args: { object: dir } };
+
+    const first = await client.run([putDir, readdir(0n, new Uint8Array(8), 400, [])]);
+    expect(first.compound.status).toBe(NFS4_OK);
+    const page = first.compound.resarray[2]!.res as Readdir4res;
+    expect(page.reply.eof).toBe(false);
+    const cookie = page.reply.entries.at(-1)!.cookie;
+
+    // A rename somewhere else entirely. `/dir`'s paging is untouched by it.
+    const before = readdirs;
+    const renamed = await client.run([
+      { op: OP_PUTFH, args: { object: other } },
+      { op: OP_SAVEFH },
+      { op: OP_PUTFH, args: { object: other } },
+      { op: OP_RENAME, args: { oldname: "a", newname: "b" } },
+    ]);
+    expect(renamed.compound.status).toBe(NFS4_OK);
+    const resumed = await client.run([putDir, readdir(cookie, page.cookieverf, 4096, [])]);
+    expect(resumed.compound.status).toBe(NFS4_OK);
+    expect((resumed.compound.resarray[2]!.res as Readdir4res).reply.entries.length).toBeGreaterThan(
+      0,
+    );
+    // Straight out of the cache: RENAME used to `clear()` every snapshot in the
+    // server, so an unrelated `mv` made this directory re-list itself from the
+    // driver to prove the client's cookie still meant something.
+    expect(readdirs - before).toBe(0);
+
+    // A CREATE *in* the directory being paged is the other half of the rule:
+    // the snapshot goes, and the client is told its cookie means nothing rather
+    // than handed a listing from before the create.
+    const created = await client.run([
+      putDir,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "zzz",
+          createattrs: { attrmask: [], values: {}, unsupported: [] },
+        },
+      },
+    ]);
+    expect(created.compound.status).toBe(NFS4_OK);
+    const stale = await client.run([putDir, readdir(cookie, page.cookieverf, 4096, [])]);
+    expect(stale.compound.status).toBe(NFS4ERR_NOT_SAME);
+  });
+
+  /**
+   * The other half of "resolve the page as a batch": how big a batch to ask
+   * for.
+   *
+   * A fixed window is only right when the page has room for at least that many
+   * entries. A client with a small `maxcount` — this test, and any test client
+   * — fits three or four per page, so a blind 64 fetches sixty of them to throw
+   * away, mints a handle-table entry for each, and re-fetches them on the next
+   * page. That is up to 64x the driver work of the one-at-a-time loop this
+   * batching replaced, in the one case it is supposed to help.
+   *
+   * So the first batch of every page is bounded from the *names alone*: an
+   * entry costs at least its `dircount` size plus the smallest `fattr4` that
+   * can encode, and neither needs a driver call.
+   */
+  it("does not over-fetch the first batch of a page with room for a few entries", async () => {
+    const base = createMemoryDriver();
+    for (let index = 0; index < 40; index++) {
+      await base.mkdir(`/e${String(index).padStart(2, "0")}`);
+    }
+    let lstats = 0;
+    const counted: FsDriver = {
+      ...base,
+      async lstat(path) {
+        lstats++;
+        return base.lstat(path);
+      },
+    };
+    const session = new Nfs4Session(counted);
+    const client = await Client.open(session);
+
+    const names: string[] = [];
+    let cookie = 0n;
+    let cookieverf: Uint8Array = new Uint8Array(8);
+    let pages = 0;
+    for (;;) {
+      const reply = await client.run([
+        { op: OP_PUTROOTFH },
+        readdir(cookie, cookieverf, 260, [FATTR4_TYPE]),
+      ]);
+      expect(reply.compound.status).toBe(NFS4_OK);
+      const res = reply.compound.resarray[2]!.res as Readdir4res;
+      pages++;
+      for (const entry of res.reply.entries) {
+        names.push(entry.name);
+        cookie = entry.cookie;
+      }
+      cookieverf = res.cookieverf;
+      if (res.reply.eof) {
+        break;
+      }
+      expect(res.reply.entries.length).toBeGreaterThan(0);
+    }
+    expect(names).toHaveLength(40);
+    // Small pages, so there are many of them — which is what makes the
+    // per-page over-fetch visible at all.
+    expect(pages).toBeGreaterThan(8);
+    // Every entry is stat'ed once for the page it lands on, plus the one entry
+    // per page that proves the page is full and is re-fetched by the next.
+    // With a fixed 64-entry first batch this is ~7x higher.
+    expect(lstats).toBeLessThan(2 * 40);
+  });
+
   it("answers a cookieverf that no longer matches with NOT_SAME", async () => {
     const driver = await populated();
     const session = new Nfs4Session(driver);

@@ -390,6 +390,47 @@ const MAX_LINK = 32_000;
 const COOKIE_BASE = 3n;
 
 /**
+ * How many entries of one READDIR page are resolved at once.
+ *
+ * The same reasoning as `../v3/session.ts`'s constant of the same name, and it
+ * bites harder here: a v4 READDIR is v3's READDIR *and* READDIRPLUS in one
+ * operation, so every entry costs an `lstat` whatever the client asked for. A
+ * page is bounded in bytes rather than in entries, so neither one-at-a-time
+ * (5000 serialized round trips for a 5000-entry `ls`) nor all-at-once (a
+ * threadpool with tens of thousands of jobs on it) is the right shape; a fixed
+ * window is.
+ */
+const PAGE_CONCURRENCY = 64;
+
+/**
+ * The smallest a `fattr4` can encode to: an empty counted `bitmap4` and an
+ * empty `attrlist4`, four bytes each (`./attr.ts`'s `encodeFattr`).
+ *
+ * Used as a floor when READDIR needs to bound a batch it has not fetched yet.
+ * A floor can only *over*-count how many entries fit, which is the safe
+ * direction: the budget loop still decides, and an over-count costs at most a
+ * second batch rather than a short page.
+ */
+const MIN_FATTR4_SIZE = 8;
+
+/** Resolve one value per name, at most {@link PAGE_CONCURRENCY} in flight. */
+async function mapPage<T, R>(
+  items: readonly T[],
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = Array.from<R>({ length: items.length });
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await fn(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PAGE_CONCURRENCY, items.length) }, worker));
+  return out;
+}
+
+/**
  * The `statfs` family: the six attributes that come from `driver.statfs` and
  * from nowhere else.
  *
@@ -874,10 +915,12 @@ export class Nfs4Session {
    * Resolves to the encoded reply, or `null` for a record too damaged to carry
    * an xid — there is nothing to address a reply to. **Never rejects.**
    *
-   * `message` is read across awaits and must not be overwritten while the
-   * promise is outstanding; everything this session *keeps* — names, file
-   * handles, session IDs — is copied out of it by the decoders, and the whole
-   * COMPOUND is decoded before the first await.
+   * A direct caller must not overwrite `message` while the promise is
+   * outstanding; everything this session *keeps* — names, file handles,
+   * session IDs — is copied out of it by the decoders, and the whole COMPOUND
+   * is decoded before the first await. The transport never has to think about
+   * it: `../rpc.ts`'s `RecordAssembler` hands over a record copied out of the
+   * socket's buffers rather than a view of them.
    */
   async handleCall(
     message: Uint8Array,
@@ -1572,9 +1615,19 @@ export class Nfs4Session {
     return { entry: this.handles.bind(path, stats), stats };
   }
 
-  /** The `fileid` for an object: the driver's own `ino` when it has one. */
-  #fileid(entry: HandleEntry, stats: StatsLike): bigint {
-    return stats.ino > 0 ? BigInt(Math.trunc(stats.ino)) : entry.id;
+  /**
+   * Drop the cached listing of a directory whose names just changed.
+   *
+   * The rule this implements — which directories, and only which — is written
+   * down once, on `DirectorySnapshots` in `../handles.ts`, and `../v3/session.ts`
+   * has the same helper against the same cache. A directory nothing has ever
+   * listed has no entry to drop, which is why the lookup is allowed to miss.
+   */
+  #invalidate(dir: string): void {
+    const entry = this.handles.at(dir);
+    if (entry !== undefined) {
+      this.#snapshots.delete(entry.id);
+    }
   }
 
   /**
@@ -1659,37 +1712,61 @@ export class Nfs4Session {
   }
 
   /**
-   * Every attribute value this server has for one object.
+   * The six `statfs`-derived attribute values, or an empty set.
    *
    * `driver.statfs` is called only when the request actually asks for one of
-   * the six attributes that need it, and a failure omits those six rather than
-   * failing the operation — the rest of the answer is still true.
+   * the six attributes that need it, and a failure answers with nothing rather
+   * than failing the operation — the six bits are then simply absent from the
+   * reply bitmap, which §18.7.3 makes the protocol's own answer for an
+   * attribute a server cannot produce.
+   *
+   * Separate from {@link Nfs4Session.#valuesFor} because these six are the only
+   * ones that are **not** about the object named: they describe the filesystem
+   * it is on, and every entry of a directory is on the same one. That is what
+   * lets a READDIR page ask once and reuse the answer for every name, instead
+   * of a `statfs` per name — which with the memory driver is a whole-tree walk
+   * per name, and on a driver with none is nothing but a failed call and an
+   * `onError` per name.
    */
-  async #valuesFor(path: string, requested: Bitmap4): Promise<Fattr4Values> {
+  async #statfsValues(path: string, requested: Bitmap4): Promise<Fattr4Values> {
+    if (
+      !this.driver.capabilities.statfs ||
+      bitmapIsEmpty(bitmapIntersection(requested, STATFS_ATTRS))
+    ) {
+      return {};
+    }
+    try {
+      return fattr4FsOf(await this.driver.statfs(path));
+    } catch (error) {
+      this.options.onError?.(error, undefined);
+      return {};
+    }
+  }
+
+  /**
+   * Every attribute value this server has for one object.
+   *
+   * `fsValues` is {@link Nfs4Session.#statfsValues}' answer when the caller has
+   * already got one for this filesystem; omitting it asks for a fresh one.
+   */
+  async #valuesFor(
+    path: string,
+    requested: Bitmap4,
+    fsValues?: Fattr4Values | undefined,
+  ): Promise<Fattr4Values> {
     const { entry, stats } = await this.#bind(path);
     const values: Fattr4Values = {
       ...this.#filesystemValues(),
       ...fattr4Of(stats, {
-        fileid: this.#fileid(entry, stats),
+        // The driver's own `ino` when it offered one, kept on the entry by the
+        // `bind` two lines up and spelled once, in `../handles.ts`.
+        fileid: entry.fileid,
         filehandle: this.handles.encode(entry),
       }),
       owner: this.#ownerName(stats.uid, false),
       ownerGroup: this.#ownerName(stats.gid, true),
     };
-    if (
-      this.driver.capabilities.statfs &&
-      !bitmapIsEmpty(bitmapIntersection(requested, STATFS_ATTRS))
-    ) {
-      try {
-        Object.assign(values, fattr4FsOf(await this.driver.statfs(path)));
-      } catch (error) {
-        // The six `statfs` bits are simply absent from the reply bitmap, which
-        // §18.7.3 makes the protocol's own answer for an attribute a server
-        // cannot produce.
-        this.options.onError?.(error, undefined);
-      }
-    }
-    return values;
+    return Object.assign(values, fsValues ?? (await this.#statfsValues(path, requested)));
   }
 
   // -------------------------------------------------------------------------
@@ -1704,6 +1781,15 @@ export class Nfs4Session {
    * client's point of view a handle it may no longer use and one that was never
    * ours are the same event, and `NFS4ERR_STALE` is the one it knows how to
    * recover from. See `../handles.ts`.
+   *
+   * **Where that error lands is deliberate.** This decodes and does not
+   * resolve, so a handle to a file whose last name is gone used to reach the
+   * *next* operation in the COMPOUND before failing there. Now that the table
+   * drops an entry with no names, PUTFH itself is where it fails. Both are
+   * legal — §15.2 lists `NFS4ERR_STALE` on PUTFH's own row — and failing at the
+   * operation that names the dead handle is the more useful of the two: the
+   * client is told which handle to drop, rather than being told that the GETATTR
+   * it happened to put after it went wrong.
    */
   #putfh(args: Putfh4args, cursor: Cursor): Status4res {
     cursor.currentFh = this.handles.encode(this.handles.decode(args.object));
@@ -2254,6 +2340,7 @@ export class Nfs4Session {
       }
     }
 
+    this.#invalidate(dir);
     await this.#claim(path, cursor.creds);
     // `mkdir` already took the mode; a symlink has none to take. `size` is not
     // a writable attribute of any of these types, so it is neither applied nor
@@ -2294,8 +2381,11 @@ export class Nfs4Session {
     const stats = await this.#statOf(path);
     const directory = (stats.mode & S_IFMT) === S_IFDIR;
     await (directory ? this.driver.rmdir(path) : this.driver.unlink(path));
-    // The handle keeps existing and stops resolving: a client still holding it
-    // gets `NFS4ERR_STALE`, which is what this server has instead of an
+    // The parent lost a name; a removed *directory* also stops being a thing
+    // whose own cached listing means anything. See `../handles.ts`.
+    this.#invalidate(dir);
+    // The handle stops resolving: a client still holding it gets
+    // `NFS4ERR_STALE`, which is what this server has instead of an
     // unlinked-but-open file.
     const entry = this.handles.unbind(path);
     if (entry !== undefined && directory) {
@@ -2322,7 +2412,12 @@ export class Nfs4Session {
     // client goes on using the handle it already has, for the object and for
     // everything below it if this was a directory.
     this.handles.remap(from, to);
-    this.#snapshots.clear();
+    // Exactly two directories changed their names: the one that lost `from` and
+    // the one that gained `to`. A directory that *moved* keeps its own snapshot
+    // — same contents, and `remap` kept it the same entry — and no unrelated
+    // directory is touched at all. See `../handles.ts`.
+    this.#invalidate(fromDir);
+    this.#invalidate(toDir);
     const sourceAfter = await this.#changeOf(fromDir);
     return {
       status: NFS4_OK,
@@ -2344,6 +2439,7 @@ export class Nfs4Session {
     const path = joinPath(dir, this.#checkName(args.newname));
     const before = await this.#changeOf(dir);
     await this.driver.link(file, path);
+    this.#invalidate(dir);
     // Same object, one more name: `bind` finds the existing entry by identity,
     // so the client's handle for the original keeps working.
     await this.#bind(path);
@@ -2460,34 +2556,104 @@ export class Nfs4Session {
     // in hand.
     const dirBudget = args.dircount;
     const maxBudget = Math.max(0, Math.min(args.maxcount, this.#maxread()) - 128);
+    // Asked once for the whole page: the six `statfs` attributes describe the
+    // filesystem every entry is on, not the entry.
+    const fsValues = await this.#statfsValues(path, attrmask);
+    // One scratch writer for the page, not one per entry. Each entry's encoded
+    // size is the *delta* it adds to this writer, so measuring costs a single
+    // geometrically-grown buffer instead of a 256-byte allocation per name —
+    // and the bytes are thrown away either way, because the reply is encoded
+    // from `entries` once the page is settled.
+    const scratch = new XdrWriter(Math.min(maxBudget, 8192));
     const entries: Entry4[] = [];
     let dirUsed = 0;
     let maxUsed = 0;
     let index = page.from;
-    for (; index < page.names.length; index++) {
-      const name = page.names[index]!;
-      // `nextentry` bool, cookie, and the counted name: what §18.23.3 says
-      // `dircount` measures ("the total length of the names of the directory
-      // entries and the cookie value for these entries").
-      const dirSize = 4 + 8 + 4 + xdrAlign(stringByteLength(name));
-      const attrs = await this.#entryAttrs(path, name, attrmask, wantsRdattrError);
-      const scratch = new XdrWriter(256);
-      encodeFattr(scratch, attrs.attrmask, attrs.values, getable);
-      const entrySize = dirSize + scratch.length;
-      if (maxUsed + entrySize > maxBudget) {
-        // The hard limit. Breaking here with nothing in hand is the one case
-        // that owes the client `NFS4ERR_TOOSMALL`.
+    // Entries are fetched a batch at a time. They cannot be chosen from the
+    // names alone the way `../v3/session.ts`'s can — `maxcount` counts encoded
+    // attributes, so an entry has to be *fetched* before it is known whether it
+    // fits — but fetching them one at a time is one driver round trip per name
+    // with nothing overlapping. So: fetch a batch concurrently, then run the
+    // budget over it, and stop at the first entry that does not fit.
+    //
+    // How big a batch is the whole difficulty, because fetching an entry the
+    // page has no room for is work thrown away *and* a handle-table entry
+    // minted for a name that is never returned. Two bounds, and the batch takes
+    // the smaller:
+    //
+    // - `floorRoom` needs no driver call at all: every entry costs its
+    //   `dircount` size — which is a function of the name — plus at least
+    //   `MIN_FATTR4_SIZE`. Walking the names with that floor can only
+    //   over-count, and it is the only bound available for the **first** batch
+    //   of a page, which is exactly where a fixed window would over-fetch the
+    //   whole window against a small `maxcount`.
+    // - the running average of the entries already measured, which is far
+    //   tighter once there is anything to average.
+    const floorRoom = (): number => {
+      let count = 0;
+      let dir = dirUsed;
+      let max = maxUsed;
+      // Capped at the window, because that is all the caller can use.
+      for (let at = index; at < page.names.length && count < PAGE_CONCURRENCY; at++) {
+        const dirSize = 4 + 8 + 4 + xdrAlign(stringByteLength(page.names[at]!));
+        max += dirSize + MIN_FATTR4_SIZE;
+        dir += dirSize;
+        if (max > maxBudget || (dirBudget > 0 && dir > dirBudget)) {
+          break;
+        }
+        count++;
+      }
+      // One over, because the entry that does *not* fit is what ends the page
+      // and it has to be fetched to be measured. Landing exactly on the last
+      // one that fits would cost an extra round trip to discover that.
+      return count + 1;
+    };
+    while (index < page.names.length) {
+      let room = floorRoom();
+      if (entries.length > 0) {
+        let average = Math.ceil(((maxBudget - maxUsed) * entries.length) / maxUsed);
+        if (dirBudget > 0) {
+          average = Math.min(
+            average,
+            Math.ceil(((dirBudget - dirUsed) * entries.length) / dirUsed),
+          );
+        }
+        room = Math.min(room, Math.max(1, average) + 1);
+      }
+      const batch = page.names.slice(index, index + Math.min(PAGE_CONCURRENCY, room));
+      const fetched = await mapPage(batch, (name) =>
+        this.#entryAttrs(path, name, attrmask, wantsRdattrError, fsValues),
+      );
+      let accepted = 0;
+      for (; accepted < fetched.length; accepted++) {
+        const name = batch[accepted]!;
+        const attrs = fetched[accepted]!;
+        // `nextentry` bool, cookie, and the counted name: what §18.23.3 says
+        // `dircount` measures ("the total length of the names of the directory
+        // entries and the cookie value for these entries").
+        const dirSize = 4 + 8 + 4 + xdrAlign(stringByteLength(name));
+        const before = scratch.length;
+        encodeFattr(scratch, attrs.attrmask, attrs.values, getable);
+        const entrySize = dirSize + (scratch.length - before);
+        if (maxUsed + entrySize > maxBudget) {
+          // The hard limit. Breaking here with nothing in hand is the one case
+          // that owes the client `NFS4ERR_TOOSMALL`.
+          break;
+        }
+        if (entries.length > 0 && dirBudget > 0 && dirUsed + dirSize > dirBudget) {
+          // The hint, and only ever after a first entry: a single name longer
+          // than the whole hint still goes out when `maxcount` has room for it,
+          // because a hint that could empty a page would not be one.
+          break;
+        }
+        dirUsed += dirSize;
+        maxUsed += entrySize;
+        entries.push({ cookie: BigInt(index + accepted) + COOKIE_BASE, name, attrs });
+      }
+      index += accepted;
+      if (accepted < batch.length) {
         break;
       }
-      if (entries.length > 0 && dirBudget > 0 && dirUsed + dirSize > dirBudget) {
-        // The hint, and only ever after a first entry: a single name longer
-        // than the whole hint still goes out when `maxcount` has room for it,
-        // because a hint that could empty a page would not be one.
-        break;
-      }
-      dirUsed += dirSize;
-      maxUsed += entrySize;
-      entries.push({ cookie: BigInt(index) + COOKIE_BASE, name, attrs });
     }
     if (entries.length === 0 && index < page.names.length) {
       return {
@@ -2515,10 +2681,11 @@ export class Nfs4Session {
     name: string,
     attrmask: Bitmap4,
     wantsRdattrError: boolean,
+    fsValues: Fattr4Values,
   ): Promise<Fattr4> {
     const child = joinPath(dir, name);
     try {
-      const values = await this.#valuesFor(child, attrmask);
+      const values = await this.#valuesFor(child, attrmask, fsValues);
       if (wantsRdattrError) {
         values.rdattrError = NFS4_OK;
       }
@@ -2802,6 +2969,12 @@ export class Nfs4Session {
       const refusal = await this.#openCreate(args, path, cursor, attrset);
       if (refusal !== undefined) {
         return refused(refusal);
+      }
+      if (dir !== undefined) {
+        // A creating OPEN may or may not have added a name — `UNCHECKED4` over
+        // a file that already exists does not — and the rule in `../handles.ts`
+        // is deliberately conservative about exactly this case.
+        this.#invalidate(dir);
       }
     }
 

@@ -7,11 +7,18 @@
  * hour ago, from a different process, after the server has been restarted. That
  * makes this table look like the FUSE `InodeTable` and behave quite differently:
  *
- * - **Nothing is refcounted, and nothing is ever dropped.** There is no message
- *   that says "I am done with this handle", so an entry lives as long as the
- *   server does. That is a real, bounded leak — one entry per path the client
- *   ever looked at — and it is the honest v1 tradeoff; a generation-stamped LRU
- *   is the fix if a workload ever needs one.
+ * - **Nothing is refcounted, and an entry lives as long as one of its names
+ *   does.** There is no message that says "I am done with this handle", so an
+ *   entry the client may still hold has to stay. What *can* go is an entry with
+ *   no names left: it is reachable only through `decode()` → `pathOf()`, which
+ *   always throws `ESTALE`, so dropping it changes nothing a client can see —
+ *   the same handle now gets `ESTALE` from `decode()` instead, one sentence
+ *   earlier. That matters because ids are minted from a monotonic counter and
+ *   never reused, so create/delete churn under a mount (a build, a `tar -x`
+ *   followed by a `rm -rf`) would otherwise grow `#byId` without any bound at
+ *   all. What is left is the honest v1 tradeoff — one live entry per path the
+ *   client currently has a name for — and a generation-stamped LRU is the fix
+ *   if a workload ever needs more.
  * - **Handles are identity-keyed**, on the driver's `(dev, ino)`, exactly as
  *   nodeids are. That is what makes a handle survive `rename` (the file is the
  *   same file, whatever it is called now) and what makes two hardlinks one
@@ -45,6 +52,16 @@ export interface HandleEntry {
   readonly id: bigint;
   /** `${dev}:${ino}` when the driver offers a usable identity. */
   key: string | undefined;
+  /**
+   * What both versions report as `fileid3`/`fattr4_fileid`: the driver's own
+   * `ino` when it offered one, and the entry id when it did not.
+   *
+   * Kept on the entry, refreshed by every {@link FileHandleTable.bind}, because
+   * a READDIR page needs one of these per name and an entry the table has
+   * *already* bound can answer with no driver call at all — which is the whole
+   * cost of a plain `ls` on a directory the client has walked before.
+   */
+  fileid: bigint;
   /** Insertion-ordered; the first is the primary path every driver call uses. */
   readonly paths: Set<string>;
 }
@@ -52,6 +69,13 @@ export interface HandleEntry {
 function identityKey(stats: StatsLike): string | undefined {
   // `ino === 0` is a driver saying it has no identity to offer.
   return stats.ino > 0 ? `${stats.dev}:${stats.ino}` : undefined;
+}
+
+/** {@link HandleEntry.fileid} for a fresh `stat`, given the entry it landed on. */
+function fileidOf(stats: StatsLike, id: bigint): bigint {
+  // Userspace uses `fileid` to spot hardlinks, and the handle is keyed on the
+  // same number anyway — so the driver's own is the answer whenever it has one.
+  return stats.ino > 0 ? BigInt(Math.trunc(stats.ino)) : id;
 }
 
 function stale(what: string): Error {
@@ -81,12 +105,20 @@ export class FileHandleTable {
   constructor(options: FileHandleTableOptions = {}) {
     this.#useDriverIno = options.useDriverIno ?? true;
     this.verifier = options.verifier ?? randomFillSync(new Uint8Array(8));
-    this.root = { id: ROOT_HANDLE_ID, key: undefined, paths: new Set(["/"]) };
+    this.root = {
+      id: ROOT_HANDLE_ID,
+      key: undefined,
+      fileid: ROOT_HANDLE_ID,
+      paths: new Set(["/"]),
+    };
     this.#byId.set(ROOT_HANDLE_ID, this.root);
     this.#byPath.set("/", this.root);
   }
 
-  /** Entries currently known. Only grows (see the module docs). */
+  /**
+   * Entries currently known — one per file that still has at least one name,
+   * plus the root. See the module docs for what is and is not dropped.
+   */
   get size(): number {
     return this.#byId.size;
   }
@@ -138,6 +170,7 @@ export class FileHandleTable {
     return entry;
   }
 
+  /** The entry an id names, if it is still live. Nothing in `src/` needs this; the tests do. */
   get(id: bigint): HandleEntry | undefined {
     return this.#byId.get(id);
   }
@@ -188,8 +221,11 @@ export class FileHandleTable {
     let entry = byKey ?? (sameFile ? previous : undefined);
 
     if (entry === undefined) {
-      entry = { id: this.#nextId++, key, paths: new Set() };
+      const id = this.#nextId++;
+      entry = { id, key, fileid: fileidOf(stats, id), paths: new Set() };
       this.#byId.set(entry.id, entry);
+    } else {
+      entry.fileid = fileidOf(stats, entry.id);
     }
     if (previous !== undefined && previous !== entry) {
       this.#detachPath(previous, path);
@@ -298,10 +334,26 @@ export class FileHandleTable {
   #detachPath(entry: HandleEntry, path: string): void {
     entry.paths.delete(path);
     this.#byPath.delete(path);
+    if (entry.paths.size > 0) {
+      return;
+    }
     // A path-less entry must not be found by identity again: a real filesystem
     // reuses the `ino` of a deleted file for the next one created.
-    if (entry.paths.size === 0 && entry.key !== undefined && this.#byKey.get(entry.key) === entry) {
+    if (entry.key !== undefined && this.#byKey.get(entry.key) === entry) {
       this.#byKey.delete(entry.key);
+    }
+    // And it must not stay in `#byId` either. The only thing that could still
+    // reach it is `decode()` of a handle the client kept, and the very next
+    // thing that happens to it is `pathOf()` throwing `ESTALE`; dropping it
+    // makes `decode()` say the same thing one sentence earlier ("unknown file
+    // handle"), which is safe precisely because `#nextId` only ever counts up,
+    // so no later file can be handed this id and alias the dead handle.
+    //
+    // The root is the exception: `PUTROOTFH` and `MNT` hand out its handle from
+    // the `root` field rather than from a lookup, so an id that no longer
+    // decodes would be a handle this server minted and immediately refuses.
+    if (entry.id !== ROOT_HANDLE_ID) {
+      this.#byId.delete(entry.id);
     }
   }
 }
@@ -366,6 +418,42 @@ export function sameVerifier(left: Uint8Array, right: Uint8Array): boolean {
  * Bounded on purpose: a server that cached every directory a client ever read
  * would be a memory leak with a `readdir` trigger. Eviction is not a
  * correctness problem — see {@link DirSnapshot}.
+ *
+ * ## The invalidation rule
+ *
+ * Both sessions share this cache, and both obey one rule:
+ *
+ * > **A mutating operation drops the snapshot of every directory whose set of
+ * > names it could have changed, and of no other directory.**
+ *
+ * Which is four cases and nothing else:
+ *
+ * - creating a name in `D` (CREATE, MKDIR, SYMLINK, MKNOD, LINK, and v4's
+ *   creating OPEN) drops `D`'s;
+ * - removing a name from `D` drops `D`'s;
+ * - removing the directory `D` itself drops `D`'s own as well, since the
+ *   listing it holds now describes something that is gone;
+ * - a rename drops **both parents'** — the source's, which lost a name, and the
+ *   target's, which gained one.
+ *
+ * Two things follow that are easy to get wrong in the other direction. A
+ * directory that was itself *renamed* keeps its snapshot: its contents did not
+ * change, and the handle table is identity-keyed, so it is still the same id.
+ * And nothing invalidates on behalf of an unrelated directory — the old
+ * `clear()`-on-rename threw away every cached listing in the server, so one
+ * `mv` in the middle of a build cost every other client its paging position.
+ *
+ * "Could have changed" is deliberately conservative: an `UNCHECKED` CREATE over
+ * a file that already exists changes no names, and still drops the snapshot.
+ * Being wrong that way costs one re-`readdir` on the next resume, and the
+ * verifier then matches and the client's cookies keep working. Being wrong the
+ * other way serves a resuming client a listing it can prove is current, and is
+ * silently the wrong one.
+ *
+ * A snapshot whose directory has ceased to exist altogether — the losing side
+ * of a rename, a subtree that moved out from under one — needs no rule: its
+ * handle no longer decodes (see {@link FileHandleTable}), so nothing can name
+ * the id again, and it ages out of the LRU behind the live entries.
  */
 export class DirectorySnapshots {
   readonly #entries = new Map<bigint, DirSnapshot>();

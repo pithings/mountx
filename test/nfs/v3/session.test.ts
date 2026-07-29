@@ -489,22 +489,87 @@ describe("readdir cookies", () => {
     expect([...two.cookieverf]).toEqual([...one.cookieverf]);
   });
 
-  it("keeps a client's page stable even when the directory changes underneath", async () => {
-    const { client, fs, root } = await serve();
-    await populate(fs, 20);
+  it("keeps a client's page stable when the directory changes behind the server's back", async () => {
+    // The change is made straight on the driver, so the server never hears
+    // about it and its snapshot is the last thing it knows to be true. That is
+    // what the snapshot is *for*: the client's cookies keep meaning what they
+    // meant, and it pages to the end of the listing it started.
+    const driver = createMemoryDriver();
+    const { client, root } = await serve(driver);
+    const behind = createLoopback(driver);
+    await populate(behind, 20);
     const dir = check(await client.lookup(root, "dir"), "lookup").object!;
     const first = check(await client.readdir(dir, 0n, undefined, 200), "readdir");
     expect(first.eof).toBe(false);
 
-    // Something else adds a file mid-scan. The snapshot the cookies belong to
-    // is cached, so the client's paging is unaffected.
-    await fs.writeFile("/dir/zzz-new", "x");
+    await behind.writeFile("/dir/zzz-new", "x");
     const rest = check(
       await client.readdir(dir, first.entries.at(-1)!.cookie, first.cookieverf, 4096),
       "readdir",
     );
     expect(rest.eof).toBe(true);
     expect(first.entries.length + rest.entries.length).toBe(20);
+  });
+
+  /**
+   * The other half of the same rule, and the one that used to be wrong.
+   *
+   * A CREATE the *server* performed is a directory it knows has changed, so the
+   * cached listing goes (`DirectorySnapshots` in `src/nfs/handles.ts` states
+   * the rule). Before that, the snapshot survived with its verifier still
+   * matching and the resuming client was handed names from before the create —
+   * the one outcome the cookie scheme exists to prevent, since the client has
+   * no way to tell that page from a current one.
+   */
+  it("stops resuming a page whose directory the server itself changed", async () => {
+    const { client, fs, root } = await serve();
+    await populate(fs, 20);
+    const dir = check(await client.lookup(root, "dir"), "lookup").object!;
+    const first = check(await client.readdir(dir, 0n, undefined, 200), "readdir");
+    expect(first.eof).toBe(false);
+
+    await fs.writeFile("/dir/zzz-new", "x");
+    // Not a stale page: `NFS3ERR_BAD_COOKIE`, which is a client's cue to start
+    // the listing again — and starting again shows the new name.
+    expect(
+      (await client.readdir(dir, first.entries.at(-1)!.cookie, first.cookieverf, 4096)).status,
+    ).toBe(NFS3ERR_BAD_COOKIE);
+    const names = await client.readdirAll(dir);
+    expect(names.map((entry) => entry.name)).toContain("zzz-new");
+  });
+
+  it("drops only the directories a mutation touched", async () => {
+    const base = createMemoryDriver();
+    let readdirs = 0;
+    const counted: FsDriver = {
+      ...base,
+      async readdir(path, options) {
+        readdirs++;
+        return base.readdir(path, options as never) as never;
+      },
+    };
+    const { client, fs, root } = await serve(counted);
+    await populate(fs, 20);
+    await fs.mkdir("/other");
+    await fs.writeFile("/other/a", "x");
+    const dir = check(await client.lookup(root, "dir"), "lookup").object!;
+    const first = check(await client.readdir(dir, 0n, undefined, 200), "readdir");
+    expect(first.eof).toBe(false);
+
+    // A rename somewhere else entirely.
+    const before = readdirs;
+    await fs.rename("/other/a", "/other/b");
+    const rest = check(
+      await client.readdir(dir, first.entries.at(-1)!.cookie, first.cookieverf, 4096),
+      "readdir",
+    );
+    expect(rest.eof).toBe(true);
+    expect(first.entries.length + rest.entries.length).toBe(20);
+    // And the resume came straight out of the cache. RENAME used to `clear()`
+    // every snapshot in the server, so one `mv` during a build made every other
+    // directory anyone was paging re-list itself from the driver to prove the
+    // client's cookies still meant something.
+    expect(readdirs - before).toBe(0);
   });
 
   it("answers BAD_COOKIE for a cookie past the end, or a verifier from nowhere", async () => {
@@ -586,6 +651,55 @@ describe("readdir cookies", () => {
     await fs.writeFile("/only", "x");
     const entries = await client.readdirAll(root);
     expect(entries.map((entry) => entry.name)).toEqual(["only"]);
+  });
+
+  /**
+   * What a page costs the driver.
+   *
+   * A page used to be one `lstat` per name, awaited one after the other, purely
+   * to fill `fileid3` — 5000 serialized round trips for a 5000-entry `ls`, and
+   * on a driver like `unstorage` (whose `stat` falls back to fetching the value)
+   * one download per object, in series. Two things changed: the page is chosen
+   * from the names alone and then resolved as a batch, and a child the handle
+   * table has already bound answers from the entry with no driver call at all.
+   */
+  it("resolves a readdir page as one batch, and re-lists a bound directory for free", async () => {
+    const base = createMemoryDriver();
+    let lstats = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const counted: FsDriver = {
+      ...base,
+      async lstat(path) {
+        lstats++;
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        try {
+          return await base.lstat(path);
+        } finally {
+          inFlight--;
+        }
+      },
+    };
+    const { client, root } = await serve(counted);
+    // Populated straight on the driver, so the handle table has never seen any
+    // of these names — which is the shape a client that mounts an existing tree
+    // and lists it once actually has.
+    await populate(createLoopback(base), 40);
+    const dir = check(await client.lookup(root, "dir"), "lookup").object!;
+
+    const before = lstats;
+    expect(await client.readdirAll(dir)).toHaveLength(40);
+    // Every name is new to the table, so the first pass still stats all of
+    // them — but concurrently. On base this peaks at exactly 1.
+    expect(lstats - before).toBeGreaterThanOrEqual(40);
+    expect(peak).toBeGreaterThan(1);
+
+    const bound = lstats;
+    expect(await client.readdirAll(dir)).toHaveLength(40);
+    // The second pass is the directory's own `post_op_attr` and nothing else.
+    // On base it is another 40.
+    expect(lstats - bound).toBeLessThan(5);
   });
 });
 

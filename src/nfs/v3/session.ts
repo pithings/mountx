@@ -205,6 +205,36 @@ export const DEFAULT_WTMAX = 1024 * 1024;
 /** Preferred `READDIR` reply size, and `FSINFO`'s `dtpref`. */
 export const DEFAULT_DTPREF = 32 * 1024;
 
+/**
+ * How many entries of one `READDIR`/`READDIRPLUS` page are resolved at once.
+ *
+ * A page is bounded in *bytes*, not in entries: a client asking for the whole
+ * `rtmax` can name tens of thousands of them in a single request. So neither
+ * extreme is right — one driver call after another makes a 5000-entry `ls`
+ * 5000 serialized round trips (and on a driver like `unstorage` that is 5000
+ * sequential downloads), while firing all of them at once trades that for a
+ * threadpool with tens of thousands of jobs queued on it. A fixed window makes
+ * the page one batch, which is the shape the cost actually has.
+ */
+const PAGE_CONCURRENCY = 64;
+
+/** Resolve one value per name, at most {@link PAGE_CONCURRENCY} in flight. */
+async function mapPage<T, R>(
+  items: readonly T[],
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const out = Array.from<R>({ length: items.length });
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      out[index] = await fn(items[index]!, index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PAGE_CONCURRENCY, items.length) }, worker));
+  return out;
+}
+
 /** A `nfsstat3` carried out of a handler. */
 class NfsStatusError extends Error {
   readonly status: number;
@@ -302,9 +332,11 @@ export class Nfs3Session {
    * Resolves to the encoded reply, or `null` for a record too damaged to carry
    * an xid — there is nothing to address a reply to. **Never rejects.**
    *
-   * `message` is read across awaits and must not be overwritten while the
-   * promise is outstanding; everything the session *keeps* — names, `WRITE`
-   * payloads, file handles — is copied out of it by the decoders.
+   * A direct caller must not overwrite `message` while the promise is
+   * outstanding; everything the session *keeps* — names, `WRITE` payloads,
+   * file handles — is copied out of it by the decoders. The transport never
+   * has to think about it: `../rpc.ts`'s `RecordAssembler` hands over a record
+   * copied out of the socket's buffers rather than a view of them.
    */
   async handleCall(
     message: Uint8Array,
@@ -521,8 +553,9 @@ export class Nfs3Session {
 
   #fattr(entry: HandleEntry, stats: StatsLike): Fattr3 {
     // The driver's own `ino` when it has one — userspace uses `fileid` to spot
-    // hardlinks, and the handle is keyed on it anyway.
-    return fattrOf(stats, stats.ino > 0 ? BigInt(Math.trunc(stats.ino)) : entry.id);
+    // hardlinks, and the handle is keyed on it anyway. `bind` just refreshed it
+    // from these very `stats`, so the entry is the one place it is spelled.
+    return fattrOf(stats, entry.fileid);
   }
 
   /**
@@ -559,6 +592,21 @@ export class Nfs3Session {
   /** The path a handle names, or `ESTALE`. */
   #pathOf(fh: Uint8Array): string {
     return this.handles.resolve(fh);
+  }
+
+  /**
+   * Drop the cached listing of a directory whose names just changed.
+   *
+   * The rule this implements — which directories, and only which — is written
+   * down once, on `DirectorySnapshots` in `../handles.ts`. A directory nothing
+   * has ever listed has no entry to drop, which is why the lookup is allowed to
+   * miss.
+   */
+  #invalidate(dir: string | undefined): void {
+    const entry = dir === undefined ? undefined : this.handles.at(dir);
+    if (entry !== undefined) {
+      this.#snapshots.delete(entry.id);
+    }
   }
 
   #checkName(name: string, syscall: string): string {
@@ -1024,6 +1072,7 @@ export class Nfs3Session {
         (request.mode === CREATE_GUARDED ? constants.O_EXCL : 0);
       const handle = await this.driver.open(path, flags, (mode ?? 0o666) & 0o7777);
       await handle.close();
+      this.#invalidate(dir);
       await this.#claim(path, creds);
       // `UNCHECKED` over an existing file still applies the attributes, which
       // is how a client asks for `open(…, O_CREAT|O_TRUNC)` in one round trip.
@@ -1046,6 +1095,7 @@ export class Nfs3Session {
       const path = joinPath(dir, this.#checkName(request.where.name, "mkdir"));
       before = await this.#preOp(dir);
       await this.driver.mkdir(path, { mode: (request.attributes.mode ?? 0o777) & 0o7777 });
+      this.#invalidate(dir);
       await this.#claim(path, creds);
       await this.#applySattr(path, { ...request.attributes, mode: undefined });
       await this.#created(writer, dir, before, path);
@@ -1066,6 +1116,7 @@ export class Nfs3Session {
       const path = joinPath(dir, this.#checkName(request.where.name, "symlink"));
       before = await this.#preOp(dir);
       await this.driver.symlink(request.target, path);
+      this.#invalidate(dir);
       await this.#claim(path, creds);
       // A symlink has no mode of its own to set; times and ownership still do.
       await this.#applySattr(
@@ -1105,6 +1156,7 @@ export class Nfs3Session {
       const mode = (request.attributes?.mode ?? 0o666) & 0o7777;
       const rdev = ((request.spec?.major ?? 0) << 8) | (request.spec?.minor ?? 0);
       await mknod.call(this.driver.mountx, path, mode | modeBitsOfFtype(request.type), rdev);
+      this.#invalidate(dir);
       await this.#claim(path, creds);
       await this.#created(writer, dir, before, path);
     } catch (error) {
@@ -1128,8 +1180,11 @@ export class Nfs3Session {
       const path = joinPath(dir, this.#checkName(request.name, directory ? "rmdir" : "unlink"));
       before = await this.#preOp(dir);
       await (directory ? this.driver.rmdir(path) : this.driver.unlink(path));
-      // The handle keeps existing and stops resolving: a client still holding
-      // it gets `NFS3ERR_STALE`, which is what NFSv3 has instead of an
+      // The parent lost a name; a removed *directory* also stops being a thing
+      // whose own cached listing means anything. See `../handles.ts`.
+      this.#invalidate(dir);
+      // The handle stops resolving: a client still holding it gets
+      // `NFS3ERR_STALE`, which is what NFSv3 has instead of an
       // unlinked-but-open file.
       const entry = this.handles.unbind(path);
       if (entry !== undefined && directory) {
@@ -1166,7 +1221,12 @@ export class Nfs3Session {
       // client goes on using the handle it already has, for the file and for
       // everything below it if this was a directory.
       this.handles.remap(from, to);
-      this.#snapshots.clear();
+      // Exactly two directories changed their names: the one that lost `from`
+      // and the one that gained `to`. A directory that *moved* keeps its own
+      // snapshot — same contents, and `remap` kept it the same entry — and no
+      // unrelated directory is touched at all. See `../handles.ts`.
+      this.#invalidate(fromDir);
+      this.#invalidate(toDir);
       writeRenameRes(writer, {
         status: NFS3_OK,
         fromWcc: await this.#wcc(fromBefore, fromDir),
@@ -1195,6 +1255,7 @@ export class Nfs3Session {
       const path = joinPath(dir, this.#checkName(request.link.name, "link"));
       before = await this.#preOp(dir);
       await this.driver.link(file, path);
+      this.#invalidate(dir);
       // Same file, one more name: `bind` finds the existing entry by identity,
       // so the client's handle for the original keeps working and both names
       // resolve to it.
@@ -1267,13 +1328,18 @@ export class Nfs3Session {
     let path: string | undefined;
     try {
       const entry = this.handles.decode(request.dir);
-      path = this.handles.pathOf(entry);
-      const page = await this.#page(entry, path, request.cookie, request.cookieverf);
+      const dir = this.handles.pathOf(entry);
+      path = dir;
+      const page = await this.#page(entry, dir, request.cookie, request.cookieverf);
       // Reply overhead: status, post_op_attr, cookieverf, the list terminator
       // and eof. Generous, because underestimating it is a reply the client
       // rejects.
       const budget = Math.max(0, Math.min(request.count, this.#rtmax()) - 128);
-      const entries: Entry3[] = [];
+      // Which names fit is decided from the names alone, so the whole page is
+      // chosen before a single `fileid3` is asked for and then resolved as one
+      // batch — rather than a driver round trip between each entry and the
+      // next.
+      const chosen: string[] = [];
       let used = 0;
       let index = page.from;
       for (; index < page.names.length; index++) {
@@ -1283,15 +1349,17 @@ export class Nfs3Session {
           break;
         }
         used += size;
-        entries.push({
-          fileid: await this.#fileid(path, name),
-          name,
-          cookie: BigInt(index + 1),
-        });
+        chosen.push(name);
       }
-      if (entries.length === 0 && index < page.names.length) {
+      if (chosen.length === 0 && index < page.names.length) {
         throw new NfsStatusError(NFS3ERR_TOOSMALL, `count ${request.count} fits no entry`);
       }
+      const fileids = await mapPage(chosen, (name) => this.#fileid(dir, name));
+      const entries: Entry3[] = chosen.map((name, offset) => ({
+        fileid: fileids[offset]!,
+        name,
+        cookie: BigInt(page.from + offset + 1),
+      }));
       writeReaddirRes(writer, {
         status: NFS3_OK,
         dirAttributes: await this.#postOp(path),
@@ -1318,14 +1386,17 @@ export class Nfs3Session {
     let path: string | undefined;
     try {
       const entry = this.handles.decode(request.dir);
-      path = this.handles.pathOf(entry);
-      const page = await this.#page(entry, path, request.cookie, request.cookieverf);
+      const dir = this.handles.pathOf(entry);
+      path = dir;
+      const page = await this.#page(entry, dir, request.cookie, request.cookieverf);
       // Two budgets, and both are the client's: `dircount` bounds the names and
       // cookies, `maxcount` the whole reply. Overrunning either is a reply the
-      // client throws away.
+      // client throws away. Both are decided from the names alone, so — as in
+      // `#readdir` — the page is chosen first and its attributes fetched as one
+      // batch rather than one round trip per entry.
       const dirBudget = Math.max(0, request.dircount - 128);
       const maxBudget = Math.max(0, Math.min(request.maxcount, this.#rtmax()) - 128);
-      const entries: EntryPlus3[] = [];
+      const chosen: string[] = [];
       let dirUsed = 0;
       let maxUsed = 0;
       let index = page.from;
@@ -1339,7 +1410,17 @@ export class Nfs3Session {
         }
         dirUsed += dirSize;
         maxUsed += plusSize;
-        const child = joinPath(path, name);
+        chosen.push(name);
+      }
+      if (chosen.length === 0 && index < page.names.length) {
+        throw new NfsStatusError(
+          NFS3ERR_TOOSMALL,
+          `dircount ${request.dircount} / maxcount ${request.maxcount} fits no entry`,
+        );
+      }
+      const entries: EntryPlus3[] = await mapPage(chosen, async (name, offset) => {
+        const child = joinPath(dir, name);
+        const cookie = BigInt(page.from + offset + 1);
         let attributes: Fattr3 | undefined;
         let handle: Uint8Array | undefined;
         let fileid: bigint;
@@ -1353,14 +1434,8 @@ export class Nfs3Session {
           // with no attributes is legal and beats failing the whole page.
           fileid = 0n;
         }
-        entries.push({ fileid, name, cookie: BigInt(index + 1), attributes, handle });
-      }
-      if (entries.length === 0 && index < page.names.length) {
-        throw new NfsStatusError(
-          NFS3ERR_TOOSMALL,
-          `dircount ${request.dircount} / maxcount ${request.maxcount} fits no entry`,
-        );
-      }
+        return { fileid, name, cookie, attributes, handle };
+      });
       writeReaddirplusRes(writer, {
         status: NFS3_OK,
         dirAttributes: await this.#postOp(path),
@@ -1380,13 +1455,32 @@ export class Nfs3Session {
     return writer.bytes();
   }
 
-  /** `fileid3` for a directory entry, without failing the page if it is gone. */
+  /**
+   * `fileid3` for a directory entry, without failing the page if it is gone.
+   *
+   * A child the handle table has already bound answers with **no driver call at
+   * all**: `HandleEntry.fileid` is exactly what a fresh `lstat` would produce,
+   * because a fresh `lstat` is where it came from. That is what makes listing a
+   * directory the client has walked before cost nothing per name — the case a
+   * shell loop or a `find` spends all its time in.
+   *
+   * What it gives up is one round of freshness: the number reported is the one
+   * this server last saw rather than one it has just re-checked. That is the
+   * right trade here and nowhere else. `fileid3` in a plain READDIR is
+   * advisory — a client that needs attributes it can act on asks for
+   * READDIRPLUS, which stats every entry and is left alone — and the *names*
+   * being paged over are already a frozen snapshot, so nothing about this page
+   * was current to begin with.
+   */
   async #fileid(dir: string, name: string): Promise<bigint> {
+    const child = joinPath(dir, name);
+    const bound = this.handles.at(child);
+    if (bound !== undefined) {
+      return bound.fileid;
+    }
     try {
-      const child = joinPath(dir, name);
       const stats = await this.#statOf(child);
-      const entry = this.handles.bind(child, stats);
-      return stats.ino > 0 ? BigInt(Math.trunc(stats.ino)) : entry.id;
+      return this.handles.bind(child, stats).fileid;
     } catch {
       return 0n;
     }
@@ -1582,19 +1676,17 @@ export class Nfs3Session {
    * Any directory in the driver is exportable, so `127.0.0.1:/sub` works the
    * way it does on a real server. The reply also lists the auth flavors we
    * accept, which is what a client uses to pick one.
+   *
+   * There is no `MNT3ERR_NAMETOOLONG` check here, and that is not an omission:
+   * the caller reads `dirpath` as `args.string(MNT3_PATHLEN, …)`, so an
+   * over-long one never gets this far — it is an `XdrError` and the RPC layer
+   * answers `GARBAGE_ARGS` before any of this runs. The status still exists in
+   * {@link mountStatusOf}, where a driver's own `ENAMETOOLONG` reaches it.
    */
   async #mnt(dirpath: string, context: NfsRequestContext): Promise<Uint8Array> {
     const writer = new XdrWriter(128);
     const path = normalizePath(dirpath);
     try {
-      if (dirpath.length > MNT3_PATHLEN) {
-        writeMountRes(writer, {
-          status: MNT3ERR_NAMETOOLONG,
-          fh: undefined,
-          authFlavors: [],
-        });
-        return writer.bytes();
-      }
       const { entry, stats } = await this.#attrOf(path);
       if ((stats.mode & S_IFMT) !== S_IFDIR) {
         throw fsError("ENOTDIR", { syscall: "mount", path });
