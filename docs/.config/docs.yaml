@@ -2,7 +2,7 @@
 name: mountx
 url: https://mountx.vercel.app
 shortDescription: Write a filesystem in JavaScript, mount it as a real folder.
-description: Mount a JavaScript filesystem — one driver interface shaped like node:fs/promises, served to the kernel over FUSE or NFSv3, with zero runtime dependencies.
+description: Mount a JavaScript filesystem — one driver interface shaped like node:fs/promises, served to the kernel over FUSE or NFS, with zero runtime dependencies.
 
 themeColor: amber
 automd: true
@@ -48,7 +48,7 @@ landing:
       description: Every program on the machine sees an ordinary path. Shell tools, editors, build systems and agents need to know nothing about it.
     - title: One API, two transports
       icon: lucide:git-fork
-      description: FUSE where FUSE works, NFSv3 everywhere else. `mountx/auto` probes the host, picks one, and hands back that transport's own mount object.
+      description: FUSE where FUSE works, NFS everywhere else. `mountx/auto` probes the host, picks one, and hands back that transport's own mount object.
     - title: No root on Linux
       icon: lucide:user-check
       description: Unprivileged mounting through `fusermount3`, the setuid helper FUSE already ships. Serving never needs privileges on either transport.

@@ -71,7 +71,7 @@ npx mountx
 - [Mounting](https://mountx.vercel.app/guide/mounting) — `mount()`, the mount object, lifecycle and unmount.
 - [Tuning](https://mountx.vercel.app/guide/tuning) — caching, concurrency, and the measured numbers.
 - [Troubleshooting](https://mountx.vercel.app/guide/troubleshooting) — the things that will bite you, and how to recover.
-- [Transports](https://mountx.vercel.app/transports) — FUSE and NFSv3, what each costs, and how to pin one.
+- [Transports](https://mountx.vercel.app/transports) — FUSE and NFS, what each costs, and how to pin one.
 - [Reference](https://mountx.vercel.app/reference) — every entry point, option and type.
 
 ## Development
