@@ -24,9 +24,16 @@
  *
  * Two hazards do remain, and the workload respects both. Anything *synchronous*
  * against the mountpoint — `readFileSync`, `execFileSync` — blocks the one
- * thread that could reply. And `spawn(…, { cwd })` with a `cwd` inside the
- * mountpoint deadlocks in `uv_spawn`, which blocks the parent's main thread
- * until the child has `chdir`ed and exec'd.
+ * thread that could reply. And `spawn()` deadlocks whenever `uv_spawn` cannot
+ * finish without an answer from this process: a `cwd` inside the mountpoint,
+ * and — witnessed on a real mount — a *binary* on the mountpoint. `uv_spawn`
+ * holds the parent's main thread until the child has `chdir`ed and exec'd, and
+ * that child parks in `p9_client_rpc` under `do_open_execat` reading the ELF
+ * header off the very mount whose server is the thread it is blocking. Worse
+ * than a hang: the `fork` gave the child a copy of the server socket, so the
+ * connection stays open even after the server process is killed, and only a
+ * `kill -9` on the child (`p9_client_rpc` waits killably) ends it. Spawn `sh
+ * -c` and let *it* exec the mount's binary if that is what you need.
  */
 
 import { spawn } from "node:child_process";
@@ -188,6 +195,72 @@ describe.skipIf(!probe.usable)("mount9p", () => {
     }
     expect(await fs.readdir(at)).toEqual([]);
   }, 180_000);
+
+  it("keeps an unlinked file alive through its fd", async () => {
+    // The reason 9P beats NFS when both need root: opens are *stateful*, so a
+    // fid outlives the name it was opened by. An NFSv3 client would be holding
+    // a file handle the server has to keep resolving instead.
+    const { at } = await mount();
+    await fs.writeFile(join(at, "doomed"), "still here");
+    const handle = await fs.open(join(at, "doomed"), "r+");
+    try {
+      await fs.unlink(join(at, "doomed"));
+      await expect(fs.stat(join(at, "doomed"))).rejects.toMatchObject({ code: "ENOENT" });
+      const buffer = Buffer.alloc(10);
+      await handle.read(buffer, 0, 10, 0);
+      expect(buffer.toString()).toBe("still here");
+      await handle.write(Buffer.from("MORE"), 0, 4, 10);
+      expect((await handle.stat()).size).toBe(14);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    // Renaming under an open fd is the same property, one step weaker.
+    await fs.writeFile(join(at, "before"), "abc");
+    const renamed = await fs.open(join(at, "before"), "r");
+    try {
+      await fs.rename(join(at, "before"), join(at, "after"));
+      const buffer = Buffer.alloc(3);
+      await renamed.read(buffer, 0, 3, 0);
+      expect(buffer.toString()).toBe("abc");
+    } finally {
+      await renamed.close();
+    }
+  }, 60_000);
+
+  it("answers the dot entries and the locks the kernel asks for", async () => {
+    const { at } = await mount();
+    await fs.mkdir(join(at, "d"));
+    await fs.writeFile(join(at, "d/x"), "1");
+    // `v9fs_dir_readdir_dotl` never calls `dir_emit_dots`, so `.` and `..` are
+    // the server's to synthesize — and `ls -a` is what notices when they aren't.
+    const listed = await run("ls", ["-a", join(at, "d")]);
+    expect(listed.status).toBe(0);
+    expect(listed.out.trim().split("\n").sort()).toEqual([".", "..", "x"]);
+    // `Tlock`/`Tgetlock` always grant, so both syscalls have to succeed. v9fs
+    // really does put them on the wire (witnessed: 8 `Tlock` for this shape).
+    const locked = await run("flock", ["-x", "-w", "5", join(at, "d/x"), "true"]);
+    expect(locked.status).toBe(0);
+  }, 60_000);
+
+  it("keeps concurrent I/O byte-exact", async () => {
+    // The zero-copy contract, against the client that actually pipelines: v9fs
+    // has many requests in flight on one socket at once.
+    const { at } = await mount();
+    const size = 256 * 1024;
+    const buffers = Array.from({ length: 16 }, (_, index) => {
+      const buffer = Buffer.alloc(size);
+      for (let offset = 0; offset < size; offset++) {
+        buffer[offset] = (index * 13 + offset * 7) & 0xff;
+      }
+      return buffer;
+    });
+    await Promise.all(buffers.map((buffer, index) => fs.writeFile(join(at, `f${index}`), buffer)));
+    const read = await Promise.all(buffers.map((_, index) => fs.readFile(join(at, `f${index}`))));
+    expect(read.map((buffer, index) => buffer.equals(buffers[index]!))).toEqual(
+      buffers.map(() => true),
+    );
+  }, 120_000);
 
   it("refuses to stack a second mount on the same point", async () => {
     const { at } = await mount();

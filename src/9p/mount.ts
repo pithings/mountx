@@ -50,6 +50,22 @@
  * *and* the socket has emitted `close` — is this transport's unmount detection,
  * for our own `umount` and for somebody else's alike.
  *
+ * **Serving a mount and using it from the same process is mostly fine here**,
+ * unlike FUSE. This server answers from the event loop over a socket rather
+ * than from a threadpool-parked `read(2)`, so asynchronous `fs` calls against
+ * our own mountpoint cannot starve the thing that has to answer them. Two
+ * shapes still deadlock, and both are the same mistake: blocking the one thread
+ * that replies while waiting on the mount. Anything *synchronous* —
+ * `readFileSync`, `execFileSync` — is the obvious one. The other is
+ * `child_process.spawn()`, because `uv_spawn` holds the calling thread until
+ * the child has `chdir`ed and exec'd: a `cwd` inside the mountpoint hangs, and
+ * so does spawning a *binary that lives on the mountpoint*, whose child parks
+ * in `p9_client_rpc` under `do_open_execat` reading its own ELF header. That
+ * second one does not even end when the server process is killed — `fork` gave
+ * the child a copy of the server socket, so the connection outlives it — and
+ * wants a `kill -9` on the child, which works because `p9_client_rpc` waits
+ * killably. Spawn a shell and let it do the exec.
+ *
  * Teardown follows the FUSE and NFS transports' discipline exactly, and for the
  * same reasons: `umount(8)` first, the mount table is the truth rather than an
  * exit status, `umount -f` and then `-l` when the deadline passes, every spawned

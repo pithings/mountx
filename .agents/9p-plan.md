@@ -195,7 +195,7 @@ rfdno=N,wfdno=N,version=9p2000.L,msize=…` with stdio-padded fd; no mount
       `test/9p/mount.test.ts`, probe-gated (expected to RUN on this host now —
       see step 10), added to `pnpm test:root`'s file list with the skip
       self-contained. Commit.
-- [ ] **10. Real-mount witnessing (local, under sudo)** — the host loaded the
+- [x] **10. Real-mount witnessing (local, under sudo)** — the host loaded the
       9p modules mid-run (see the Tier-2 decision above). Run the Tier-2 suite
       for real: `sh test/root.sh test/9p/mount.test.ts`. If the mount fails
       because `9pnet_fd` did not autoload (EPROTONOSUPPORT-shaped failure on
@@ -418,3 +418,37 @@ test:root`). **The plan's `trans=fd` decision became `trans=unix`.**
   `src/nfs/mount.ts`'s private `run()`/`describe()`/`errorMessage()` were
   deleted: `exec.ts`'s `run()` grew stdout capture and is now the only copy, and
   the NFS suite passes unchanged.
+- 2026-07-29 step 10: **the real mount worked on the first attempt and found no
+  bugs.** `sh test/root.sh test/9p/mount.test.ts` passed as-is (6 passed, 2
+  skipped, 0.6 s) before a line of this step's code was written, and the
+  stop-and-ask branch for a missing `9pnet_fd` was indeed unreachable. QEMU-TCG
+  is unnecessary and the roadmap entry for it can go. Nothing in `src/9p/`
+  changed: no session bug, no option-string bug, no wrong test expectation — the
+  Tier-0/Tier-1 columns plus the tshark oracle had already closed the gaps a real
+  client would have found. Everything on the step's checklist was then witnessed
+  by hand and is written up in `.agents/environment.md` (mount option string,
+  `/proc/self/mounts` line, opcode census, locks, teardown, wedge behaviour).
+  Four things worth carrying:
+  - **The kernel takes `msize=131096` and proves it by not printing it.**
+    `p9_show_client_options()` omits `msize=` when it equals `DEFAULT_MSIZE`, and
+    `DEFAULT_MSIZE` is exactly what step 9 chose. `{ mountMsize: 16384 }` makes
+    it appear; the session agreed to both.
+  - **`Txattrwalk` is one per created file** (1513 against 1505 `Tlcreate` in a
+    single workload), and walk/clunk dominate everything else 9073/7562 — v9fs
+    clones a fid per operation, so `FidTable` is the hot structure, not the
+    codec. No legacy 9P2000 opcode ever arrives from a real client.
+  - **There is no `dmesg` on this host** (`dmesg_restrict=1`, no `CAP_SYSLOG`, no
+    `/dev/kmsg`), so the kernel-log evidence the step asked for does not exist
+    here. Shadowing `connection.session.handleCall` on a live mount is the better
+    substitute and is what produced the census.
+  - **A killed server does not wedge a 9P mount** (first access `ECONNRESET`,
+    then `EIO`, plain `umount` clears it) — but spawning a binary _off_ the mount
+    from the serving process does, because `uv_spawn` blocks the replying thread
+    and the `fork`ed child inherits a copy of the server socket, so even killing
+    the server does not end it. `kill -9` the child, then `umount`. That hazard
+    is now documented on `src/9p/mount.ts` and in `test/9p/mount.test.ts`'s
+    header (the only two files this step touched besides the agent docs), and
+    three cases were added to the Tier-2 suite for the properties most worth
+    regression-guarding: unlink-while-open through the fd, `.`/`..` plus
+    `flock`, and 16×256 KiB concurrent round-trips. Suite after: 9 passed,
+    2 skipped.
