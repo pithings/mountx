@@ -1,4 +1,4 @@
-import { stat as nodeStat } from "node:fs/promises";
+import { readFile, stat as nodeStat } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
 import {
@@ -18,6 +18,81 @@ import {
   splitPath,
 } from "../src/index.ts";
 import type { FsDriver } from "../src/index.ts";
+
+describe("the root export's module graph", () => {
+  /**
+   * Every specifier `path` imports, statically or dynamically, ignoring the
+   * ones inside comments and doc examples.
+   *
+   * Statements only — an `import`/`export` at the start of a line, or an
+   * `import(` anywhere — which is what keeps the many prose mentions of
+   * `node:fs` in these files' doc comments out of the answer: a JSDoc line
+   * starts with `*`, never with `import`.
+   */
+  function specifiersOf(source: string): { specifier: string; typeOnly: boolean }[] {
+    const found: { specifier: string; typeOnly: boolean }[] = [];
+    const statement =
+      /^[ \t]*(?:import|export)[ \t]+(type[ \t]+)?[^;]*?from[ \t]*["']([^"']+)["']/gm;
+    const bare = /^[ \t]*import[ \t]*["']([^"']+)["']/gm;
+    const dynamic = /\bimport\([ \t]*["']([^"']+)["']/g;
+    for (const match of source.matchAll(statement)) {
+      found.push({ specifier: match[2]!, typeOnly: match[1] !== undefined });
+    }
+    for (const match of source.matchAll(bare)) {
+      found.push({ specifier: match[1]!, typeOnly: false });
+    }
+    for (const match of source.matchAll(dynamic)) {
+      found.push({ specifier: match[1]!, typeOnly: false });
+    }
+    return found;
+  }
+
+  it("reaches no node: builtin and no package, from any file", async () => {
+    /*
+     * The root `mountx` export is the driver interface, the errors, the paths,
+     * the lock and the loopback harness — what a driver author composes with —
+     * and it is the one entry point that has to stay free of `node:`. Anything
+     * that opens a device, a socket, a process or an HTTP listener lives behind
+     * a transport subpath, where reaching for `node:net` or `node:child_process`
+     * is what the subpath is *for*. The comment in `src/index.ts` says exactly
+     * this; without a check it holds only until the first convenience
+     * re-export, which is the kind of thing that regresses silently.
+     *
+     * Checked on the source rather than on `dist/`, because `pnpm test` runs
+     * with no build in front of it and a stale `dist/` would answer for a tree
+     * nobody is editing. `obuild` bundles `src/index.ts` into a single
+     * `dist/index.mjs`, so the graph walked here is exactly what ends up in the
+     * artifact — verified by hand against a real build.
+     */
+    const walked = new Set<string>();
+    const offenders: string[] = [];
+
+    const walk = async (url: URL): Promise<void> => {
+      const key = url.pathname;
+      if (walked.has(key)) return;
+      walked.add(key);
+      const source = await readFile(url, "utf8");
+      for (const { specifier, typeOnly } of specifiersOf(source)) {
+        if (specifier.startsWith(".")) {
+          await walk(new URL(specifier, url));
+          continue;
+        }
+        // Type-only imports are erased, so they cost nothing at runtime; a
+        // value import of anything that is not a sibling file is either a
+        // `node:` builtin or a dependency, and the root export may have
+        // neither.
+        if (!typeOnly) offenders.push(`${key.split("/src/")[1]}: ${specifier}`);
+      }
+    };
+
+    await walk(new URL("../src/index.ts", import.meta.url));
+
+    expect(offenders).toEqual([]);
+    // And the walk actually walked: a regex that stopped matching would pass
+    // the assertion above without reading a thing.
+    expect(walked.size).toBeGreaterThanOrEqual(6);
+  });
+});
 
 describe("paths", () => {
   it("normalizes to absolute POSIX paths", () => {
