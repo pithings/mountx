@@ -75,24 +75,42 @@ const LEN_SIZE = 4;
 const DEFAULT_MOUNT_OPTIONS: readonly string[] = [];
 
 /**
- * This file's sibling relay, in whichever form is on disk.
+ * Where the relay is, relative to this module, in each layout it can be in.
  *
- * `.mjs` first because that is the built package (`dist/exec/userns-relay.mjs`
- * beside `dist/exec/index.mjs`), `.ts` second because that is the source tree,
- * where Node's own type stripping runs it directly. `userns.ts` is bundled
- * *into* `dist/exec/index.mjs`, so the sibling relationship survives the build
- * and this resolves the same way from both — the trick `src/cli/index.ts` uses
- * to find the README.
+ * The relay is spawned rather than imported, so it has to be a file on disk
+ * with a path — which makes it the one thing here that has to survive the
+ * build as itself. It is a build entry for exactly that reason, landing at
+ * `dist/exec/userns-relay.mjs`; what moves underneath it is *this* file:
+ *
+ * - `src/exec/userns.ts` — the source tree, where the relay is a sibling `.ts`
+ *   and Node's own type stripping runs it directly.
+ * - `dist/_chunks/userns.mjs` — the built package. `src/exec/index.ts` reaches
+ *   this module through `await import()`, which is the whole point of the
+ *   mechanism split, and obuild answers a dynamic import with a *chunk* rather
+ *   than by inlining it. So the sibling relationship does not survive, and
+ *   `dist/exec/` is one directory over.
+ *
+ * Both are checked, cheaply, once per call. A third layout would announce
+ * itself as the thrown error below rather than as a mystery `ENOENT` from
+ * `spawn`, which is what this is for.
  */
+const RELAY_CANDIDATES = [
+  "userns-relay.ts",
+  "userns-relay.mjs",
+  "../exec/userns-relay.mjs",
+] as const;
+
+/** The relay on disk, in whichever layout this module was loaded from. */
 function relayPath(): string {
-  for (const name of ["userns-relay.mjs", "userns-relay.ts"]) {
+  for (const name of RELAY_CANDIDATES) {
     const candidate = new URL(name, import.meta.url).pathname;
     if (existsSync(candidate)) {
       return candidate;
     }
   }
   throw new Error(
-    "mountx: the userns relay is missing — `userns-relay` should sit beside this module, and " +
+    "mountx: the userns relay is missing — `userns-relay` is spawned rather than imported, so " +
+      "it has to exist as a file next to this module or under a sibling `exec/` directory, and " +
       "an install or bundle that dropped it cannot run a command in a namespace",
   );
 }
