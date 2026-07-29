@@ -256,10 +256,13 @@ rather than by accident.
 - **`FUSE_PASSTHROUGH`** (Linux 6.9+) — lets the kernel bypass the daemon
   for read/write on a backing fd; relevant for overlay-shaped drivers.
 - **`FUSE_READDIRPLUS_AUTO` default.** Benchmarked as actively costing the
-  readdirplus win: a cold 1000-entry `ls -l` gets 10.3k entries/s with it
-  on vs. 25.0k (the predicted 2.4×) with it off, at a ~20% cost to a
-  names-only `readdir`. Not changed in v1 — see `.agents/benchmarks.md` for
-  the numbers — but it is the best-supported open question in the repo.
+  readdirplus win: a cold 1000-entry `ls -l` gets 9.6k entries/s with it
+  on vs. 25.0k (the predicted 2.4×, measured 2.6×) with it off, at a 1.56×
+  cost to a names-only `readdir`. Measured on two trees in one sitting
+  (2.6× and 2.47×), so the finding replicates; the cost side grew from
+  1.32× because `7185f33` made the plain-`READDIR` path 1.20× faster and
+  left the plus path alone. Not changed in v1 — see `.agents/benchmarks.md`
+  for the numbers — but it is the best-supported open question in the repo.
 - **unstorage driver adapter** — deferred per the drivers-in-v1 decision
   above; would make 30+ storage backends mountable with no new code.
 - **`mountx/drivers/s3`** — an `FsDriver` over a real S3-compatible bucket,
