@@ -270,10 +270,21 @@ rather than by accident.
 - **Negative-entry caching.** Nothing currently populates FUSE's negative
   dentry cache for lookups that miss, so a repeated failed `LOOKUP` always
   reaches the driver.
-- **Handle-table / file-handle growth bound.** NFSv3 has no `FORGET`, so a
-  handle entry lives as long as the server — a real, bounded leak (one per
-  path the client ever named), accepted as the honest v1 tradeoff. A
-  generation-stamped LRU is the fix if a workload needs bounded memory.
+- **Handle-table growth bound.** Neither NFS version has a `FORGET`, so
+  nothing tells the server a client is done with a handle. Half of this is
+  now closed: `FileHandleTable.#detachPath` drops an entry once its last path
+  is detached, since such an entry could only ever be reached by `decode()` →
+  `pathOf()` and that always threw `ESTALE` — ids come off a monotonic
+  counter and are never reused, so the same handle still answers `ESTALE`,
+  from `decode()` ("unknown file handle") one step earlier. Create/delete
+  churn under a mount therefore no longer grows the table without bound.
+  What is left is genuinely bounded: **one entry per path a client currently
+  has a name for**, held for the life of the server however long ago the
+  client looked, plus the root entry, which is exempt from eviction because
+  `PUTROOTFH`/`PUTPUBFH`/`MNT` encode it from a field rather than from a
+  lookup. A generation-stamped LRU is still the fix if a workload needs a
+  bound on _that_ — it is the only remaining growth, and it is the one an
+  LRU can serve without breaking a live client.
 - **Set-gid inheritance and caller credentials in the driver interface.** A
   new entry in a set-gid directory should take its parent's group; more
   generally, supplementary groups and per-call caller credentials want to
