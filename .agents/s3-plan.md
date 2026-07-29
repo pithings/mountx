@@ -165,7 +165,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       via the meta header, `sync` against a tree with an empty directory; plus
       a curl presigned-URL GET/PUT case. Verify: runs green here, skips clean
       when the binary is hidden from PATH.
-- [ ] **10. Docs + bookkeeping (sonnet)** — `docs/2.transports/` page for S3
+- [x] **10. Docs + bookkeeping (sonnet)** — `docs/2.transports/` page for S3
       (guide prose first, full export surface below, same as FUSE/NFS pages;
       explicitly: gateway not mount, why it's outside `mountx/auto`, auth
       posture, ETag/mtime/empty-dir semantics, the `NotImplemented` boundary);
