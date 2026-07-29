@@ -77,6 +77,7 @@ import {
   P9_LOCK_TYPE_UNLCK,
   P9_MIN_MSIZE,
   P9_NOFID,
+  P9_QTSYMLINK,
   P9_RATTACH,
   P9_RCLUNK,
   P9_RFLUSH,
@@ -145,7 +146,7 @@ import {
   V9FS_MAGIC,
   messageName,
 } from "./constants.ts";
-import { FidTable, walkStep, type Fid, type FidOpenState } from "./fids.ts";
+import { FidTable, qidVersion, walkStep, type Fid, type FidOpenState } from "./fids.ts";
 import {
   P9DirentPacker,
   encodeMessage,
@@ -1129,12 +1130,72 @@ export class P9Session {
    *
    * There is no `st_ino` on this wire; see the module docs. The mask bit named
    * `INO` describes the qid, which is always filled.
+   *
+   * **An open fid is answered as an `fstat`**; see {@link #fidAttributes}.
    */
   async #getattr(header: P9Header, request: Tgetattr): Promise<Uint8Array> {
     const entry = this.fids.require(request.fid);
-    const stats = await this.#statOf(entry.path);
-    const attr = this.#attrOf(this.fids.qidFor(stats, entry.path), stats, request.requestMask);
+    const { qid, stats } = await this.#fidAttributes(entry);
+    const attr = this.#attrOf(qid, stats, request.requestMask);
     return this.#framed(header, P9_RGETATTR, (writer) => writeRgetattr(writer, attr), 192);
+  }
+
+  /**
+   * What a fid's attributes are, and which identity describes them.
+   *
+   * A fid is the 9P spelling of an open file description: it keeps naming its
+   * file after the name it was opened from is gone, and after another file has
+   * taken that name. So a fid holding a driver handle is answered from the
+   * **handle** — `fstat`, not `stat` — which is what lets `unlink` on an open
+   * file keep working (`Tread` already serves it, since it holds the same
+   * handle) and is the one thing this transport has over NFSv3's statelessness.
+   *
+   * Two rules keep that from corrupting identity, and both were reproduced
+   * before they were rules.
+   *
+   * - **The identity is pinned, never re-derived.** It comes from
+   *   {@link FidOpenState.qid}, snapshotted by the `Tlopen`/`Tlcreate` that
+   *   opened this fid. {@link FidTable.qidFor} does not merely read the
+   *   path→identity map, it *writes* it, so calling it here would re-attach an
+   *   identity to a path `#released` has just detached — and the next file
+   *   created at that name would inherit the dead one's `qid.path`, which is
+   *   exactly the aliasing `release()` exists to prevent. `src/fuse/session.ts`
+   *   has the same discipline from the other side: a nodeid is fixed at
+   *   `LOOKUP` and never re-derived from a later `GETATTR`. Only `version` is
+   *   recomputed, because it is the file's mtime — a change token rather than
+   *   an identity — and a pinned one would hide every write from the client's
+   *   cache check.
+   * - **A symlink is answered from its path.** `Tlopen` on a fid naming a
+   *   symlink opens the link's *target* (only a directory is special-cased), so
+   *   its handle describes a different file than the fid does: reporting from
+   *   it would give the target's mode and size under the link's qid.
+   *
+   * Everything else — an unopened fid, a directory (which opens nothing), a
+   * `handles: false` fid, and a driver whose handles answer `ENOSYS` — resolves
+   * the path, as it always did. `qidFor` is therefore only ever fed attributes
+   * that came *from* that path, which is the invariant underneath both rules.
+   */
+  async #fidAttributes(entry: Fid<string>): Promise<{ qid: P9Qid; stats: StatsLike }> {
+    const open = entry.open;
+    const pinned = open?.qid;
+    const handle = open?.handle;
+    if (handle !== undefined && pinned !== undefined && (pinned.type & P9_QTSYMLINK) === 0) {
+      let stats: StatsLike | undefined;
+      try {
+        stats = await handle.stat();
+      } catch (error) {
+        // A driver whose handles cannot stat has nothing to add and the path
+        // answers instead. Any *other* failure is this fid's real answer.
+        if ((error as { code?: string }).code !== "ENOSYS") {
+          throw error;
+        }
+      }
+      if (stats !== undefined) {
+        return { qid: { type: pinned.type, version: qidVersion(stats), path: pinned.path }, stats };
+      }
+    }
+    const stats = await this.#statOf(entry.path);
+    return { qid: this.fids.qidFor(stats, entry.path), stats };
   }
 
   #attrOf(qid: P9Qid, stats: StatsLike, requestMask: bigint): Rgetattr {
@@ -1670,7 +1731,11 @@ export class P9Session {
       };
     }
     entry.iounit = 0;
+    // Derived from the *final* `stats`, so an `O_TRUNC` open pins the file it
+    // leaves behind rather than the one it emptied — and pinned on the open
+    // state, which is what `Tgetattr` answers with once the path is gone.
     const qid = this.fids.qidFor(stats, entry.path);
+    entry.open.qid = qid;
     return this.#framed(
       header,
       P9_RLOPEN,
@@ -1736,7 +1801,14 @@ export class P9Session {
       throw error;
     }
     entry.path = path;
-    entry.open = { flags: reopenFlags(flags), handle: keep ? handle : undefined, directory: false };
+    entry.open = {
+      flags: reopenFlags(flags),
+      handle: keep ? handle : undefined,
+      directory: false,
+      // The qid this create just computed, pinned for the life of the open —
+      // the identity `Tgetattr` answers with once the path stops resolving.
+      qid,
+    };
     entry.iounit = 0;
     return this.#framed(
       header,

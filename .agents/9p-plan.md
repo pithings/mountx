@@ -153,7 +153,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       Remaining carry-forward: call `FidTable.release(path)` on
       Tremove/Tunlinkat and on create-over so a recreated path never
       inherits the dead file's identity. Extend session tests. Commit.
-- [ ] **6. Conformance column + session fuzz** — `test/9p/conformance.test.ts`
+- [x] **6. Conformance column + session fuzz** — `test/9p/conformance.test.ts`
       runs `test/conformance.ts` through the JS client against `P9Session` over
       memory + node-fs (rooted oracle), like the NFS column. A session fuzz
       file (hostile frames, bad fids, bad tags, flush races) in the spirit of
@@ -308,3 +308,22 @@ deferred)
   survives with no fid pointing at it (deliberate; one line in the docs
   page). Twrite is unclamped at session level (frame assembler bounds it
   in real transports; harness-only reachability, documented).
+- 2026-07-29 step 6: conformance column (three targets: memory with
+  handles, memory handles:false, rooted node:fs oracle with errors:"host";
+  adapter `p9Driver` in client.ts walks a fresh fid per call, resolves
+  symlinks client-side with the VFS's 40-link bound, chunks I/O at msize)
+  - session-fuzz suite (ledger invariant `requests === replies + dropped`).
+    The column found a real bug: Tgetattr ignored the open handle, so an
+    unlinked-but-open file failed to stat. The first fix REGRESSED — statting
+    through the handle fed handle-derived stats to `qidFor`, rebinding a
+    symlink's path to its target's identity and undoing release-on-unlink
+    (qid churn under a held-open fd). Final shape: the qid is pinned on
+    `FidOpenState` at Tlopen/Tlcreate (post-O_TRUNC stats), `qidFor` is only
+    ever fed path-derived stats, symlink fids answer from the path, version
+    stays a recomputed change token. Verifier round 2 PASS with mutation
+    testing — each of the four behaviors fails exactly its own test when
+    broken. Pre-existing quirk logged, not fixed: with useDriverIno, an
+    identity is forgotten when its last _bound_ name is released even if a
+    hardlink made behind the server's back still exists (`#link` binds, but
+    a driver-side link does not). Step-13 follow-up recorded: `test/matrix.ts`
+    COLUMNS needs the 9p conformance entry.

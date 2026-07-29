@@ -75,7 +75,7 @@ import { DEFAULT_MSIZE, P9Session, type P9SessionOptions } from "../../src/9p/se
 import type { P9Writer } from "../../src/9p/wire.ts";
 import { O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } from "../../src/fuse/constants.ts";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
-import { ERRNO_CODES } from "../../src/errors.ts";
+import { ERRNO_CODES, fsError } from "../../src/errors.ts";
 import { createLoopback, type Loopback } from "../../src/harness.ts";
 import {
   S_IFCHR,
@@ -185,6 +185,30 @@ function gated(): { driver: FsDriver; block: () => void; release: () => void } {
 function pathOnly(): FsDriver {
   const base = createMemoryDriver();
   return { ...base, capabilities: { ...base.capabilities, handles: false } };
+}
+
+/**
+ * A memory driver whose open handles refuse to `stat()`.
+ *
+ * `FileHandleLike.stat` is not optional, so "no `fstat`" can only ever be a
+ * driver that has one and answers `ENOSYS` — which is the case the fallback in
+ * `#getattr` has to tell apart from a handle that failed for a real reason.
+ */
+function handleStatFails(error: unknown): FsDriver {
+  const memory = createMemoryDriver();
+  return {
+    ...memory,
+    async open(path, flags, mode): Promise<FileHandleLike> {
+      const handle = await memory.open!(path, flags, mode);
+      return {
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+        write: (buffer, offset, length, position) => handle.write(buffer, offset, length, position),
+        stat: () => Promise.reject(error),
+        truncate: (length) => handle.truncate(length),
+        close: () => handle.close(),
+      };
+    },
+  };
 }
 
 /** The two open models every I/O test runs against. */
@@ -605,6 +629,126 @@ describe("Tgetattr", () => {
     expect([dir!.type, file!.type, link!.type]).toEqual([P9_QTDIR, P9_QTFILE, P9_QTSYMLINK]);
     // A fid on a symlink describes the link, never its target.
     expect((await client.getattr(3)).mode & S_IFMT).toBe(S_IFLNK);
+  });
+
+  /**
+   * `Tgetattr` is `fstat`, and a fid outlives the name it was opened from.
+   *
+   * Found by the conformance column: the suite's "keeps an open handle readable
+   * after unlink" case reads fine through the fid — `Tread` uses the handle —
+   * and then asks for the size, which a path-based stat cannot answer because
+   * the path is gone. Answering it through the handle is what makes 9P's
+   * stateful opens worth the `["fuse", "9p", "nfs"]` preference order.
+   */
+  it("falls back to the fid's handle, so an unlinked open file still answers", async () => {
+    const { client, fs } = await serve();
+    await fs.writeFile("/doomed", "still here");
+    await client.walk(0, 1, ["doomed"]);
+    // A second fid on the same file, deliberately left unopened: it has only
+    // the path, and the path is what the removal takes away.
+    await client.walk(0, 2, ["doomed"]);
+    await client.lopen(1, O_RDONLY);
+    await client.unlinkat(0, "doomed", 0);
+
+    await expect(fs.stat("/doomed")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(decode(await client.read(1, 0n))).toBe("still here");
+    expect((await client.getattr(1)).size).toBe(10n);
+    expect(await codeOfRejection(client.getattr(2))).toBe("ENOENT");
+  });
+
+  /**
+   * The fallback answers with the identity the open pinned, and binds nothing.
+   *
+   * Two ways to get this wrong, one for each `useDriverIno` mode, and both are
+   * the same mistake: `qidFor` *writes* the path→identity map, so calling it
+   * with the open file's attributes re-attaches an identity to a path that
+   * `#released` has just detached. With the driver's `(dev, ino)` trusted, the
+   * open fid's own `qid.path` churns under a client that derives `i_ino` from
+   * it; without it, the next file created at that name inherits the dead one's
+   * identity and the client serves the old file's cached pages for it.
+   */
+  for (const useDriverIno of [true, false]) {
+    it(`keeps an unlinked open fid's identity to itself (useDriverIno: ${useDriverIno})`, async () => {
+      const { client, fs } = await serve(createMemoryDriver(), { useDriverIno });
+      await fs.writeFile("/doomed", "still here");
+      const [before] = await client.walk(0, 1, ["doomed"]);
+      await client.lopen(1, O_RDONLY);
+      await client.unlinkat(0, "doomed", 0);
+
+      const attr = await client.getattr(1);
+      expect(attr.size).toBe(10n);
+      expect(attr.qid.path).toBe(before!.path);
+
+      // The name is free, so a file created at it is a different file — which
+      // is what `FidTable.release` is for and what a re-bind would have undone.
+      await fs.writeFile("/doomed", "new");
+      expect((await client.walk(0, 2, ["doomed"]))[0]!.path).not.toBe(before!.path);
+      // And none of it moved the open fid.
+      expect((await client.getattr(1)).qid.path).toBe(before!.path);
+    });
+  }
+
+  /**
+   * A `Tlopen` on a symlink opens its **target** — only a directory is special
+   * cased — so the handle is a handle on a different file than the fid names.
+   * Answering the fid from it would report the target's mode and bind the
+   * link's path to the target's identity: one `qid.path`, two files, which
+   * `fids.ts` calls the worse half of getting identity wrong.
+   */
+  it("answers a fid on a symlink from the link, not from what the open followed", async () => {
+    const { client, fs } = await serve();
+    await fs.writeFile("/target", "payload");
+    await fs.symlink("target", "/link");
+    const [link] = await client.walk(0, 1, ["link"]);
+    const [target] = await client.walk(0, 2, ["target"]);
+    expect(link!.type).toBe(P9_QTSYMLINK);
+    expect(link!.path).not.toBe(target!.path);
+
+    await client.lopen(1, O_RDONLY);
+    const attr = await client.getattr(1);
+    expect(attr.mode & S_IFMT).toBe(S_IFLNK);
+    expect(attr.size).toBe(6n);
+    expect(attr.qid.path).toBe(link!.path);
+
+    // And the map still says the two are different files, in both directions.
+    const [again] = await client.walk(0, 3, ["link"]);
+    expect(again!.path).toBe(link!.path);
+    expect(again!.type).toBe(P9_QTSYMLINK);
+    expect((await client.getattr(2)).qid.path).toBe(target!.path);
+  });
+
+  it("re-resolves the path for a fid with no handle to stat", async () => {
+    // A `handles: false` driver keeps nothing per open, so the path is the only
+    // answer there is — and a directory fid never opened a handle at all.
+    const { client, fs } = await serve(pathOnly());
+    await fs.writeFile("/file", "hello");
+    await client.walk(0, 1, ["file"]);
+    await client.lopen(1, O_RDONLY);
+    expect((await client.getattr(1)).size).toBe(5n);
+    await client.walk(0, 2, []);
+    expect((await client.getattr(2)).mode & S_IFMT).toBe(0o40_000);
+  });
+
+  it("reports the path's own error when the handle cannot stat either", async () => {
+    // `ENOSYS` is a driver with no `fstat` to offer, so the answer is the one
+    // the path gave: the file really is gone.
+    const { client, fs } = await serve(handleStatFails(fsError("ENOSYS", { syscall: "fstat" })));
+    await fs.writeFile("/doomed", "x");
+    await client.walk(0, 1, ["doomed"]);
+    await client.lopen(1, O_RDONLY);
+    await client.unlinkat(0, "doomed", 0);
+    expect(await codeOfRejection(client.getattr(1))).toBe("ENOENT");
+  });
+
+  it("reports the handle's own error when it has one", async () => {
+    // Anything else is this fid's real answer and goes out as itself, rather
+    // than being flattened into the path's `ENOENT`.
+    const { client, fs } = await serve(handleStatFails(fsError("EACCES", { syscall: "fstat" })));
+    await fs.writeFile("/doomed", "x");
+    await client.walk(0, 1, ["doomed"]);
+    await client.lopen(1, O_RDONLY);
+    await client.unlinkat(0, "doomed", 0);
+    expect(await codeOfRejection(client.getattr(1))).toBe("EACCES");
   });
 
   it("gives hardlinks one qid.path, or two when the driver is not trusted for it", async () => {

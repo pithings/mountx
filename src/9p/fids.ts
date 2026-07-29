@@ -124,6 +124,29 @@ export interface FidOpenState {
    * is not. The session enforces it; the table only remembers which it was.
    */
   directory: boolean;
+  /**
+   * The qid this fid was opened on, pinned for the life of the open.
+   *
+   * An open fid names a *file*, and it keeps naming it after its path stops
+   * resolving — the whole point of a stateful open. So when the session has to
+   * answer a `Tgetattr` the path can no longer answer (an unlinked file being
+   * read through the fid that holds it open), the identity in the reply comes
+   * from here rather than from {@link FidTable.qidFor}: re-deriving one would
+   * mean *binding* an identity to a path that no longer exists, undoing the
+   * {@link FidTable.release} that removal performed and letting the next file
+   * created at that name inherit the dead one's `qid.path`.
+   *
+   * Only `type` and `path` are read from it. `version` is a change token rather
+   * than an identity — it is the file's mtime — so it is recomputed from
+   * whatever attributes the reply carries, and a client's cache check still
+   * sees writes. `type` is safe to pin because nothing turns a file into a
+   * directory.
+   *
+   * `undefined` only for a state built by hand: every one this session creates
+   * carries the qid its `Tlopen`/`Tlcreate` already computed, and a state
+   * without one simply falls back to the path, as before.
+   */
+  qid?: P9Qid;
 }
 
 /**
