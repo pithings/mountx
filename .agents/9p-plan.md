@@ -107,12 +107,15 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       Tests `test/9p/protocol.test.ts` (golden, all-distinct) +
       `test/9p/fuzz.test.ts` (random struct round-trips + hostile truncated/
       oversized frames never throw uncaught). Commit.
-- [ ] **3. Fid table** — `src/9p/fids.ts`: fid → path + open state (driver
+- [x] **3. Fid table** — `src/9p/fids.ts`: fid → path + open state (driver
       `FileHandleLike` or path-mode) + iounit + per-fid readdir cursor keyed by
-      offset (re-`readdir` on offset 0 or unknown offset, like FUSE paging).
-      Walk clones fids; clunk/remove release; qid synthesis from `StatsLike`
-      (type from mode; path from ino — respect `useDriverIno` option parity
-      later). `..` clamps at the root (`src/path.ts` semantics). Tests
+      offset (offset 0 resnapshots; an unknown non-zero offset is `EINVAL` —
+      offsets are opaque cookies we mint, guessing would skip or repeat files).
+      Walk clones fids; clunk/remove release; qid identity keyed on the
+      `(dev, ino)` pair with `qid.path` always allocated from our own counter
+      (`useDriverIno` selects the identity key only; the driver's `ino` goes
+      out in `Rgetattr`, not `qid.path` — the FUSE nodeid/`st_ino` split).
+      `..` clamps at the root (`src/path.ts` semantics). Tests
       `test/9p/fids.test.ts`. Commit.
 - [ ] **4. Session core + JS client** — `src/9p/session.ts`: `P9Session
 (driver, options)` with `handleCall(bytes): Promise<Uint8Array | null>`
@@ -139,8 +142,15 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       rename**, subtree fid-path remap on rename like `InodeTable` does),
       xattrwalk/xattrcreate → ENOTSUP (Linux clients probe `security.*` on
       write — the refusal path is hot, keep it cheap), lock/getlock per the
-      grant-all decision, legacy opcodes → ENOTSUP. Extend session tests.
-      Commit.
+      grant-all decision, legacy opcodes → ENOTSUP. Carry-forwards from the
+      step-3 verification: fill `Rgetattr.st_ino` from `stats.ino` with a
+      fallback to the fid's `qid.path` when `ino === 0` (the exact FUSE
+      pattern, `src/fuse/session.ts` attr fill) and document what it reports
+      under `useDriverIno: false`; call `FidTable.release(path)` on
+      Tremove/Tunlinkat and on create-over so a recreated path never inherits
+      the dead file's identity; refuse Twalk from an OPEN fid (`EINVAL` — 9P
+      forbids it, the table leaves enforcement to the session). Extend session
+      tests. Commit.
 - [ ] **6. Conformance column + session fuzz** — `test/9p/conformance.test.ts`
       runs `test/conformance.ts` through the JS client against `P9Session` over
       memory + node-fs (rooted oracle), like the NFS column. A session fuzz
@@ -245,3 +255,20 @@ deferred)
   has no `p9_client_auth` — Tauth layout rests on diod alone; decoded anyway
   so the session can refuse it politely. Nits carried: wire.ts scalar writers
   mask silently; assembler O(n²) vs byte-dribblers (same shape as rpc.ts).
+- 2026-07-29 step 3: `fids.ts` (fid lifecycle, subtree remap, readdir
+  cursors, qid identity) + 50 tests. Verifier round 1 FAILED: qid.path
+  dropped `dev` (cross-device ino collapse — v9fs keys its inode cache on
+  qid.path), a driver `ino ≥ 2^63` aliased the synthesized range, no release
+  API (unbounded memo + recreated paths inheriting dead identities), and
+  rewind-to-0 left stale cursors resumable. Fix round removed the dual space
+  entirely — qid.path is always allocated, identity keyed `(dev, ino)`
+  InodeTable-style, `release()` added, cursors invalidated on any path
+  identity change. Round 2 confirmed all fixes but found the fix round had
+  introduced the repo's only TS parameter property, which plain `node`
+  cannot load in strip-only mode (green under vitest/tsc — caught only by
+  running `node -e 'import(...)'`); fixed inline by the orchestrator with
+  the verifier's exact repro re-run, plus the lost `Number.isFinite` guard
+  in `identityKey`. Step-5 carry-forwards written into the plan: Rgetattr
+  st_ino fill, `release()` on remove/create-over, refuse walk-from-open-fid.
+  Lesson for later steps: verify with plain `node`, not only the test
+  runner.
