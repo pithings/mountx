@@ -8,11 +8,13 @@ import {
   ERRNO_CODES,
   errnoOf,
   fsError,
+  isNormalizedPath,
   isPathInside,
   isFsError,
   joinPath,
   normalizePath,
   resolveCapabilities,
+  resolvePath,
   splitPath,
 } from "../src/index.ts";
 import type { FsDriver } from "../src/index.ts";
@@ -44,6 +46,137 @@ describe("paths", () => {
     expect(isPathInside("/a", "/a")).toBe(true);
     expect(isPathInside("/ab", "/a")).toBe(false);
     expect(isPathInside("/a", "/")).toBe(true);
+  });
+
+  it("recognizes an already-normalized path", () => {
+    for (const path of ["/", "/a", "/a/b/c", "/..a", "/a../b", "/...", "/a.b", "/.a"]) {
+      expect(isNormalizedPath(path)).toBe(true);
+    }
+    for (const path of ["", "a", "a/b", "/a/", "//a", "/a//b", "/.", "/..", "/a/./b", "/a/b/.."]) {
+      expect(isNormalizedPath(path)).toBe(false);
+    }
+  });
+
+  it("still rewrites everything the fast path must not accept", () => {
+    for (const [input, expected] of [
+      ["", "/"],
+      ["a", "/a"],
+      ["/a/", "/a"],
+      ["//a", "/a"],
+      ["/a//b", "/a/b"],
+      ["/a/./b", "/a/b"],
+      ["/a/..", "/"],
+      ["/.", "/"],
+      ["/..", "/"],
+      ["/a/b/..", "/a"],
+      ["/a/b/.", "/a/b"],
+    ] as const) {
+      expect(normalizePath(input)).toBe(expected);
+    }
+  });
+
+  it("normalizes and splits in one call", () => {
+    expect(resolvePath("/a/b")).toEqual({ path: "/a/b", segments: ["a", "b"] });
+    expect(resolvePath("/")).toEqual({ path: "/", segments: [] });
+    expect(resolvePath("")).toEqual({ path: "/", segments: [] });
+    expect(resolvePath("a/../b/./c/")).toEqual({ path: "/b/c", segments: ["b", "c"] });
+    expect(resolvePath("/../escape")).toEqual({ path: "/escape", segments: ["escape"] });
+  });
+
+  it("agrees with normalizePath and splitPath on every input", () => {
+    for (const input of [
+      "",
+      "/",
+      "a",
+      "/a",
+      "/a/b/c",
+      "//a//b//",
+      "/a/./b/../c",
+      "/../../etc/passwd",
+      "/a/..",
+      "/...",
+      "/..a/b..",
+    ]) {
+      const resolved = resolvePath(input);
+      expect(resolved.path).toBe(normalizePath(input));
+      expect(resolved.segments).toEqual(splitPath(input));
+      // The array is the caller's: drivers `shift()` and index into it.
+      resolved.segments.push("mutable");
+      expect(resolvePath(input).segments).toEqual(splitPath(input));
+    }
+  });
+
+  it("matches the unoptimized algorithm on a generated corpus", () => {
+    /*
+     * The split-and-rejoin `normalizePath` was before the fast path landed.
+     * Nothing can observe the difference between it and the current one by
+     * running them — the fast path is value-preserving on purpose, and a
+     * primitive string has no observable reference identity — so what is
+     * pinned here is the two properties that *can* go wrong: the predicate
+     * deciding a path is normal when it is not (which would return an
+     * unnormalized path from `normalizePath`), and the helpers' shortcuts
+     * disagreeing with the long way round.
+     */
+    const reference = (path: string): string => {
+      const kept: string[] = [];
+      for (const segment of path.split("/")) {
+        if (segment === "" || segment === ".") continue;
+        if (segment === "..") {
+          kept.pop();
+          continue;
+        }
+        kept.push(segment);
+      }
+      return kept.length === 0 ? "/" : `/${kept.join("/")}`;
+    };
+
+    const tokens = ["a", "b", "", ".", "..", "...", "..a", "a.."];
+    const bodies = [""];
+    for (let depth = 0; depth < 3; depth++) {
+      for (const body of bodies.slice()) {
+        for (const token of tokens) bodies.push(body === "" ? token : `${body}/${token}`);
+      }
+    }
+
+    let normalized = 0;
+    for (const body of bodies) {
+      for (const input of [body, `/${body}`, `${body}/`, `/${body}/`]) {
+        const expected = reference(input);
+        expect(normalizePath(input), input).toBe(expected);
+        // The predicate is the fast path's only decision, and it must agree
+        // exactly with "the long way round changed nothing".
+        expect(isNormalizedPath(input), input).toBe(expected === input);
+        if (isNormalizedPath(input)) normalized++;
+
+        const resolved = resolvePath(input);
+        expect(resolved.path, input).toBe(expected);
+        expect(resolved.segments, input).toEqual(splitPath(input));
+
+        const parent = reference(`${expected}/..`);
+        expect(dirname(input), input).toBe(parent);
+        expect(basename(input), input).toBe(
+          expected === "/" ? "/" : expected.slice(parent === "/" ? 1 : parent.length + 1),
+        );
+      }
+    }
+    // Guard against the corpus degenerating into only one side of the branch.
+    expect(normalized).toBeGreaterThan(100);
+    expect(bodies.length * 4 - normalized).toBeGreaterThan(100);
+  });
+
+  it("takes the same fast path in dirname and basename", () => {
+    for (const [input, dir, base] of [
+      ["/", "/", "/"],
+      ["/a", "/", "a"],
+      ["/a/b", "/a", "b"],
+      ["/a/b/c", "/a/b", "c"],
+      ["/a//b/", "/a", "b"],
+      ["/a/b/..", "/", "a"],
+      ["", "/", "/"],
+    ] as const) {
+      expect(dirname(input)).toBe(dir);
+      expect(basename(input)).toBe(base);
+    }
   });
 });
 
@@ -93,8 +226,10 @@ describe("harness", () => {
   };
 
   it("infers capabilities from the methods a driver has", () => {
-    // `handles` and `atomicRename` cannot be inferred from a driver's shape,
-    // so an undeclared driver gets the conservative answer.
+    // `handles`, `atomicRename` and `readOnly` cannot be inferred from a
+    // driver's shape, so an undeclared driver gets the conservative answer —
+    // and for `readOnly` the conservative answer is `false`: nothing about a
+    // missing `unlink` promises that every mutating call answers `EROFS`.
     expect(resolveCapabilities(minimal)).toMatchObject({
       handles: false,
       atomicRename: false,
@@ -104,7 +239,7 @@ describe("harness", () => {
       times: false,
       truncate: false,
       statfs: false,
-      readOnly: true,
+      readOnly: false,
       extensions: [],
     });
     expect(resolveCapabilities(createMemoryDriver())).toMatchObject({
@@ -120,6 +255,39 @@ describe("harness", () => {
     });
   });
 
+  it("takes readOnly only from a declaration", () => {
+    // A driver with none of the three name-level mutators still has `open`,
+    // and can have `truncate` and `chmod` — so it is not read-only unless it
+    // says it is, and one that says it is stays so however many methods it has.
+    expect(resolveCapabilities({ ...minimal, truncate: async () => {} }).readOnly).toBe(false);
+    expect(resolveCapabilities({ ...minimal, capabilities: { readOnly: true } }).readOnly).toBe(
+      true,
+    );
+    expect(
+      resolveCapabilities({
+        ...minimal,
+        capabilities: { readOnly: true },
+        unlink: async () => {},
+        mkdir: async () => undefined,
+        rename: async () => {},
+      }).readOnly,
+    ).toBe(true);
+  });
+
+  it("resolves the extension namespace from the driver's own keys", () => {
+    expect(resolveCapabilities(minimal).extensions).toEqual([]);
+    expect(
+      resolveCapabilities({ ...minimal, mountx: { mknod: async () => {} } }).extensions,
+    ).toEqual(["mknod"]);
+    expect(
+      resolveCapabilities({
+        ...minimal,
+        mountx: { mknod: async () => {} },
+        capabilities: { extensions: ["utimens"] },
+      }).extensions,
+    ).toEqual(["utimens"]);
+  });
+
   it("lets a driver declare capabilities its methods contradict", () => {
     const lying: FsDriver = {
       ...minimal,
@@ -133,6 +301,29 @@ describe("harness", () => {
     const fs = createLoopback(minimal);
     await expect(fs.symlink("a", "/b")).rejects.toMatchObject({ code: "ENOSYS", errno: -38 });
     await expect(fs.mkdir("/dir")).rejects.toMatchObject({ code: "ENOSYS" });
+  });
+
+  it("reads the driver's shape once, at construction", async () => {
+    // The one semantic the once-only binding changes, pinned so it is a
+    // decision rather than a surprise: the loopback resolves which methods the
+    // driver has when it is built, not per call.
+    const growing: FsDriver = { ...minimal };
+    const fs = createLoopback(growing);
+    (growing as { mkdir?: FsDriver["mkdir"] }).mkdir = async () => "/late";
+    await expect(fs.mkdir("/late")).rejects.toMatchObject({ code: "ENOSYS" });
+    // Still ENOSYS on the second call: the answer is cached, not re-derived
+    // and not memoized off a first failure.
+    await expect(fs.mkdir("/late")).rejects.toMatchObject({ code: "ENOSYS" });
+    // A fresh loopback over the same object does see it.
+    await expect(createLoopback(growing).mkdir("/late")).resolves.toBe("/late");
+
+    // And the mirror: a method removed afterwards keeps working, because the
+    // bound function is held rather than looked up again.
+    const shrinking = createMemoryDriver() as FsDriver;
+    const held = createLoopback(shrinking);
+    delete (shrinking as { mkdir?: unknown }).mkdir;
+    await held.mkdir("/still-there");
+    expect((await held.stat("/still-there")).isDirectory()).toBe(true);
   });
 
   it("normalizes paths before they reach the driver", async () => {
