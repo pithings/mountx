@@ -21,27 +21,63 @@
 
 import { ERRNO_CODES, fsError, type ErrnoCode, type FsError } from "../../src/errors.ts";
 import {
+  P9_IOHDRSZ,
   P9_NOFID,
   P9_NOTAG,
   P9_RATTACH,
   P9_RCLUNK,
   P9_RFLUSH,
+  P9_RFSYNC,
   P9_RGETATTR,
+  P9_RGETLOCK,
+  P9_RLCREATE,
   P9_RLERROR,
+  P9_RLINK,
+  P9_RLOCK,
+  P9_RLOPEN,
+  P9_RMKDIR,
+  P9_RMKNOD,
   P9_READDIRHDRSZ,
+  P9_RREAD,
   P9_RREADDIR,
+  P9_RREADLINK,
+  P9_RREMOVE,
+  P9_RRENAME,
+  P9_RRENAMEAT,
+  P9_RSETATTR,
   P9_RSTATFS,
+  P9_RSYMLINK,
+  P9_RUNLINKAT,
   P9_RVERSION,
   P9_RWALK,
+  P9_RWRITE,
   P9_TATTACH,
   P9_TCLUNK,
   P9_TFLUSH,
+  P9_TFSYNC,
   P9_TGETATTR,
+  P9_TGETLOCK,
+  P9_TLCREATE,
+  P9_TLINK,
+  P9_TLOCK,
+  P9_TLOPEN,
+  P9_TMKDIR,
+  P9_TMKNOD,
+  P9_TREAD,
   P9_TREADDIR,
+  P9_TREADLINK,
+  P9_TREMOVE,
+  P9_TRENAME,
+  P9_TRENAMEAT,
+  P9_TSETATTR,
   P9_TSTATFS,
+  P9_TSYMLINK,
+  P9_TUNLINKAT,
   P9_TVERSION,
   P9_TWALK,
+  P9_TWRITE,
   P9_GETATTR_ALL,
+  P9_LOCK_TYPE_WRLCK,
   P9_VERSION_DOTL,
   messageName,
 } from "../../src/9p/constants.ts";
@@ -50,26 +86,57 @@ import {
   readDirents,
   readRattach,
   readRgetattr,
+  readRgetlock,
+  readRlcreate,
   readRlerror,
+  readRlock,
+  readRlopen,
+  readRmkdir,
+  readRread,
   readRreaddir,
+  readRreadlink,
+  readRwrite,
   readRstatfs,
   readRversion,
   readRwalk,
   readEmptyBody,
+  readQidReply,
   writeFidRequest,
   writeTattach,
   writeTflush,
+  writeTfsync,
   writeTgetattr,
+  writeTgetlock,
+  writeTlcreate,
+  writeTlink,
+  writeTlock,
+  writeTlopen,
+  writeTmkdir,
+  writeTmknod,
+  writeTread,
   writeTreaddir,
+  writeTrename,
+  writeTrenameat,
+  writeTsetattr,
+  writeTsymlink,
+  writeTunlinkat,
   writeTversion,
   writeTwalk,
+  writeTwrite,
   type P9Dirent,
+  type P9Time,
   type Rgetattr,
+  type Rgetlock,
+  type Rlopen,
   type Rstatfs,
   type Rversion,
+  type Tsetattr,
 } from "../../src/9p/protocol.ts";
 import type { P9Session } from "../../src/9p/session.ts";
 import { P9Reader, type P9Qid, type P9Writer } from "../../src/9p/wire.ts";
+
+/** Zero, as a `sec[8] nsec[8]` pair — the value every unset time field carries. */
+const NO_TIME: P9Time = { sec: 0n, nsec: 0n };
 
 /** Framed request in, framed reply out. A session, a socket, a fixture. */
 export type P9Transport = (request: Uint8Array) => Promise<Uint8Array | null>;
@@ -313,6 +380,267 @@ export class P9Client {
       all.push(...page);
       offset = page.at(-1)!.offset;
     }
+  }
+
+  // --- I/O ---
+
+  /** `Tlopen`. `flags` is the **wire's** `O_*`, i.e. the Linux kernel's. */
+  async lopen(fid: number, flags = 0): Promise<Rlopen> {
+    const reply = await this.call(P9_TLOPEN, P9_RLOPEN, (writer) =>
+      writeTlopen(writer, { fid, flags }),
+    );
+    const opened = readRlopen(reply.body);
+    reply.body.end("Rlopen");
+    return opened;
+  }
+
+  /** `Tlcreate` — the fid names the parent going in and the new file coming out. */
+  async lcreate(
+    fid: number,
+    name: string,
+    options: { flags?: number; mode?: number; gid?: number } = {},
+  ): Promise<Rlopen> {
+    const reply = await this.call(P9_TLCREATE, P9_RLCREATE, (writer) =>
+      writeTlcreate(writer, {
+        fid,
+        name,
+        flags: options.flags ?? 0,
+        mode: options.mode ?? 0o644,
+        gid: options.gid ?? 0,
+      }),
+    );
+    const created = readRlcreate(reply.body);
+    reply.body.end("Rlcreate");
+    return created;
+  }
+
+  /**
+   * `Tread`. `count` defaults to what the negotiated `msize` leaves for a
+   * payload, which is what `p9_client_read_once()` clamps to.
+   */
+  async read(fid: number, offset: bigint, count?: number): Promise<Uint8Array> {
+    const budget = count ?? (this.negotiated ?? this.msize) - P9_IOHDRSZ;
+    const reply = await this.call(P9_TREAD, P9_RREAD, (writer) =>
+      writeTread(writer, { fid, offset, count: budget }),
+    );
+    const { data } = readRread(reply.body);
+    reply.body.end("Rread");
+    return data;
+  }
+
+  /** `Tread` until the file ends, concatenated. */
+  async readAll(fid: number, count?: number): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = [];
+    let offset = 0n;
+    for (;;) {
+      const chunk = await this.read(fid, offset, count);
+      if (chunk.byteLength === 0) {
+        break;
+      }
+      chunks.push(chunk);
+      offset += BigInt(chunk.byteLength);
+    }
+    const all = new Uint8Array(Number(offset));
+    let at = 0;
+    for (const chunk of chunks) {
+      all.set(chunk, at);
+      at += chunk.byteLength;
+    }
+    return all;
+  }
+
+  /** `Twrite` — the byte count the server accepted. */
+  async write(fid: number, offset: bigint, data: Uint8Array | string): Promise<number> {
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const reply = await this.call(
+      P9_TWRITE,
+      P9_RWRITE,
+      (writer) => writeTwrite(writer, { fid, offset, data: bytes }),
+      { capacity: bytes.byteLength + 32 },
+    );
+    const { count } = readRwrite(reply.body);
+    reply.body.end("Rwrite");
+    return count;
+  }
+
+  async fsync(fid: number, datasync = 0): Promise<void> {
+    const reply = await this.call(P9_TFSYNC, P9_RFSYNC, (writer) =>
+      writeTfsync(writer, { fid, datasync }),
+    );
+    readEmptyBody(reply.body, "Rfsync");
+  }
+
+  // --- attributes ---
+
+  /**
+   * `Tsetattr`. Everything but `valid` defaults to zero, exactly as the kernel
+   * leaves the fields whose bits it did not set.
+   */
+  async setattr(
+    fid: number,
+    attr: Partial<Omit<Tsetattr, "fid">> & { valid: number },
+  ): Promise<void> {
+    const reply = await this.call(P9_TSETATTR, P9_RSETATTR, (writer) =>
+      writeTsetattr(writer, {
+        fid,
+        valid: attr.valid,
+        mode: attr.mode ?? 0,
+        uid: attr.uid ?? 0,
+        gid: attr.gid ?? 0,
+        size: attr.size ?? 0n,
+        atime: attr.atime ?? NO_TIME,
+        mtime: attr.mtime ?? NO_TIME,
+      }),
+    );
+    readEmptyBody(reply.body, "Rsetattr");
+  }
+
+  // --- namespace ---
+
+  async mkdir(dfid: number, name: string, mode = 0o755, gid = 0): Promise<P9Qid> {
+    const reply = await this.call(P9_TMKDIR, P9_RMKDIR, (writer) =>
+      writeTmkdir(writer, { dfid, name, mode, gid }),
+    );
+    const { qid } = readRmkdir(reply.body);
+    reply.body.end("Rmkdir");
+    return qid;
+  }
+
+  async symlink(dfid: number, name: string, symtgt: string, gid = 0): Promise<P9Qid> {
+    const reply = await this.call(P9_TSYMLINK, P9_RSYMLINK, (writer) =>
+      writeTsymlink(writer, { dfid, name, symtgt, gid }),
+    );
+    const { qid } = readQidReply(reply.body);
+    reply.body.end("Rsymlink");
+    return qid;
+  }
+
+  async mknod(
+    dfid: number,
+    name: string,
+    options: { mode?: number; major?: number; minor?: number; gid?: number } = {},
+  ): Promise<P9Qid> {
+    const reply = await this.call(P9_TMKNOD, P9_RMKNOD, (writer) =>
+      writeTmknod(writer, {
+        dfid,
+        name,
+        mode: options.mode ?? 0o644,
+        major: options.major ?? 0,
+        minor: options.minor ?? 0,
+        gid: options.gid ?? 0,
+      }),
+    );
+    const { qid } = readQidReply(reply.body);
+    reply.body.end("Rmknod");
+    return qid;
+  }
+
+  /** `Tlink` — note the order: the *directory* fid comes first. */
+  async link(dfid: number, fid: number, name: string): Promise<void> {
+    const reply = await this.call(P9_TLINK, P9_RLINK, (writer) =>
+      writeTlink(writer, { dfid, fid, name }),
+    );
+    readEmptyBody(reply.body, "Rlink");
+  }
+
+  async readlink(fid: number): Promise<string> {
+    const reply = await this.call(P9_TREADLINK, P9_RREADLINK, (writer) =>
+      writeFidRequest(writer, { fid }),
+    );
+    const { target } = readRreadlink(reply.body);
+    reply.body.end("Rreadlink");
+    return target;
+  }
+
+  async rename(fid: number, dfid: number, name: string): Promise<void> {
+    const reply = await this.call(P9_TRENAME, P9_RRENAME, (writer) =>
+      writeTrename(writer, { fid, dfid, name }),
+    );
+    readEmptyBody(reply.body, "Rrename");
+  }
+
+  async renameat(
+    olddirfid: number,
+    oldname: string,
+    newdirfid: number,
+    newname: string,
+  ): Promise<void> {
+    const reply = await this.call(P9_TRENAMEAT, P9_RRENAMEAT, (writer) =>
+      writeTrenameat(writer, { olddirfid, oldname, newdirfid, newname }),
+    );
+    readEmptyBody(reply.body, "Rrenameat");
+  }
+
+  /** `Tunlinkat`; `flags` is `P9_DOTL_AT_REMOVEDIR` or nothing. */
+  async unlinkat(dirfid: number, name: string, flags = 0): Promise<void> {
+    const reply = await this.call(P9_TUNLINKAT, P9_RUNLINKAT, (writer) =>
+      writeTunlinkat(writer, { dirfid, name, flags }),
+    );
+    readEmptyBody(reply.body, "Runlinkat");
+  }
+
+  /** `Tremove` — removes the file **and** clunks the fid, success or not. */
+  async remove(fid: number): Promise<void> {
+    const reply = await this.call(P9_TREMOVE, P9_RREMOVE, (writer) =>
+      writeFidRequest(writer, { fid }),
+    );
+    readEmptyBody(reply.body, "Rremove");
+  }
+
+  // --- locks ---
+
+  /** `Tlock` — the `P9_LOCK_*` status the server answered. */
+  async lock(
+    fid: number,
+    options: {
+      type?: number;
+      flags?: number;
+      start?: bigint;
+      length?: bigint;
+      procId?: number;
+      clientId?: string;
+    } = {},
+  ): Promise<number> {
+    const reply = await this.call(P9_TLOCK, P9_RLOCK, (writer) =>
+      writeTlock(writer, {
+        fid,
+        type: options.type ?? P9_LOCK_TYPE_WRLCK,
+        flags: options.flags ?? 0,
+        start: options.start ?? 0n,
+        length: options.length ?? 0n,
+        procId: options.procId ?? 1,
+        clientId: options.clientId ?? "test-client",
+      }),
+    );
+    const { status } = readRlock(reply.body);
+    reply.body.end("Rlock");
+    return status;
+  }
+
+  /** `Tgetlock` — the conflicting lock, or `P9_LOCK_TYPE_UNLCK` for none. */
+  async getlock(
+    fid: number,
+    options: {
+      type?: number;
+      start?: bigint;
+      length?: bigint;
+      procId?: number;
+      clientId?: string;
+    } = {},
+  ): Promise<Rgetlock> {
+    const reply = await this.call(P9_TGETLOCK, P9_RGETLOCK, (writer) =>
+      writeTgetlock(writer, {
+        fid,
+        type: options.type ?? P9_LOCK_TYPE_WRLCK,
+        start: options.start ?? 0n,
+        length: options.length ?? 0n,
+        procId: options.procId ?? 1,
+        clientId: options.clientId ?? "test-client",
+      }),
+    );
+    const lock = readRgetlock(reply.body);
+    reply.body.end("Rgetlock");
+    return lock;
   }
 
   async flush(oldtag: number, options: { tag?: number } = {}): Promise<void> {

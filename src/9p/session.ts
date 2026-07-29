@@ -35,47 +35,117 @@
  * the option changes a field on the wire, here it only changes which files
  * share a number. See `fids.ts`'s `qidPathFor`.
  *
- * This step implements version, attach, walk, clunk, getattr, statfs, readdir
- * and flush. Every other message answers `Rlerror ENOTSUP` from one `default`,
- * which is a legal thing for a 9P server to do and is what the legacy 9P2000
- * opcodes will keep answering forever.
+ * Every 9P2000.L message is answered here. What is left in the `default` is the
+ * four legacy 9P2000 opcodes the .L dialect replaced (`Topen`, `Tcreate`,
+ * `Tstat`, `Twstat`), `Tlerror`/`Terror`, which are never sent in either
+ * dialect, and anything that is not a message at all: `Rlerror ENOTSUP`, which
+ * is a legal thing for a 9P server to say and what those will keep hearing.
+ *
+ * **The two `open(2)` namespaces cross here too.** `Tlopen.flags` and
+ * `Tlcreate.flags` are the Linux kernel's, exactly like `fuse_open_in.flags`,
+ * and a driver resolves flags against the *host* — so the crossing is
+ * `src/fuse/flags.ts`'s `driverOpenFlags()`, imported rather than copied. That
+ * is a deliberate dependency from `src/9p/` onto `src/fuse/`: the translation
+ * is a fact about Linux's `O_*` and the host's, not about either transport,
+ * and a second copy of it is a second copy to get wrong. The wire's `O_*`
+ * values come from `src/fuse/constants.ts` for the same reason — they are
+ * transcribed once, from `include/uapi/linux/fcntl.h`, and 9P's wire is the
+ * same kernel's.
  */
 
+import { constants } from "node:fs";
 import { errnoOf, fsError } from "../errors.ts";
+import { driverOpenFlags, reopenFlags } from "../fuse/flags.ts";
 import { createLoopback, type Loopback } from "../harness.ts";
 import { PathLock } from "../lock.ts";
 import { joinPath } from "../path.ts";
-import { S_IFDIR, S_IFMT, type FsDriver, type StatsLike } from "../types.ts";
 import {
+  S_IFDIR,
+  S_IFMT,
+  S_IFREG,
+  type FileHandleLike,
+  type FsDriver,
+  type StatsLike,
+} from "../types.ts";
+import { O_ACCMODE, O_CREAT, O_RDONLY, O_TRUNC } from "../fuse/constants.ts";
+import {
+  P9_DOTL_AT_REMOVEDIR,
   P9_GETATTR_BASIC,
   P9_GETATTR_BTIME,
+  P9_IOHDRSZ,
+  P9_LOCK_SUCCESS,
+  P9_LOCK_TYPE_UNLCK,
   P9_MIN_MSIZE,
   P9_NOFID,
   P9_RATTACH,
   P9_RCLUNK,
   P9_RFLUSH,
+  P9_RFSYNC,
   P9_RGETATTR,
+  P9_RGETLOCK,
+  P9_RLCREATE,
   P9_RLERROR,
+  P9_RLINK,
+  P9_RLOCK,
+  P9_RLOPEN,
+  P9_RMKDIR,
+  P9_RMKNOD,
   P9_READDIRHDRSZ,
+  P9_RREAD,
   P9_RREADDIR,
+  P9_RREADLINK,
+  P9_RREMOVE,
+  P9_RRENAME,
+  P9_RRENAMEAT,
+  P9_RSETATTR,
   P9_RSTATFS,
+  P9_RSYMLINK,
+  P9_RUNLINKAT,
   P9_RVERSION,
   P9_RWALK,
+  P9_RWRITE,
+  P9_SETATTR_ATIME,
+  P9_SETATTR_ATIME_SET,
+  P9_SETATTR_GID,
+  P9_SETATTR_MODE,
+  P9_SETATTR_MTIME,
+  P9_SETATTR_MTIME_SET,
+  P9_SETATTR_SIZE,
+  P9_SETATTR_UID,
   P9_TATTACH,
   P9_TAUTH,
   P9_TCLUNK,
   P9_TFLUSH,
+  P9_TFSYNC,
   P9_TGETATTR,
+  P9_TGETLOCK,
+  P9_TLCREATE,
+  P9_TLINK,
+  P9_TLOCK,
+  P9_TLOPEN,
+  P9_TMKDIR,
+  P9_TMKNOD,
+  P9_TREAD,
   P9_TREADDIR,
+  P9_TREADLINK,
+  P9_TREMOVE,
+  P9_TRENAME,
+  P9_TRENAMEAT,
+  P9_TSETATTR,
   P9_TSTATFS,
+  P9_TSYMLINK,
+  P9_TUNLINKAT,
   P9_TVERSION,
   P9_TWALK,
+  P9_TWRITE,
+  P9_TXATTRCREATE,
+  P9_TXATTRWALK,
   P9_VERSION_DOTL,
   P9_VERSION_UNKNOWN,
   V9FS_MAGIC,
   messageName,
 } from "./constants.ts";
-import { FidTable, walkStep, type Fid } from "./fids.ts";
+import { FidTable, walkStep, type Fid, type FidOpenState } from "./fids.ts";
 import {
   P9DirentPacker,
   encodeMessage,
@@ -84,27 +154,71 @@ import {
   readTattach,
   readTauth,
   readTflush,
+  readTfsync,
   readTgetattr,
+  readTgetlock,
+  readTlcreate,
+  readTlink,
+  readTlock,
+  readTlopen,
+  readTmkdir,
+  readTmknod,
+  readTread,
   readTreaddir,
+  readTrename,
+  readTrenameat,
+  readTsetattr,
+  readTsymlink,
+  readTunlinkat,
   readTversion,
   readTwalk,
+  readTwrite,
   writeRattach,
   writeRgetattr,
+  writeRgetlock,
   writeRlerror,
+  writeRlock,
+  writeRlopen,
+  writeRread,
   writeRreaddir,
+  writeRreadlink,
   writeRstatfs,
   writeRversion,
   writeRwalk,
+  writeRwrite,
+  writeQidReply,
   type P9Header,
   type P9Time,
   type Rgetattr,
   type Tattach,
+  type Tfsync,
   type Tgetattr,
+  type Tgetlock,
+  type Tlcreate,
+  type Tlink,
+  type Tlock,
+  type Tlopen,
+  type Tmkdir,
+  type Tmknod,
+  type Tread,
   type Treaddir,
+  type Trename,
+  type Trenameat,
+  type Tsetattr,
+  type Tsymlink,
+  type Tunlinkat,
   type Tversion,
   type Twalk,
+  type Twrite,
 } from "./protocol.ts";
-import { P9Error, P9Reader, isP9Error, type P9Qid, type P9Writer } from "./wire.ts";
+import {
+  P9Error,
+  P9Reader,
+  isP9Error,
+  stringByteLength,
+  type P9Qid,
+  type P9Writer,
+} from "./wire.ts";
 
 /**
  * The largest `msize` this server agrees to, and the ceiling the negotiated one
@@ -128,6 +242,41 @@ const NAME_MAX = 255;
  * `access=<uname>` mode sends. It is a sentinel, never a uid.
  */
 const NO_NUNAME = 0xff_ff_ff_ff;
+
+/**
+ * `(gid_t)-1` in a create message: "no group to give this to".
+ *
+ * The same sentinel as {@link NO_NUNAME} and for the same reason — v9fs sends
+ * `from_kgid(&init_user_ns, gid)`, and an `INVALID_GID` comes out of that as
+ * `(gid_t)-1`, which is also POSIX's "leave the group alone" for `chown(2)`.
+ */
+const NO_NGID = 0xff_ff_ff_ff;
+
+/**
+ * The largest byte offset a `Tread`/`Twrite`/`Tsetattr` may name.
+ *
+ * The wire field is a `u64` and the driver interface takes a `number`, so the
+ * ceiling is where a JS integer stops being exact. Beyond it the offset cannot
+ * be represented, and rounding one silently would read or write somewhere the
+ * client did not ask for — `EINVAL` says so instead.
+ */
+const MAX_OFFSET = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * The one refusal that is allocated once, because it is sent constantly.
+ *
+ * Linux probes `security.*` on every write to a file it has no cached xattr
+ * answer for, so `Txattrwalk` outnumbers every other message on a busy mount
+ * even though nothing in the driver interface can answer one. The body is not
+ * decoded and the error is not rebuilt: neither is needed to say no, and both
+ * would allocate on the hottest path this server has.
+ *
+ * Sharing one `Error` instance is safe because nothing mutates it — the session
+ * reads its `code` through `errnoOf()` and hands the value to `onError`.
+ */
+const XATTR_UNSUPPORTED = fsError("ENOTSUP", {
+  message: "ENOTSUP: this server has no extended attributes",
+});
 
 /**
  * The `DT_*` byte for a mode.
@@ -166,10 +315,9 @@ function splitMs(ms: number): P9Time {
  * v9fs's default `access=user` sends one `Tattach` per user that touches the
  * mount, and every fid walked from it inherits the attach — so this is the
  * 9P spelling of the `AUTH_SYS` credentials `NfsSession` reads off each call.
- * Nothing in this step acts on it; it is recorded because the ownership claim
- * that needs it (`#claim` in the other two sessions: `lchown` a freshly created
- * file to whoever asked for it) belongs with `Tlcreate`/`Tmkdir`, in step 5,
- * and by then the attach it came from is long gone.
+ * It is what `#claim` gives a freshly created file to: the creating messages
+ * carry a `gid` of their own but no uid at all, because the only place a 9P
+ * connection ever says who it is, is the `Tattach` every fid descends from.
  */
 export interface P9User {
   /** `uname` — a name, and empty whenever `uid` is set. */
@@ -200,17 +348,23 @@ export interface P9SessionOptions {
   /**
    * Refuse every mutating request with `EROFS`. Default `false`.
    *
-   * Nothing in this step mutates anything — version, attach, walk, clunk,
-   * getattr, statfs, readdir and flush are all readers — so it is recorded and
-   * has nothing yet to refuse. Step 5 brings the messages it applies to.
+   * "Mutating" includes a `Tlopen` that asks for write access, `O_CREAT` or
+   * `O_TRUNC` — refusing the write and allowing the open that promised it would
+   * leave the client holding a descriptor whose every use fails, where `EROFS`
+   * at `open(2)` is exactly what a read-only mount gives userspace.
+   *
+   * `Tremove` is the one message this cannot make harmless: the protocol clunks
+   * its fid whether or not the removal succeeds (see {@link P9Session}'s
+   * `#remove`), so a refused `Tremove` still costs the client its fid.
    */
   readOnly?: boolean;
   /**
    * `chown` a newly created entry to the attaching user. Default `true`.
    *
-   * Recorded for the same reason {@link P9User} is: the creating messages
-   * arrive in step 5, and the option has to exist before them so the attach
-   * that answers "which user?" is being kept from the start.
+   * The driver creates everything as the server process, so without this a file
+   * created by uid 1000 comes back owned by whoever is running the server and
+   * then fails every permission check its own creator makes. Quiet when the
+   * driver cannot express ownership — see `#claim`.
    */
   claimOwnership?: boolean;
   /** Run the reply-exactly-once assertions. Default on outside production. */
@@ -494,16 +648,24 @@ export class P9Session {
    *
    * `ENODEV` once {@link P9Session.destroy} has run, which is the answer the
    * FUSE session gives for the same situation — the connection this reply was
-   * for is gone. `EIO` for a live session that merely re-versioned: the request
-   * really was aborted, which is what the version exchange is defined to do,
-   * and `EIO` is what an aborted I/O reports. Either way the client has been
-   * told to start over, so neither is a surprise to it.
+   * for is gone. `EIO` for a live session: the request really was aborted, and
+   * `EIO` is what an aborted I/O reports. Either way the client has been told
+   * to start over, so neither is a surprise to it.
+   *
+   * The `EIO` message names both things that can have happened, because the
+   * error is raised from two places and cannot tell them apart: a `Tversion`
+   * reset (which clunks every fid and bumps the generation) and a plain
+   * `Tclunk`/`Tremove` that released *this* request's fid while it was parked in
+   * the driver — same outcome, no generation change, and blaming a version
+   * exchange that never happened would send a reader looking for the wrong bug.
    */
   #stale(header: P9Header): Error {
     const what = messageName(header.type);
     return this.#destroyed
       ? fsError("ENODEV", { message: `ENODEV: ${what} outlived the session` })
-      : fsError("EIO", { message: `EIO: ${what} was aborted by a Tversion reset` });
+      : fsError("EIO", {
+          message: `EIO: ${what} was aborted — the session was reset or its fid was released`,
+        });
   }
 
   /**
@@ -593,10 +755,91 @@ export class P9Session {
         const budget = Math.min(request.count >>> 0, Math.max(0, this.#msize - P9_READDIRHDRSZ));
         return this.#read(() => this.#readdir(header, request, budget));
       }
+      case P9_TLOPEN: {
+        const request = this.#decode(header, body, readTlopen);
+        return this.#read(() => this.#lopen(header, request));
+      }
+      case P9_TLCREATE: {
+        const request = this.#decode(header, body, readTlcreate);
+        return this.#read(() => this.#lcreate(header, request));
+      }
+      case P9_TREAD: {
+        const request = this.#decode(header, body, readTread);
+        // Captured in the prologue for `Treaddir`'s reason, and dispatched
+        // *outside* the path lock for `PathLock`'s: a read is the request a
+        // driver can park on for an unbounded time, and it resolves nothing in
+        // the path map. Only the re-open a `handles: false` driver needs takes
+        // the reader lock, and only around the open itself (`#withHandle`).
+        const budget = Math.min(request.count >>> 0, Math.max(0, this.#msize - P9_IOHDRSZ));
+        return this.#readFile(header, request, budget);
+      }
+      case P9_TWRITE: {
+        // `readTwrite` copies the payload, so nothing here is a view of the
+        // caller's buffer once the prologue is over.
+        return this.#write(header, this.#decode(header, body, readTwrite));
+      }
+      case P9_TFSYNC: {
+        return this.#fsync(header, this.#decode(header, body, readTfsync));
+      }
+      case P9_TSETATTR: {
+        const request = this.#decode(header, body, readTsetattr);
+        return this.#read(() => this.#setattr(header, request));
+      }
+      case P9_TMKDIR: {
+        const request = this.#decode(header, body, readTmkdir);
+        return this.#read(() => this.#mkdir(header, request));
+      }
+      case P9_TSYMLINK: {
+        const request = this.#decode(header, body, readTsymlink);
+        return this.#read(() => this.#symlink(header, request));
+      }
+      case P9_TMKNOD: {
+        const request = this.#decode(header, body, readTmknod);
+        return this.#read(() => this.#mknod(header, request));
+      }
+      case P9_TLINK: {
+        const request = this.#decode(header, body, readTlink);
+        return this.#read(() => this.#link(header, request));
+      }
+      case P9_TREADLINK: {
+        const fid = this.#decode(header, body, readFidRequest).fid;
+        return this.#read(() => this.#readlink(header, fid));
+      }
+      case P9_TRENAME: {
+        const request = this.#decode(header, body, readTrename);
+        // The only writer, in both transports and for the same reason: a rename
+        // rewrites paths it did not resolve itself. See `src/lock.ts`.
+        return this.#lock.write(() => this.#rename(header, request));
+      }
+      case P9_TRENAMEAT: {
+        const request = this.#decode(header, body, readTrenameat);
+        return this.#lock.write(() => this.#renameat(header, request));
+      }
+      case P9_TUNLINKAT: {
+        const request = this.#decode(header, body, readTunlinkat);
+        return this.#read(() => this.#unlinkat(header, request));
+      }
+      case P9_TREMOVE: {
+        const fid = this.#decode(header, body, readFidRequest).fid;
+        return this.#read(() => this.#remove(header, fid));
+      }
+      case P9_TXATTRWALK:
+      case P9_TXATTRCREATE: {
+        // Refused without decoding the body; see {@link XATTR_UNSUPPORTED}.
+        throw XATTR_UNSUPPORTED;
+      }
+      case P9_TLOCK: {
+        // Named for the `fcntl(2)` commands they are, because `#lock` is
+        // already the path lock and a `#lock` that is not one would be a trap.
+        return this.#setlk(header, this.#decode(header, body, readTlock));
+      }
+      case P9_TGETLOCK: {
+        return this.#getlk(header, this.#decode(header, body, readTgetlock));
+      }
       default: {
-        // Every message this step does not implement, the four legacy 9P2000
-        // ones it never will, and anything that is not a message at all. Step 5
-        // replaces the first group; the rest keep this answer.
+        // The four legacy 9P2000 opcodes .L replaced (`Topen`, `Tcreate`,
+        // `Tstat`, `Twstat`), the two error types nobody sends, and anything
+        // that is not a message at all. This answer is permanent.
         throw fsError("ENOTSUP", {
           message: `ENOTSUP: ${messageName(header.type)} is not supported`,
         });
@@ -605,15 +848,14 @@ export class P9Session {
   }
 
   /**
-   * Run a handler as a reader.
+   * Run a handler as a reader: concurrent with every other reader, and
+   * serialized against `Trename`/`Trenameat`, the only writers.
    *
-   * There is no writer yet — every message in this step resolves paths and
-   * mutates nothing — so the lock is uncontended by construction. It is here
-   * rather than in step 5 because the *readers* are what a writer has to be
-   * serialized against, and adding them retroactively is how one gets missed.
-   * `Tclunk` stays outside it: it resolves no path, and the driver `close()` it
-   * may do is exactly the kind of unbounded wait the lock's own docs say to
-   * keep out.
+   * Everything that resolves a path is a reader. Four messages are deliberately
+   * outside it: `Tclunk` and `Tflush` resolve nothing, and `Tread`/`Twrite` are
+   * where a driver can park for an unbounded time — the lock's own docs say to
+   * keep those out, and they name no path either (the re-open a `handles: false`
+   * driver needs takes the reader lock for itself, around the open alone).
    */
   #read(fn: () => Promise<Uint8Array>): Promise<Uint8Array> {
     return this.#lock.read(fn);
@@ -698,7 +940,12 @@ export class P9Session {
     const ceiling = Math.trunc(this.options.msize ?? DEFAULT_MSIZE);
     const msize = Math.min(request.msize >>> 0, ceiling);
     const agreed = request.version === P9_VERSION_DOTL && msize >= P9_MIN_MSIZE;
-    if (agreed) {
+    // `#reset()` awaits every driver `close()`, so a `destroy()` can land while
+    // this negotiation is parked inside it. Restoring an `msize` afterwards
+    // would leave a torn-down session reporting a live one; the request gate in
+    // `#dispatch` refuses everything either way, but a getter that contradicts
+    // `destroyed` is a lie a reader has to disprove.
+    if (agreed && !this.#destroyed) {
       this.#msize = msize;
     }
     return this.#framed(header, P9_RVERSION, (writer) =>
@@ -989,24 +1236,22 @@ export class P9Session {
   /**
    * The open state a `Treaddir` needs.
    *
-   * 9P requires a fid to have been opened before it can be read, and this is
-   * where that check belongs. **Step 5 completes it**: `Tlopen` does not exist
-   * yet, so there is no way for a client to open anything, and refusing every
-   * unopened fid here would leave `Treaddir` unreachable and untested for a
-   * whole step. Until then an unopened fid naming a directory is read, and the
-   * driver's own `ENOTDIR` covers a fid naming something else.
-   *
-   * What is already exact is the half that will survive: a fid opened as a
-   * *file* is refused here and now, because `Tread` — not `Treaddir` — is what
-   * that fid is for, and that refusal does not depend on `Tlopen` existing.
+   * 9P requires a fid to have been opened before it can be read, so an unopened
+   * one is `EBADF` — the errno Linux gives for I/O on a descriptor that is not
+   * one, and the same answer {@link FidTable.require} gives for a fid that was
+   * never issued. A fid opened as a *file* is `ENOTDIR`: it names something a
+   * `Tread` can read and a `Treaddir` cannot, which is what `readdir(3)` on a
+   * plain file reports.
    */
-  #requireDirectory(entry: Fid<string>): void {
-    if (entry.open !== undefined && !entry.open.directory) {
+  #requireDirectory(entry: Fid<string>): FidOpenState {
+    const open = this.#requireOpen(entry, "readdir");
+    if (!open.directory) {
       throw fsError("ENOTDIR", {
         message: `ENOTDIR: fid ${entry.fid} was opened as a file`,
         path: entry.path,
       });
     }
+    return open;
   }
 
   /**
@@ -1092,6 +1337,904 @@ export class P9Session {
       P9_RREADDIR,
       (writer) => writeRreaddir(writer, { data: packer.bytes() }),
       packer.size + 16,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // names, offsets, ownership
+  // -------------------------------------------------------------------------
+
+  /**
+   * The path a `name` in the directory `parent` names.
+   *
+   * `walkStep` already refuses the three things that are not names at all — an
+   * empty element, one with a separator in it, one with a NUL — and this adds
+   * the two more a *create or remove* target has to satisfy: `.` and `..` name
+   * directories that already exist rather than entries to make or unmake, and a
+   * name longer than `NAME_MAX` **bytes** is one no filesystem will take. The
+   * count is of bytes and not characters for the reason `Rstatfs.namelen` is:
+   * the limit a kernel enforces is on the encoded name.
+   */
+  #childOf(parent: Fid<string>, name: string, syscall: string): string {
+    if (name === "." || name === "..") {
+      throw fsError("EINVAL", {
+        syscall,
+        message: `EINVAL: '${name}' is not an entry name`,
+        path: parent.path,
+      });
+    }
+    if (stringByteLength(name) > NAME_MAX) {
+      throw fsError("ENAMETOOLONG", { syscall, message: `ENAMETOOLONG: entry name '${name}'` });
+    }
+    return walkStep(parent.path, name);
+  }
+
+  /** A 64-bit wire offset as a `number`, or `EINVAL`. See {@link MAX_OFFSET}. */
+  #offset(value: bigint, syscall: string): number {
+    if (value < 0n || value > MAX_OFFSET) {
+      throw fsError("EINVAL", { syscall, message: `EINVAL: offset ${value} is out of range` });
+    }
+    return Number(value);
+  }
+
+  /**
+   * Refuse a mutating request on a read-only session.
+   *
+   * The gate is the session option and not `driver.capabilities.readOnly`: a
+   * driver that cannot write says so by throwing, one method at a time, and
+   * turning its inference into a blanket refusal here would answer `EROFS` for
+   * a driver that merely has no `rename`. See {@link P9SessionOptions.readOnly}.
+   *
+   * Every caller checks its fids **first**, so a request that is both malformed
+   * and forbidden reports the client's own mistake — `EBADF` for a fid this
+   * connection never issued is information the client can act on, where `EROFS`
+   * would send it looking at the wrong thing.
+   */
+  #requireWritable(syscall: string, path?: string): void {
+    if (this.options.readOnly === true) {
+      throw fsError("EROFS", {
+        syscall,
+        path,
+        message: `EROFS: ${syscall} on a read-only 9P export`,
+      });
+    }
+  }
+
+  /**
+   * Give a newly created entry to whoever asked for it.
+   *
+   * Character-for-character `NfsSession.#claim`'s stance, with the credentials
+   * gathered from the two places 9P keeps them: the uid from the `Tattach` this
+   * fid descends from (`p9_client_attach()` sends it once per user, and every
+   * walk inherits it), the gid from the create message itself, which is the one
+   * credential 9P repeats per request.
+   *
+   * Best effort, deliberately. A driver with no `lchown` (`ENOSYS`), or one not
+   * privileged enough to hand ownership away (`EPERM`/`ENOTSUP`), is not
+   * thereby broken — it is a driver with no concept of ownership, and failing
+   * the create it just completed would be the wrong answer to that. Skipped
+   * outright when the caller *is* the server process, which is the common case
+   * and worth one driver round trip.
+   */
+  async #claim(path: string, fid: number, gid: number): Promise<void> {
+    if (this.options.claimOwnership === false) {
+      return;
+    }
+    const uid = this.#users.get(fid)?.uid ?? -1;
+    const wanted = gid === NO_NGID ? -1 : gid;
+    if (uid === -1 && wanted === -1) {
+      return;
+    }
+    if (uid === (process.getuid?.() ?? -1) && wanted === (process.getgid?.() ?? -1)) {
+      return;
+    }
+    try {
+      // `-1` is POSIX for "leave this one alone", inherited from `node:fs`.
+      await this.driver.lchown(path, uid, wanted);
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
+        throw error;
+      }
+    }
+  }
+
+  /** Stat a path a create just produced, and answer the qid that describes it. */
+  async #qidOf(path: string): Promise<P9Qid> {
+    return this.fids.qidFor(await this.#statOf(path), path);
+  }
+
+  /** A reply that is nothing but a qid: `Rmkdir`, `Rsymlink`, `Rmknod`. */
+  #qidReply(header: P9Header, type: number, qid: P9Qid): Uint8Array {
+    return this.#framed(header, type, (writer) => writeQidReply(writer, { qid }), 32);
+  }
+
+  // -------------------------------------------------------------------------
+  // open state
+  // -------------------------------------------------------------------------
+
+  /**
+   * The open state of a fid, or `EBADF`.
+   *
+   * A fid with no {@link FidOpenState} has never been through `Tlopen` or
+   * `Tlcreate`, and 9P has no operation that reads or writes one: the client is
+   * required to open before it does I/O, exactly as it is required to `open(2)`
+   * before it `read(2)`s, and `EBADF` is what the kernel says for the same
+   * mistake made with a descriptor.
+   */
+  #requireOpen(entry: Fid<string>, syscall: string): FidOpenState {
+    if (entry.open === undefined) {
+      throw fsError("EBADF", {
+        syscall,
+        path: entry.path,
+        message: `EBADF: fid ${entry.fid} has not been opened`,
+      });
+    }
+    return entry.open;
+  }
+
+  /** The open state of a fid opened as a *file*, or `EBADF`/`EISDIR`. */
+  #requireFile(entry: Fid<string>, syscall: string): FidOpenState {
+    const open = this.#requireOpen(entry, syscall);
+    if (open.directory) {
+      // What `read(2)` and `write(2)` answer for a directory descriptor, and
+      // what v9fs's `p9_client_read()` callers expect: a directory is read with
+      // `Treaddir` and written not at all.
+      throw fsError("EISDIR", { syscall, path: entry.path });
+    }
+    return open;
+  }
+
+  /**
+   * Run something with a real `FileHandle`.
+   *
+   * `src/fuse/session.ts`'s `#withHandle`, and the same two cases: a driver
+   * that declares `handles` gets the one `Tlopen` opened, and one that does not
+   * gets a fresh open per operation from the fid's path — correct for
+   * everything 9P does, since every `Tread` and `Twrite` carries an explicit
+   * offset, and the honest degradation for a driver with no per-open state.
+   *
+   * The re-open resolves a path, so it takes the reader lock — for the resolve
+   * and the open only, never for the operation itself. Without it a concurrent
+   * `Trename` could move the file between the two and fail a perfectly valid
+   * fid with `ENOENT`.
+   */
+  async #withHandle<T>(
+    entry: Fid<string>,
+    open: FidOpenState,
+    fn: (handle: FileHandleLike) => Promise<T>,
+  ): Promise<T> {
+    if (open.handle !== undefined) {
+      return fn(open.handle);
+    }
+    const handle = await this.#lock.read(async () => this.driver.open(entry.path, open.flags));
+    try {
+      return await fn(handle);
+    } finally {
+      await this.#closeQuietly(handle);
+    }
+  }
+
+  /**
+   * Close a handle the client does not know about.
+   *
+   * Failing here is a diagnostic, never an errno: the request it belongs to has
+   * already done its work, and the only close a client is entitled to hear
+   * about is the one its own `Tclunk` asked for.
+   */
+  async #closeQuietly(handle: FileHandleLike): Promise<void> {
+    try {
+      await handle.close();
+    } catch (error) {
+      this.#report(error, undefined);
+    }
+  }
+
+  /**
+   * The fid is still exactly what this request's prologue saw, or the open it
+   * just performed has been overtaken and must be unwound.
+   *
+   * **Two races, one check, and both are reachable from a single connection.**
+   *
+   * - *The fid went away.* A `Tversion`, a `destroy()`, a `Tclunk` or a
+   *   `Tremove` drops the entry while `driver.open()` is still running; `#run`
+   *   would discard the reply, but the handle would already be stored on an
+   *   object nothing can reach and would never be closed. Answered with
+   *   {@link P9Session.#stale}.
+   * - *The fid was opened by somebody else.* Two `Tlopen`s (or two `Tlcreate`s)
+   *   naming the same fid arrive before either finishes: both pass the
+   *   prologue's "not open yet" test, both open, and the second assignment
+   *   overwrites the first — leaking a descriptor for the life of the
+   *   connection, since a `Tclunk` can only ever close the handle it finds.
+   *   `p9_client_open()` never does this (v9fs serializes per fid), but
+   *   `createP9Server` will accept frames from anything that connects, so the
+   *   leak is a hostile client away and unbounded.
+   *
+   * `EBUSY` for the second, deliberately distinct from the `EINVAL` an ordinary
+   * double-open gets: that one is a client that forgot it had opened the fid,
+   * this one is a client racing itself, and a server that reported them
+   * identically would make the difference invisible in exactly the case where it
+   * matters. The loser closes what it opened — the caller's `catch` does that —
+   * so the winner's handle is the only one left.
+   *
+   * `path` is `Tlcreate`'s extra half: the fid it started from must still name
+   * the directory it named, because a create moves the fid, and a loser that
+   * only checked `open` would still overwrite the winner's path.
+   */
+  #ensureOpenable(entry: Fid<string>, header: P9Header, path?: string): void {
+    if (this.fids.get(entry.fid) !== entry) {
+      throw this.#stale(header);
+    }
+    if (entry.open !== undefined || (path !== undefined && entry.path !== path)) {
+      throw fsError("EBUSY", {
+        message: `EBUSY: fid ${entry.fid} was opened by another request in flight`,
+        path: entry.path,
+      });
+    }
+  }
+
+  /**
+   * Does an open ask to change anything? `O_WRONLY`, `O_RDWR`, `O_CREAT`,
+   * `O_TRUNC` — in the **wire's** namespace, which is the Linux kernel's.
+   */
+  #writeIntent(wireFlags: number): boolean {
+    return (wireFlags & O_ACCMODE) !== O_RDONLY || (wireFlags & (O_CREAT | O_TRUNC)) !== 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Tlopen / Tlcreate
+  // -------------------------------------------------------------------------
+
+  /**
+   * `Tlopen` — prepare an already-walked fid for I/O.
+   *
+   * **A directory is opened without asking the driver.** `node:fs/promises` has
+   * no `opendir`-shaped entry point in `FsDriver` — `readdir` takes a path — so
+   * a `driver.open()` on a directory would produce a handle nothing here would
+   * ever use, and drivers disagree about whether it succeeds at all (`node:fs`
+   * gives an `fd`, the memory driver gives a handle, others answer `EISDIR`).
+   * What the open owes the client is the *check*, and an `lstat` is the check:
+   * it is what says the fid names a directory, and it is what `Treaddir` needs
+   * a moment later anyway. `src/fuse/session.ts`'s `OPENDIR` decides the same
+   * way, for the same reason; `NfsSession` never faces the question, because
+   * NFSv3 has no open.
+   *
+   * **`iounit` is `0`**, which the protocol defines as "no preference" and
+   * `p9_client_open()` reads as `msize - P9_IOHDRSZ`. That is exactly the bound
+   * this server would compute anyway (`Tread`'s budget is the same expression),
+   * so naming a smaller number would only cost round trips, and naming a larger
+   * one would invite a `Twrite` that cannot be framed. A driver with a
+   * preferred block size has nowhere to say so in `FsDriver`, so there is
+   * nothing better to report and nothing invented.
+   *
+   * Opening a fid twice is `EINVAL` when the client has already been told about
+   * the first open, and `EBUSY` when the two opens overlap — see
+   * {@link P9Session.#ensureOpenable}, which is also what keeps the loser's
+   * handle from leaking. An open fid names a file being read or written;
+   * `p9_client_open()` never opens one twice.
+   */
+  async #lopen(header: P9Header, request: Tlopen): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    if (entry.open !== undefined) {
+      throw fsError("EINVAL", { message: `EINVAL: fid ${request.fid} is already open` });
+    }
+    if (this.#writeIntent(request.flags)) {
+      this.#requireWritable("open", entry.path);
+    }
+    // `request.flags` is the kernel's namespace, so it is inspected with the
+    // kernel's constants above and translated here; the identity on Linux.
+    const flags = driverOpenFlags(request.flags);
+    let stats = await this.#statOf(entry.path);
+    if ((stats.mode & S_IFMT) === S_IFDIR) {
+      if (this.#writeIntent(request.flags)) {
+        throw fsError("EISDIR", { syscall: "open", path: entry.path });
+      }
+      this.#ensureOpenable(entry, header);
+      // Nothing one-shot survives to a re-open, and for a directory nothing
+      // re-opens at all — `Treaddir` reads the path. `reopenFlags()` is applied
+      // anyway so the field means one thing on every fid.
+      entry.open = { flags: reopenFlags(flags), handle: undefined, directory: true };
+    } else {
+      const handle = await this.driver.open(entry.path, flags);
+      const keep = this.driver.capabilities.handles;
+      if (!keep) {
+        // No per-open state to keep, but the open still had to happen: it is
+        // what reports `ENOENT`, `EACCES` and the rest.
+        await this.#closeQuietly(handle);
+      }
+      try {
+        if ((request.flags & O_TRUNC) !== 0) {
+          // The open just changed the file, so the qid the client will cache
+          // against has to describe it *afterwards*: `qid.version` is the mtime,
+          // and one taken before the truncation names the file that is gone.
+          // Linux never reaches this — `do_dentry_open()` clears `O_CREAT`,
+          // `O_EXCL`, `O_NOCTTY` and `O_TRUNC` out of `f_flags` before
+          // `v9fs_file_open()` ever maps them, so a `Tlopen` from v9fs carries
+          // none of the three — but any other client may send it, and a stale
+          // version is a cache the client will not invalidate.
+          stats = await this.#statOf(entry.path);
+        }
+        this.#ensureOpenable(entry, header);
+      } catch (error) {
+        if (keep) {
+          await this.#closeQuietly(handle);
+        }
+        throw error;
+      }
+      entry.open = {
+        // The creation flags acted once, at this open; a re-open standing in
+        // for it must not repeat them. See `src/fuse/flags.ts`.
+        flags: reopenFlags(flags),
+        handle: keep ? handle : undefined,
+        directory: false,
+      };
+    }
+    entry.iounit = 0;
+    const qid = this.fids.qidFor(stats, entry.path);
+    return this.#framed(
+      header,
+      P9_RLOPEN,
+      (writer) => writeRlopen(writer, { qid, iounit: entry.iounit }),
+      32,
+    );
+  }
+
+  /**
+   * `Tlcreate` — create a **regular file** under the directory `fid` names, and
+   * leave the fid naming the file.
+   *
+   * That hand-over is the message's whole shape: the parent's fid is spent, so
+   * `v9fs_vfs_atomic_open_dotl()` always clones one before creating. It happens
+   * here only on success, and through {@link Fid.path}'s setter, so a failed
+   * create leaves the fid exactly where it was — pointing at the directory,
+   * unopened, and with any readdir cursor it held intact (a cursor is dropped
+   * only when the path really moves).
+   *
+   * **`O_CREAT` is or-ed in unconditionally**, and that is belt and braces
+   * rather than a correction: `v9fs_open_to_dotl_flags()` *does* map it
+   * (`dotl_oflag_map` pairs `O_CREAT` with `P9_DOTL_CREATE`, and `P9L_MODE_MASK`
+   * keeps the bit), so the kernel sends it — but creating is what this message
+   * *means*, there is no reading of `Tlcreate` under which the file should not
+   * be created, and a client that left the bit out would otherwise get `ENOENT`
+   * for the one request that cannot fail that way. `O_EXCL` is the client's
+   * alone and passes through untouched, which is what makes
+   * `open(O_CREAT|O_EXCL)` fail with `EEXIST` over the wire the way it does
+   * locally.
+   *
+   * Two `Tlcreate`s racing on one fid are refused like two `Tlopen`s — see
+   * {@link P9Session.#ensureOpenable}. The loser's *file* is not removed: the
+   * create really happened, and unlinking it would be this server deleting a
+   * path some other request may already have opened.
+   */
+  async #lcreate(header: P9Header, request: Tlcreate): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    if (entry.open !== undefined) {
+      throw fsError("EINVAL", {
+        message: `EINVAL: fid ${request.fid} is open, and an open fid cannot create`,
+      });
+    }
+    this.#requireWritable("open", entry.path);
+    const parent = entry.path;
+    const path = this.#childOf(entry, request.name, "open");
+    const flags = driverOpenFlags(request.flags) | constants.O_CREAT;
+    const handle = await this.driver.open(path, flags, request.mode & 0o7777);
+    const keep = this.driver.capabilities.handles;
+    if (!keep) {
+      await this.#closeQuietly(handle);
+    }
+    let qid: P9Qid;
+    try {
+      await this.#claim(path, request.fid, request.gid);
+      qid = await this.#qidOf(path);
+      this.#ensureOpenable(entry, header, parent);
+    } catch (error) {
+      // The file exists but we cannot describe it, so there is no open fid to
+      // hand back and nothing that would ever clunk this handle.
+      if (keep) {
+        await this.#closeQuietly(handle);
+      }
+      throw error;
+    }
+    entry.path = path;
+    entry.open = { flags: reopenFlags(flags), handle: keep ? handle : undefined, directory: false };
+    entry.iounit = 0;
+    return this.#framed(
+      header,
+      P9_RLCREATE,
+      (writer) => writeRlopen(writer, { qid, iounit: entry.iounit }),
+      32,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Tread / Twrite / Tfsync
+  // -------------------------------------------------------------------------
+
+  /**
+   * `Tread` — bytes at an offset, from a fid opened as a file.
+   *
+   * `count` is clamped to what the negotiated `msize` can frame, computed
+   * before the first `await` (see the dispatch). A short read is the driver's
+   * answer, not an error: fewer bytes than asked for is how a file says it
+   * ended, and zero of them is how it says the offset is past the end. A
+   * zero-length read is legal and answers an empty `Rread`.
+   */
+  async #readFile(header: P9Header, request: Tread, budget: number): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    const open = this.#requireFile(entry, "read");
+    const offset = this.#offset(request.offset, "read");
+    const size = Math.min(request.count >>> 0, budget);
+    const buffer = new Uint8Array(size);
+    const { bytesRead } = await this.#withHandle(entry, open, (handle) =>
+      handle.read(buffer, 0, size, offset),
+    );
+    const data = buffer.subarray(0, Math.min(size, Math.max(0, bytesRead)));
+    return this.#framed(
+      header,
+      P9_RREAD,
+      (writer) => writeRread(writer, { data }),
+      data.byteLength + 16,
+    );
+  }
+
+  /**
+   * `Twrite` — bytes at an offset, to a fid opened as a file.
+   *
+   * The payload arrived inside an `msize`-bounded frame, so there is nothing to
+   * clamp; `readTwrite` already copied it, so there is nothing to copy either —
+   * copying it twice is the mistake this codebase has made once, and the
+   * decoder is where it was fixed.
+   *
+   * "Bounded" is the transport's guarantee and not this method's:
+   * `P9FrameAssembler` refuses any frame larger than its `limit`, which the
+   * transport lowers onto the negotiated `msize` (see {@link P9Session.msize}),
+   * and it refuses it before a byte reaches here. So an over-budget `Twrite`
+   * cannot arrive through a socket at all; only a test calling
+   * {@link P9Session.handleCall} directly can present one, and what it gets is
+   * the write it asked for.
+   */
+  async #write(header: P9Header, request: Twrite): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    const open = this.#requireFile(entry, "write");
+    this.#requireWritable("write", entry.path);
+    const offset = this.#offset(request.offset, "write");
+    const { bytesWritten } = await this.#withHandle(entry, open, (handle) =>
+      handle.write(request.data, 0, request.data.byteLength, offset),
+    );
+    return this.#framed(
+      header,
+      P9_RWRITE,
+      (writer) => writeRwrite(writer, { count: Math.max(0, bytesWritten) }),
+      16,
+    );
+  }
+
+  /**
+   * `Tfsync` — flush what the fid has open.
+   *
+   * `datasync` picks `FileHandle.datasync()` and falls back to `sync()`, which
+   * is `src/fuse/session.ts`'s `FSYNC` exactly: a driver that only implements
+   * one of the two flushes more than asked, never less.
+   *
+   * **A `handles: false` driver still gets a real flush**, because `#withHandle`
+   * re-opens the path for it and syncs *that* handle. It is FUSE's choice and
+   * it is the useful one: for a driver whose state lives in the file rather
+   * than in the handle (the `node:fs` passthrough, most obviously) an `fsync`
+   * on a fresh descriptor for the same file is the same syscall on the same
+   * inode. Answering a bare success instead would be quietly telling a client
+   * its data is durable when nothing was asked to make it so.
+   *
+   * A directory fid is a success with no work: there is nothing open to flush,
+   * and `fsync(2)` on a directory is a promise about the *entries*, which the
+   * driver interface cannot express and no driver here buffers.
+   */
+  async #fsync(header: P9Header, request: Tfsync): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    const open = this.#requireOpen(entry, "fsync");
+    if (!open.directory) {
+      await this.#withHandle(entry, open, async (handle) => {
+        const flush = request.datasync === 0 ? handle.sync : (handle.datasync ?? handle.sync);
+        await flush?.call(handle);
+      });
+    }
+    return this.#framed(header, P9_RFSYNC);
+  }
+
+  // -------------------------------------------------------------------------
+  // Tsetattr
+  // -------------------------------------------------------------------------
+
+  /**
+   * `Tsetattr` — the `P9_SETATTR_*` bitmask, applied one bit at a time.
+   *
+   * The order is `src/fuse/session.ts`'s `SETATTR`, and it is the order a shell
+   * would have issued them in: mode and ownership first, then the size, then
+   * the timestamps — so an explicit `mtime` in the same message wins over the
+   * one the truncate just set.
+   *
+   * **`P9_SETATTR_CTIME` is accepted and does nothing**, deliberately. The
+   * kernel really does send it — `v9fs_mapped_iattr_valid()` maps `ATTR_CTIME`,
+   * and the VFS sets `ATTR_CTIME` on nearly every `notify_change()` — but the
+   * message carries no ctime *value* (there is no field for one: the bit can
+   * only ever mean "now"), and POSIX already says a ctime is stamped by the
+   * metadata change itself. So every driver that stored the `chmod` or the
+   * `chown` in the same request has already done what the bit asks, and no
+   * driver has an interface to do it separately. Refusing the bit would fail
+   * almost every `chmod` on the mount; honoring it separately is impossible;
+   * ignoring it is both correct and what diod does.
+   *
+   * `uid` and `gid` are read only when their own bits are set — the `(uid_t)-1`
+   * convention `chown(2)` uses does not apply on this wire, the mask does the
+   * saying — and the value passed for the one that is absent is `-1`, which is
+   * where that convention *does* live, in the driver call.
+   */
+  async #setattr(header: P9Header, request: Tsetattr): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    const { valid } = request;
+    const path = entry.path;
+    this.#requireWritable("setattr", path);
+    // Only a *real* handle: a `handles: false` fid has nothing to truncate
+    // through, and re-opening one to truncate it would repeat the open's flags
+    // for no gain over `truncate(path)`.
+    const handle = entry.open?.handle;
+
+    if ((valid & P9_SETATTR_MODE) !== 0) {
+      await this.driver.chmod(path, request.mode & 0o7777);
+    }
+    if ((valid & (P9_SETATTR_UID | P9_SETATTR_GID)) !== 0) {
+      const uid = (valid & P9_SETATTR_UID) === 0 ? -1 : request.uid;
+      const gid = (valid & P9_SETATTR_GID) === 0 ? -1 : request.gid;
+      await this.#nofollow(
+        () => this.driver.lchown(path, uid, gid),
+        () => this.driver.chown(path, uid, gid),
+      );
+    }
+    if ((valid & P9_SETATTR_SIZE) !== 0) {
+      const size = this.#offset(request.size, "truncate");
+      await (handle === undefined ? this.driver.truncate(path, size) : handle.truncate(size));
+    }
+    if ((valid & (P9_SETATTR_ATIME | P9_SETATTR_MTIME)) !== 0) {
+      await this.#setTimes(path, request);
+    }
+    return this.#framed(header, P9_RSETATTR);
+  }
+
+  /**
+   * The time half of a `Tsetattr`.
+   *
+   * A time bit *without* its `_SET` companion means "use the server's clock"
+   * and the value in the message is then ignored — the one place 9P's setattr
+   * differs in shape from FUSE's, which spends two bits on the same idea
+   * (`FATTR_ATIME` plus `FATTR_ATIME_NOW`). `utimes` sets both stamps at once,
+   * so a request naming only one has to read the other back first.
+   *
+   * Nanoseconds survive only through the `mountx.utimens` extension:
+   * `fs.utimes` takes float seconds and loses them, and 9P is the transport
+   * that would otherwise carry them intact.
+   */
+  async #setTimes(path: string, request: Tsetattr): Promise<void> {
+    const { valid } = request;
+    const wantAtime = (valid & P9_SETATTR_ATIME) !== 0;
+    const wantMtime = (valid & P9_SETATTR_MTIME) !== 0;
+    const nowNs = BigInt(Math.round(Date.now() * 1e6));
+    let current: StatsLike | undefined;
+    if (!wantAtime || !wantMtime) {
+      current = await this.#statOf(path);
+    }
+    const chosen = (
+      want: boolean,
+      set: boolean,
+      time: P9Time,
+      fallbackMs: number | undefined,
+    ): bigint => {
+      if (!want) {
+        return BigInt(Math.round(Math.max(0, fallbackMs ?? 0) * 1e6));
+      }
+      return set ? time.sec * 1_000_000_000n + time.nsec : nowNs;
+    };
+    const atimeNs = chosen(
+      wantAtime,
+      (valid & P9_SETATTR_ATIME_SET) !== 0,
+      request.atime,
+      current?.atimeMs,
+    );
+    const mtimeNs = chosen(
+      wantMtime,
+      (valid & P9_SETATTR_MTIME_SET) !== 0,
+      request.mtime,
+      current?.mtimeMs,
+    );
+
+    const utimens = this.driver.mountx?.utimens;
+    if (utimens !== undefined) {
+      await utimens.call(this.driver.mountx, path, atimeNs, mtimeNs);
+      return;
+    }
+    const [atime, mtime] = [Number(atimeNs) / 1e9, Number(mtimeNs) / 1e9];
+    await this.#nofollow(
+      () => this.driver.lutimes(path, atime, mtime),
+      () => this.driver.utimes(path, atime, mtime),
+    );
+  }
+
+  /**
+   * Prefer the `AT_SYMLINK_NOFOLLOW` form of a metadata call.
+   *
+   * A fid names a file, and that file can be a symlink — the client resolves
+   * symlinks itself, so anything reaching this server is already the final
+   * component. Following it would stamp the target instead, which is wrong when
+   * the target exists and `ENOENT` when it does not. Both FUSE and NFS carry
+   * this for the same reason; `tar -xp` is the case that found it, since it
+   * restores a symlink before whatever it points at and then stamps it.
+   */
+  async #nofollow<T>(preferred: () => Promise<T>, following: () => Promise<T>): Promise<T> {
+    try {
+      return await preferred();
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOSYS") {
+        return following();
+      }
+      throw error;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // creating things: mkdir, symlink, mknod, link, readlink
+  // -------------------------------------------------------------------------
+
+  async #mkdir(header: P9Header, request: Tmkdir): Promise<Uint8Array> {
+    const parent = this.fids.require(request.dfid);
+    this.#requireWritable("mkdir", parent.path);
+    const path = this.#childOf(parent, request.name, "mkdir");
+    await this.driver.mkdir(path, { mode: request.mode & 0o7777 });
+    await this.#claim(path, request.dfid, request.gid);
+    return this.#qidReply(header, P9_RMKDIR, await this.#qidOf(path));
+  }
+
+  /**
+   * `Tsymlink`. The target is opaque — never resolved, never normalized: it may
+   * be relative, and it means whatever it means when something walks through it.
+   */
+  async #symlink(header: P9Header, request: Tsymlink): Promise<Uint8Array> {
+    const parent = this.fids.require(request.dfid);
+    this.#requireWritable("symlink", parent.path);
+    const path = this.#childOf(parent, request.name, "symlink");
+    await this.driver.symlink(request.symtgt, path);
+    await this.#claim(path, request.dfid, request.gid);
+    return this.#qidReply(header, P9_RSYMLINK, await this.#qidOf(path));
+  }
+
+  /**
+   * `Tmknod` — a device, fifo or socket node.
+   *
+   * `mountx.mknod` when the driver declares it, `ENOSYS` when it does not, and
+   * one fallback in between that is `src/fuse/session.ts`'s: a `mode` naming a
+   * *regular* file (or naming no type at all) is an `open(O_CREAT|O_EXCL)`,
+   * because that is a thing every driver can do and `mknod(path, S_IFREG)` is
+   * how a few tools still create an empty file.
+   *
+   * `major`/`minor` arrive as separate fields and are packed into the single
+   * `dev` the extension takes the way `NfsSession` packs a `specdata3` — one
+   * packing across the project, since nothing implements the extension yet and
+   * two would be a difference nobody could act on.
+   *
+   * The flags this fallback originates are the **host's**, not the wire's: they
+   * are ours rather than the client's, so no translation applies to them.
+   */
+  async #mknod(header: P9Header, request: Tmknod): Promise<Uint8Array> {
+    const parent = this.fids.require(request.dfid);
+    this.#requireWritable("mknod", parent.path);
+    const path = this.#childOf(parent, request.name, "mknod");
+    const mknod = this.driver.mountx?.mknod;
+    if (mknod !== undefined) {
+      await mknod.call(
+        this.driver.mountx,
+        path,
+        request.mode,
+        (request.major << 8) | request.minor,
+      );
+    } else if ((request.mode & S_IFMT) === S_IFREG || (request.mode & S_IFMT) === 0) {
+      const handle = await this.driver.open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        request.mode & 0o7777,
+      );
+      await this.#closeQuietly(handle);
+    } else {
+      throw fsError("ENOSYS", { syscall: "mknod", path });
+    }
+    await this.#claim(path, request.dfid, request.gid);
+    return this.#qidReply(header, P9_RMKNOD, await this.#qidOf(path));
+  }
+
+  /**
+   * `Tlink` — one file, one more name.
+   *
+   * No `#claim`: a hardlink creates no inode, so there is no ownership to give
+   * away — the file it names already belongs to whoever made it. `Rlink` is
+   * bodyless for the same reason there is no qid to report.
+   */
+  async #link(header: P9Header, request: Tlink): Promise<Uint8Array> {
+    const existing = this.fids.require(request.fid);
+    const parent = this.fids.require(request.dfid);
+    this.#requireWritable("link", parent.path);
+    const path = this.#childOf(parent, request.name, "link");
+    await this.driver.link(existing.path, path);
+    return this.#framed(header, P9_RLINK);
+  }
+
+  /** `Treadlink` — the link's contents, verbatim. */
+  async #readlink(header: P9Header, fid: number): Promise<Uint8Array> {
+    const entry = this.fids.require(fid);
+    const target = await this.driver.readlink(entry.path);
+    return this.#framed(
+      header,
+      P9_RREADLINK,
+      (writer) => writeRreadlink(writer, { target }),
+      target.length * 3 + 16,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // moving and removing: rename, renameat, unlinkat, remove
+  // -------------------------------------------------------------------------
+
+  /**
+   * The rename both messages perform: move the tree, then move the fids.
+   *
+   * {@link FidTable.remap} is what keeps a client's open fids working across a
+   * rename it did not perform — `mv` on a directory somebody is reading is not
+   * exotic — and it is also what drops the identities under the *destination*,
+   * whose files have just been replaced. That release is remap's, not this
+   * caller's: doing it here as well would detach an identity the remap has
+   * already rebound to the moved file.
+   *
+   * Runs as the path lock's writer; see the dispatch.
+   */
+  async #renameTo(from: string, to: string): Promise<void> {
+    await this.driver.rename(from, to);
+    this.fids.remap(from, to);
+  }
+
+  /** `Trename` — move what `fid` names to `name` under `dfid`. */
+  async #rename(header: P9Header, request: Trename): Promise<Uint8Array> {
+    const entry = this.fids.require(request.fid);
+    const parent = this.fids.require(request.dfid);
+    this.#requireWritable("rename", entry.path);
+    await this.#renameTo(entry.path, this.#childOf(parent, request.name, "rename"));
+    return this.#framed(header, P9_RRENAME);
+  }
+
+  /** `Trenameat` — the `renameat(2)` shape: two directories and two names. */
+  async #renameat(header: P9Header, request: Trenameat): Promise<Uint8Array> {
+    const oldDir = this.fids.require(request.olddirfid);
+    const newDir = this.fids.require(request.newdirfid);
+    this.#requireWritable("rename", oldDir.path);
+    await this.#renameTo(
+      this.#childOf(oldDir, request.oldname, "rename"),
+      this.#childOf(newDir, request.newname, "rename"),
+    );
+    return this.#framed(header, P9_RRENAMEAT);
+  }
+
+  /**
+   * `Tunlinkat` — `unlink`, or `rmdir` with `AT_REMOVEDIR`.
+   *
+   * The fid a client may hold on the removed file is **not** clunked: that is
+   * `Tremove`'s job and this message's whole point of difference. What is
+   * dropped is the *identity* — see `#released`.
+   */
+  async #unlinkat(header: P9Header, request: Tunlinkat): Promise<Uint8Array> {
+    const directory = (request.flags & P9_DOTL_AT_REMOVEDIR) !== 0;
+    const syscall = directory ? "rmdir" : "unlink";
+    const parent = this.fids.require(request.dirfid);
+    this.#requireWritable(syscall, parent.path);
+    const path = this.#childOf(parent, request.name, syscall);
+    await (directory ? this.driver.rmdir(path) : this.driver.unlink(path));
+    this.#released(path);
+    return this.#framed(header, P9_RUNLINKAT);
+  }
+
+  /**
+   * `Tremove` — remove what the fid names, **and clunk it either way**.
+   *
+   * The clunk is unconditional and it is the protocol's rule, not a
+   * simplification: 9P2000's `remove(5)` says the fid is clunked even if the
+   * remove fails, and `p9_client_remove()` (v6.12) destroys its side of the fid
+   * in the `error:` path as readily as in the successful one. A server that
+   * kept the fid on failure would be holding one the client has already
+   * forgotten, and nothing would ever come to clunk it. So the fid goes first,
+   * synchronously, before anything can throw.
+   *
+   * Which call to make is the server's to work out — the message says "remove",
+   * not "unlink" or "rmdir" — so it costs one `lstat`.
+   */
+  async #remove(header: P9Header, fid: number): Promise<Uint8Array> {
+    const entry = this.fids.clunk(fid);
+    this.#users.delete(fid);
+    const handle = entry.open?.handle;
+    entry.open = undefined;
+    if (handle !== undefined) {
+      await this.#closeQuietly(handle);
+    }
+    this.#requireWritable("remove", entry.path);
+    const stats = await this.#statOf(entry.path);
+    const directory = (stats.mode & S_IFMT) === S_IFDIR;
+    await (directory ? this.driver.rmdir(entry.path) : this.driver.unlink(entry.path));
+    this.#released(entry.path);
+    return this.#framed(header, P9_RREMOVE);
+  }
+
+  /**
+   * A path stopped existing: forget the `qid.path` bound to it.
+   *
+   * Without this a path that is removed and created again inherits the dead
+   * file's identity, and the client — which caches pages and dentries against
+   * `qid.path` — serves the old file's data for the new one. `FidTable.release`
+   * keeps a hardlinked file's identity until its last name goes, so this is
+   * safe to call for every removal.
+   */
+  #released(path: string): void {
+    this.fids.release(path);
+  }
+
+  // -------------------------------------------------------------------------
+  // locks
+  // -------------------------------------------------------------------------
+
+  /**
+   * `Tlock` — granted, always.
+   *
+   * This is the `nolock` decision `src/nfs/mount.ts` makes, arrived at from the
+   * other side. A 9P mount served here has exactly one client: the connection
+   * *is* the session, and `mount9p()` hands the socket to one kernel. That
+   * kernel already does the POSIX-lock bookkeeping for every process on its own
+   * side — `fs/9p` calls `locks_lock_file_wait()` before it ever sends a
+   * `Tlock` — so the locking users actually observe is real and local, and what
+   * this reply adds is whether a *second* client could conflict. There is no
+   * second client.
+   *
+   * Granting is therefore honest and refusing would not be: `P9_LOCK_ERROR`
+   * makes `fcntl(F_SETLK)` fail on a mount where nothing is contending, which
+   * breaks sqlite, dpkg and every lockfile idiom for no protection at all. If
+   * `createP9Server` ever grows real multi-client use, this is where the table
+   * goes — noted in `.agents/roadmap.md`.
+   */
+  async #setlk(header: P9Header, request: Tlock): Promise<Uint8Array> {
+    // The fid is required, so a lock on a fid that does not exist is still the
+    // client's bug and still `EBADF`.
+    this.fids.require(request.fid);
+    return this.#framed(
+      header,
+      P9_RLOCK,
+      (writer) => writeRlock(writer, { status: P9_LOCK_SUCCESS }),
+      16,
+    );
+  }
+
+  /**
+   * `Tgetlock` — nothing is locked.
+   *
+   * The counterpart of `#setlk`: this server holds no lock
+   * table, so there is no conflicting lock to report and `P9_LOCK_TYPE_UNLCK`
+   * is the truthful answer. The range and the client identity are echoed back
+   * because `p9_client_getlock_dotl()` copies them into the caller's `flock`,
+   * and a reply that invented a range would describe a lock nobody holds.
+   */
+  async #getlk(header: P9Header, request: Tgetlock): Promise<Uint8Array> {
+    this.fids.require(request.fid);
+    return this.#framed(
+      header,
+      P9_RGETLOCK,
+      (writer) =>
+        writeRgetlock(writer, {
+          type: P9_LOCK_TYPE_UNLCK,
+          start: request.start,
+          length: request.length,
+          procId: request.procId,
+          clientId: request.clientId,
+        }),
+      48,
     );
   }
 

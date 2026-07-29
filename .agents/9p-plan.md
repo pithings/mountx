@@ -134,7 +134,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       `test/9p/client.ts`: Tier-1 JS client speaking to the session (built on
       the same codecs, like `test/nfs/client.ts`). `test/9p/session.test.ts`
       for this step's ops. Commit.
-- [ ] **5. Session I/O + namespace ops** — lopen/lcreate (flags through
+- [x] **5. Session I/O + namespace ops** — lopen/lcreate (flags through
       `driverOpenFlags()`; `handles: false` drivers get the reopen-per-op path
       with `reopenFlags()` semantics), read/write (clamped to msize−IOHDRSZ,
       payload copied before await), fsync, setattr (bitmask → driver calls,
@@ -290,3 +290,21 @@ deferred)
   re-run. Nit carried: destroyed-session getters can report an msize if
   destroy() interleaves inside a parked Tversion reset (cosmetic, gate
   still refuses requests).
+- 2026-07-29 step 5: every remaining opcode in `session.ts` (+1147 lines),
+  139 session tests, both open models. Verifier round 1 FAILED on two:
+  overlapping Tlopen/Tlcreate on one fid leaked a driver handle forever
+  (the open-guard ran in the prologue but `entry.open` was assigned after
+  awaits — matters because step 7's TCP server faces arbitrary clients),
+  and a comment cited a false kernel fact (v9fs DOES map O_CREAT; O_TRUNC
+  is the never-mapped one, and `do_dentry_open` strips
+  O_CREAT|O_EXCL|O_NOCTTY|O_TRUNC before Tlopen). Fixed via
+  `#ensureOpenable` post-await re-check (loser closes its handle, answers
+  EBUSY, distinct from sequential-double-open EINVAL); Rlopen re-stats
+  after O_TRUNC opens. Round 2 PASS: opens==closes across a 150-round
+  6-op-per-round same-fid race stress. Decisions recorded in-code: iounit
+  0, directory opens ask the driver nothing, fsync-via-reopen for
+  handles:false, CTIME bit accepted as no-op, Tremove clunks even on
+  failure/EROFS. Step-12 doc note: a Tlcreate loser's created file
+  survives with no fid pointing at it (deliberate; one line in the docs
+  page). Twrite is unclamped at session level (frame assembler bounds it
+  in real transports; harness-only reachability, documented).
