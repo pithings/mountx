@@ -16,9 +16,11 @@ import { createNodeFsDriver } from "../../src/drivers/node-fs.ts";
 import { ERRNO_CODES } from "../../src/errors.ts";
 import {
   FATTR_ATIME,
+  FATTR_GID,
   FATTR_MODE,
   FATTR_MTIME,
   FATTR_SIZE,
+  FATTR_UID,
   FUSE_GETATTR,
   FUSE_INIT,
   FUSE_LOOKUP,
@@ -44,6 +46,7 @@ import {
   type FuseInitOut,
 } from "../../src/fuse/protocol.ts";
 import { createFuseSession, FuseSession, type FuseSessionOptions } from "../../src/fuse/session.ts";
+import { createLoopback } from "../../src/harness.ts";
 import { S_IFDIR, S_IFMT, S_IFREG, type FsDriver, type StatsLike } from "../../src/types.ts";
 import { KernelError, SyntheticKernel } from "./synthetic-kernel.ts";
 
@@ -775,6 +778,130 @@ describe("SETATTR", () => {
     });
     expect(attr.attr.size).toBe(2n);
     await kernel.release(file.entry.nodeid, file.open.fh);
+    expectHealthy(session);
+  });
+});
+
+describe("id maps", () => {
+  /**
+   * A driver whose files are owned by {@link OWNER}, and a kernel whose caller
+   * is 0 — the shape `mountx/exec` produces, where the mount lives in an
+   * `unshare -r` user namespace that maps the invoking user onto 0 and nothing
+   * else.
+   *
+   * The stakes are not cosmetic: an id the *mount's* namespace cannot map makes
+   * `may_delete()` answer `-EOVERFLOW` and `inode_permission()` answer `-EACCES`
+   * on write, both inside the VFS, so the session never even sees the request
+   * that failed. There is no way to catch that here — no kernel — so what is
+   * pinned instead is the byte that decides it.
+   *
+   * The uid and gid are deliberately different numbers, and the map answers
+   * them separately, so a crossing that passed the wrong `group` flag — or
+   * dropped one of the two — shows up as a wrong number rather than as a value
+   * that happens to be right for both.
+   */
+  const OWNER = { uid: 1000, gid: 2000 };
+  const NS_IDS = {
+    toMount: () => 0,
+    fromMount: (id: number, group: boolean) => (id === 0 ? (group ? 2000 : 1000) : id),
+  };
+
+  function namespaced(options: FuseSessionOptions = {}): {
+    driver: ReturnType<typeof createMemoryDriver>;
+    session: FuseSession;
+    kernel: SyntheticKernel;
+  } {
+    const driver = createMemoryDriver(OWNER);
+    const session = new FuseSession(driver, options);
+    return { driver, session, kernel: new SyntheticKernel(session, { uid: 0, gid: 0 }) };
+  }
+
+  it("puts the mount's ids on the wire, not the driver's", async () => {
+    const { driver, session, kernel } = namespaced({ idmap: NS_IDS });
+    await kernel.init();
+    await createLoopback(driver).writeFile("/pre.txt", "x\n");
+
+    // Both the paths a nodeid is learned through, because the bug this pins was
+    // discovered as "created files can be deleted and looked-up ones cannot".
+    const entry = await kernel.lookup(FUSE_ROOT_ID, "pre.txt");
+    expect(entry.attr.uid).toBe(0);
+    expect(entry.attr.gid).toBe(0);
+    const attr = await kernel.getattr(entry.nodeid);
+    expect(attr.attr.uid).toBe(0);
+    expect(attr.attr.gid).toBe(0);
+    expectHealthy(session);
+  });
+
+  it("is the identity with no map configured", async () => {
+    const { driver, session, kernel } = namespaced();
+    await kernel.init();
+    await createLoopback(driver).writeFile("/pre.txt", "x\n");
+
+    const entry = await kernel.lookup(FUSE_ROOT_ID, "pre.txt");
+    expect(entry.attr.uid).toBe(1000);
+    expect(entry.attr.gid).toBe(2000);
+    expectHealthy(session);
+  });
+
+  it("reads the caller's id back into the driver's space before handing a file over", async () => {
+    // The ownership hand-off compares the caller against this process, and both
+    // sides of that comparison have to be in one id space. Read the wire value
+    // raw and a caller who *is* this process wearing another number looks like
+    // a stranger, so every file the command creates is handed to a uid 0 that
+    // means nothing out here — which is what used to happen.
+    const { driver, session, kernel } = namespaced({ idmap: NS_IDS });
+    await kernel.init();
+    await kernel.mkdir(FUSE_ROOT_ID, "made");
+    const stats = await createLoopback(driver).lstat("/made");
+    expect([stats.uid, stats.gid]).toEqual([1000, 2000]);
+    expectHealthy(session);
+  });
+
+  it("still hands a file over to a caller who really is someone else", async () => {
+    // The map must not have quietly disabled the hand-off: an id it does not
+    // rewrite is a different user, and gets the file exactly as before. Derived
+    // from this process's own ids so it is a stranger on any host.
+    const foreign = Math.max(process.getuid?.() ?? 0, process.getgid?.() ?? 0) + 4242;
+    const { driver, session, kernel } = namespaced({ idmap: NS_IDS });
+    await kernel.init();
+    const other = new SyntheticKernel(session, { uid: foreign, gid: foreign });
+    await other.mkdir(FUSE_ROOT_ID, "theirs");
+    const stats = await createLoopback(driver).lstat("/theirs");
+    expect([stats.uid, stats.gid]).toEqual([foreign, foreign]);
+    expectHealthy(session);
+  });
+
+  it("maps SETATTR's uid and gid back into the driver's space", async () => {
+    const { driver, session, kernel } = namespaced({ idmap: NS_IDS });
+    await kernel.init();
+    const fs = createLoopback(driver);
+    await fs.writeFile("/pre.txt", "x\n");
+    await fs.lchown("/pre.txt", 7, 7);
+
+    const entry = await kernel.lookup(FUSE_ROOT_ID, "pre.txt");
+    // `chown 0:0` from inside the namespace means "make it mine", and mine out
+    // here is 1000:2000 — not a 0:0 the driver's world has never heard of.
+    await kernel.setattr(entry.nodeid, { valid: FATTR_UID | FATTR_GID, uid: 0, gid: 0 });
+    const stats = await fs.lstat("/pre.txt");
+    expect([stats.uid, stats.gid]).toEqual([1000, 2000]);
+    expectHealthy(session);
+  });
+
+  it("leaves SETATTR's `leave it alone` sentinel out of the map", async () => {
+    // `-1` is POSIX, not an id, and a map that saw it would chown the half the
+    // caller asked to keep. The map here would mangle it visibly.
+    const { driver, session, kernel } = namespaced({
+      idmap: { toMount: (id) => id, fromMount: (id) => id + 100 },
+    });
+    await kernel.init();
+    const fs = createLoopback(driver);
+    await fs.writeFile("/pre.txt", "x\n");
+    await fs.lchown("/pre.txt", 7, 9);
+
+    const entry = await kernel.lookup(FUSE_ROOT_ID, "pre.txt");
+    await kernel.setattr(entry.nodeid, { valid: FATTR_UID, uid: 5, gid: 0 });
+    const stats = await fs.lstat("/pre.txt");
+    expect([stats.uid, stats.gid]).toEqual([105, 9]);
     expectHealthy(session);
   });
 });

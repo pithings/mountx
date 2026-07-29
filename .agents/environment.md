@@ -322,3 +322,31 @@ vers=3,proto=tcp,port=…,mountport=…,nolocks,soft,nobrowse 127.0.0.1:/ ./mnt`
   approval), then `sudo umount -f`, then reboot. A hung `umount` does **not** die
   on `SIGKILL` — it is parked in the kernel — which is why `run()` in
   `src/nfs/mount.ts` settles on its own deadline instead of waiting for `close`.
+
+## Unprivileged interception, no mount (verified 2026-07-29, this Linux host)
+
+Established while spiking the `proot`-style `exec()` work
+(`.agents/proot-plan.md`). Kernel 6.12.96 (Debian 13), glibc 2.43, x86-64.
+
+- **There is no `fusermount3` on this host at all** — not at `/usr/bin`, not
+  anywhere on `PATH`. So the rootless FUSE path (`src/fuse/fusermount.ts`)
+  cannot run here, and `pnpm test:rootless`'s FUSE column skips itself for that
+  reason rather than for a missing prebuilt.
+- **Unprivileged user namespaces work**, and are the way around it:
+  `unshare -Urm` yields uid 0 with `CapEff: 000001ffffffffff`, `/dev/fuse` is
+  `crw-rw-rw-`, and `mount -t tmpfs` inside succeeds. A FUSE mount made in
+  there needs **no helper, no root and no native addon** — it is the ordinary
+  root path in `src/fuse/mount.ts`, which keys off `getuid() === 0`. The mount
+  is invisible in the host's `/proc/self/mounts` and dies with the namespace.
+  This is what `src/exec/userns.ts` is built on, and it is why that suite is
+  the one Tier-2 mount column that passes on this host.
+- **Node can never enter such a namespace itself.** `unshare(CLONE_NEWUSER)`
+  and `setns(2)` both require a single-threaded caller; Node has the libuv
+  threadpool up before user code runs. Any design here needs a child process.
+- **seccomp user notification works unprivileged here too.** A filter installed
+  with `SECCOMP_FILTER_FLAG_NEW_LISTENER` after `PR_SET_NO_NEW_PRIVS` succeeds,
+  and `SECCOMP_IOCTL_NOTIF_ADDFD` can inject a descriptor into the tracee. This
+  is true even though the shell already runs under a seccomp filter of its own
+  (`Seccomp: 2`, `Seccomp_filters: 1` in `/proc/self/status`) — filters stack.
+  Recorded because it is a verified host fact, not because anything on this
+  branch uses it: the mechanism that did lives in the history of PR #9.

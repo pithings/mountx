@@ -139,6 +139,33 @@ results.
   column (no host could mount 9P when the benchmark suite was last run — see
   "Future / deferred", now that one can).
 
+- **`mountx/exec`** (2026-07-29). A `proot`-shaped `exec()`: run a command
+  with a driver grafted onto its filesystem view at `$MOUNTX_ROOT`, visible
+  to that process tree and to nothing else on the machine, resolving with
+  that command's exit status. One mechanism ships — **the user namespace**:
+  FUSE inside `unshare -U -r -m`, the driver staying in the calling process,
+  raw traffic relayed over a unix socket because `unshare(CLONE_NEWUSER)`
+  refuses a threaded caller and Node is never single-threaded. No root, no
+  `fusermount3`, no native addon, on any path. `probeExec()` publishes what
+  it can do here and why not; the mechanism arrives through `await import()`,
+  and the result is its own object with a `mechanism` discriminant defined
+  on it. `src/exec/probe.ts` is import-light in `src/nfs/probe.ts`'s sense
+  and names causes a caller can act on rather than one errno.
+  Deliberately **outside `mountx/auto`**, whose contract is a mountpoint this
+  produces none of — the line `mountx/s3` already sits on.
+  What was deliberately **not** done: **a second mechanism on this branch.**
+  A seccomp user-notification supervisor was built and measured alongside
+  this one, works where `/dev/fuse` is withheld (which is the case that
+  motivated the question — a container withholding the device withholds it
+  from a namespace root too, since `mknod` there answers `EPERM`), and lives
+  in the history of **PR #9 on `pithings/mountx`** rather than here; the
+  picker keeps the seam for it (`ExecMechanism`, `preference`, the result
+  discriminant) without inventing a second entry to fill. Also not done: a
+  conformance-matrix column, which for this mechanism would duplicate FUSE's
+  exactly since what the child sees _is_ FUSE; and `default_permissions` on
+  the namespace mount, because the kernel checking a driver's uid against a
+  namespace that maps exactly one turns every write into `EACCES`.
+
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
@@ -171,6 +198,22 @@ rather than by accident.
   is also where `src/9p/`'s deferred `trans=fd` would finally earn its keep:
   it wants a descriptor the relay already holds, where `mount9p()`'s own
   `trans=unix` has nothing to relay to.
+- **`mountx/exec` without `/dev/fuse`.** The one mechanism here is a real
+  kernel mount, so a host or container that withholds the device is a host
+  it cannot serve, and nothing can be done about that from the inside. The
+  measured answer is a seccomp user-notification supervisor, which needs no
+  device node, no kernel module and no shared library; it exists in the
+  history of PR #9 on `pithings/mountx` and would come back as a second arm
+  of `ExecMechanism` rather than as a new API. `.agents/proot-plan.md` has
+  what it showed and what was still open when it was set aside.
+- **A conformance-matrix column for `mountx/exec`.** There is none. For the
+  user-namespace mechanism it would duplicate the FUSE column exactly (what
+  the child sees _is_ FUSE, through the kernel's VFS), which is an argument
+  for never writing it rather than for writing it later.
+- **`mountx/exec` on macOS.** Nothing here transfers: no user namespaces, and
+  SIP blocks `DYLD_INSERT_LIBRARIES` for exactly the system binaries anyone
+  would want to run. macOS stays NFS-mount territory, and the honest answer
+  is that this feature is Linux's.
 - **A 9P bench column.** `bench/` has loopback and NFS columns and a
   sudo-gated FUSE one; 9P has none yet, and unlike when the transport was
   designed, a host that can mount it now exists (`.agents/environment.md`).
