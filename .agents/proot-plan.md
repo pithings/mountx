@@ -6,9 +6,16 @@ injects `LD_PRELOAD`, or any other universal syscall-inspection route?
 
 Answer: yes, two different ways, and they are not close in quality. This file
 records what was built, what was measured, and what should happen next.
-Everything here is uncommitted spike code on `feat/proot`; nothing is wired
-into `mountx/auto`, exported from a subpath, or covered by the conformance
-matrix.
+
+**Status (2026-07-29): the recommendation at the bottom was carried out.**
+Both surviving mechanisms ship behind one picker at `mountx/exec` — see the
+roadmap's "Shipped since v1" entry, `docs/2.transports/6.exec.md` for the
+user-facing page, and `AGENTS.md`'s code map for the file-by-file account.
+`LD_PRELOAD` was dropped as recommended and is reachable from nothing that
+ships. Neither mechanism has a conformance-matrix column, and nothing is
+wired into `mountx/auto` — deliberately, since `auto`'s contract is a
+mountpoint and this produces none. The measurements below are unchanged and
+are what the decision rests on.
 
 ## The structural finding
 
@@ -28,14 +35,14 @@ already tests.
 
 ## What was built
 
-|     | file                                       | what it is                                                             |
-| --- | ------------------------------------------ | ---------------------------------------------------------------------- |
-| A   | `src/exec/userns.ts`, `userns-relay.ts`    | FUSE inside an unprivileged user namespace, driver stays in the parent |
-| B   | `src/exec/preload.ts`, `preload/shim.zig`  | `LD_PRELOAD` libc interposer → 9P                                      |
-| C   | `src/exec/seccomp.ts`, `seccomp/trace.zig` | seccomp user-notification supervisor → 9P                              |
-| —   | `src/exec/preload/p9.zig`                  | the 9P2000.L client both B and C are built on                          |
-| —   | `test/exec/probe.c`, `probe-raw.c`         | one workload, three linkages                                           |
-| —   | `test/exec/compare.sh`                     | builds everything and runs the matrix                                  |
+|     | file                                       | what it is                                                             | today                          |
+| --- | ------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------ |
+| A   | `src/exec/userns.ts`, `userns-relay.ts`    | FUSE inside an unprivileged user namespace, driver stays in the parent | ships, first choice            |
+| B   | `src/exec/preload.ts`, `preload/shim.zig`  | `LD_PRELOAD` libc interposer → 9P                                      | **rejected**, kept as evidence |
+| C   | `src/exec/seccomp.ts`, `seccomp/trace.zig` | seccomp user-notification supervisor → 9P                              | ships, second choice           |
+| —   | `src/exec/preload/p9.zig`                  | the 9P2000.L client both B and C are built on                          | shared verbatim                |
+| —   | `test/exec/probe.c`, `probe-raw.c`         | one workload, three linkages                                           | the spike harness              |
+| —   | `test/exec/compare.sh`                     | builds everything and runs the matrix                                  | the spike harness              |
 
 ## Measured results
 
@@ -83,7 +90,8 @@ namespace. The roadmap ruled a user-namespace mode out when the goal was
 "mount a directory for the machine"; for an `exec()`-shaped API the tradeoff
 inverts, and invisible is the point.
 
-Three things it cost, all witnessed:
+Four things it cost, all witnessed — the first three during the spike, the
+last one while productionising it:
 
 - **Node can never enter the namespace.** `unshare(CLONE_NEWUSER)` requires a
   single-threaded caller and Node is never single-threaded; `setns(2)` has the
@@ -101,6 +109,18 @@ Three things it cost, all witnessed:
   after the exec.
 - **A killed parent orphans a wedged mount.** Handled by having the relay exit
   when the socket closes.
+- **`default_permissions` makes the mount read-only by accident.** Found while
+  productionising A (2026-07-29), not during the spike, because the spike's
+  workload never wrote. The option asks the _kernel_ to check the driver's
+  `uid`/`gid`/`mode` against the caller's credentials, and inside the namespace
+  those are not the same identity space: `unshare -r` maps exactly one uid, so
+  a driver reporting the serving process's real uid reports an identity the
+  namespace renders as `nobody`, and a `nobody`-owned `0755` root directory
+  refuses every write from the one process meant to have it. Namespace-root's
+  `CAP_DAC_OVERRIDE` does not rescue it either — that capability does not reach
+  a file owned by an unmapped uid. It is no longer the default; permission
+  checking stays with the driver, and the mount carries no `allow_other`, so
+  the only process that can reach it is the one it was created for.
 
 Also worth recording, because it changes what `mountx/auto` could do on this
 class of host: **this host has no `fusermount3` at all**, so today's rootless
@@ -313,11 +333,14 @@ that motivated the question in the first place.
 ## Reproducing
 
 ```sh
-sh test/exec/compare.sh          # builds all three, runs the matrix, no root
-node src/exec/spike-a.ts  <cmd>  # userns + FUSE
-MOUNTX_SHIM=…  node src/exec/spike-b.ts <cmd>
+sh test/exec/compare.sh              # builds all three, runs the matrix, no root
+node src/exec/demo-userns.ts  <cmd>  # userns + FUSE
+MOUNTX_SHIM=…  node src/exec/demo-preload.ts <cmd>
 MOUNTX_TRACE=… node src/exec/spike-c.ts <cmd>
-MOUNTX_TRACE_DEBUG=1             # per-syscall tracing for spike C
+MOUNTX_TRACE_DEBUG=1                 # per-syscall tracing for the supervisor
 ```
+
+The runners were `spike-a.ts`/`spike-b.ts`/`spike-c.ts` when the measurements
+below were taken; the first two are now named after their mechanisms.
 
 The command sees the driver at `$MOUNTX_ROOT`, which all three set.

@@ -139,6 +139,38 @@ results.
   column (no host could mount 9P when the benchmark suite was last run — see
   "Future / deferred", now that one can).
 
+- **`mountx/exec`** (2026-07-29). A `proot`-shaped `exec()`: run a command
+  with a driver grafted onto its filesystem view at `$MOUNTX_ROOT`, visible
+  to that process tree and to nothing else on the machine, resolving with
+  that command's exit status. Three mechanisms were built and measured
+  (`.agents/proot-plan.md`); two ship behind one picker. `probeExec()`
+  publishes what each can do here and why not, `exec()` takes the first
+  usable one in preference order — the **user namespace** (FUSE inside
+  `unshare -U -r -m`, driver in the parent, traffic relayed over a unix
+  socket because `unshare(CLONE_NEWUSER)` refuses a threaded caller) where
+  the kernel's FUSE is usable, the **seccomp** user-notification supervisor
+  otherwise, which is the case that motivated the question: a container that
+  withholds `/dev/fuse` withholds it from a namespace root too (`mknod`
+  answers `EPERM`, verified on `alpine:latest`). Both arrive through
+  `await import()`; the result is the mechanism's own object with a
+  `mechanism` discriminant defined on it. `src/exec/probe.ts` is import-light
+  in `src/nfs/probe.ts`'s sense and names causes a caller can act on rather
+  than one errno.
+  Deliberately **outside `mountx/auto`**, whose contract is a mountpoint this
+  produces none of — the line `mountx/s3` already sits on.
+  What was deliberately **not** done: **`LD_PRELOAD` was rejected** rather
+  than finished (it cannot see a Go or static binary by construction, its
+  symbol surface tracks other projects' releases, a descriptor it creates
+  does not survive `exec`, and its characteristic failure is a confident
+  wrong answer — the code stays as the written-up evidence, reachable from
+  its own runner and the comparison harness and from nothing that ships); no
+  conformance-matrix column for either mechanism (the `userns` one would
+  duplicate FUSE's exactly, the `seccomp` one is not ready for it); no
+  supervisor binary in the npm package, so the seccomp mechanism needs a Zig
+  toolchain and `$MOUNTX_TRACE`; and no `default_permissions` on the
+  namespace mount, because the kernel checking a driver's uid against a
+  namespace that maps exactly one turns every write into `EACCES`.
+
 ## Finalized decisions (still binding)
 
 - **Scope:** FUSE (Linux) + NFSv3 loopback transports. WebDAV deferred.
@@ -171,6 +203,29 @@ rather than by accident.
   is also where `src/9p/`'s deferred `trans=fd` would finally earn its keep:
   it wants a descriptor the relay already holds, where `mount9p()`'s own
   `trans=unix` has nothing to relay to.
+- **`mountx/exec`'s seccomp mechanism, past the spike.** It ships as the
+  second choice and covers the case `userns` cannot, but four things are
+  open and each is named in `src/exec/seccomp.ts` and
+  `.agents/proot-plan.md`: **streaming instead of slurping** (a file open
+  copies the whole file into a `memfd`, which is what buys native
+  `read`/`lseek`/`mmap` afterwards and is wrong for a large file and for
+  anything that writes — trapping `read`/`write`/`lseek` per descriptor is
+  the fix, the way `getdents64` already is); **write-back at all**, since it
+  is read-only as spiked; **arm64**, which is a second syscall table rather
+  than a redesign; and **trapping `close`**, which means not sharing a filter
+  with the tracee, i.e. the `SCM_RIGHTS` shape after all — for which
+  `native/` already has `recvFd`. Also: the supervisor is not in the npm
+  package, so the mechanism needs a Zig toolchain and `$MOUNTX_TRACE` today.
+- **A conformance-matrix column for `mountx/exec`.** Neither mechanism has
+  one. The `userns` one would duplicate the FUSE column exactly (what the
+  child sees _is_ FUSE, through the kernel's VFS), which is an argument for
+  never writing it rather than for writing it later; the `seccomp` one is
+  the interesting one and wants the streaming work above first, since a
+  read-only column would be mostly skips.
+- **`mountx/exec` on macOS.** Nothing from any of this transfers: no user
+  namespaces, no seccomp, and SIP blocks `DYLD_INSERT_LIBRARIES` for exactly
+  the system binaries anyone would want to run. macOS stays NFS-mount
+  territory, and the honest answer is that this feature is Linux's.
 - **A 9P bench column.** `bench/` has loopback and NFS columns and a
   sudo-gated FUSE one; 9P has none yet, and unlike when the transport was
   designed, a host that can mount it now exists (`.agents/environment.md`).
