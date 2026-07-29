@@ -158,7 +158,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       memory + node-fs (rooted oracle), like the NFS column. A session fuzz
       file (hostile frames, bad fids, bad tags, flush races) in the spirit of
       `test/fuse/session-fuzz.test.ts`. Fix what they find. Commit.
-- [ ] **7. Server** — `src/9p/server.ts`: `createP9Server(driver, options)` —
+- [x] **7. Server** — `src/9p/server.ts`: `createP9Server(driver, options)` —
       TCP listener, unix-socket listener (0700-checked path), and
       `attach(duplex)` for a socketpair/fd; per-connection framing via
       `framesFrom()`, one `P9Session` per connection, dispatch-without-await +
@@ -327,3 +327,23 @@ deferred)
     hardlink made behind the server's back still exists (`#link` binds, but
     a driver-side link does not). Step-13 follow-up recorded: `test/matrix.ts`
     COLUMNS needs the 9p conformance entry.
+- 2026-07-29 step 7: `server.ts` (TCP / unix-socket / attach(duplex), one
+  session + one assembler per connection, un-awaited dispatch, 22 tests
+  over real sockets). Verifier round 1 FAILED on three: close() hung
+  forever on a half-closed non-reading peer (the connection forgot itself
+  before its socket died, so close() had nothing to hard-drop); reply
+  amplification — backpressure paused future reads but not replies of
+  already-parsed frames, one 64 KB delivery of 2,800 Treads queued 2.93 GB
+  (45,557x, RSS 6 GB); missing .catch on the dispatch chain (attach()ed
+  duplex whose write() throws killed the process). Fixed: `#owned` stream
+  set emptied by each stream's own 'close' event; serialized reply writes
+  awaiting 'drain' + a dispatch window (`DEFAULT_MAX_IN_FLIGHT = 16`,
+  excess waits as parsed frames — bytes, not msize-sized replies); the NFS
+  server's .catch mirrored. Also fixed for real: the assembler's O(n²)
+  re-concat (now a compacting buffer; 256 KiB byte-dribble 7.5 s → 10 ms)
+  since TCP exposes it to arbitrary peers. Round 2 PASS: 3,000-seed
+  differential fuzz of the new assembler, 240-connection chaos soak, all
+  reproductions re-run (amplification now one frame; close() 1 ms).
+  Step-12 notes: teardown is a reset not a flush (peer can see ECONNRESET
+  with replies queued — say so in docs); bench should record
+  `maxInFlight` rather than discover it.

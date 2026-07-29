@@ -1630,7 +1630,23 @@ const copyBytes = (bytes: Uint8Array, start: number, end: number): Uint8Array =>
  * the object on a *new* one, not for carrying on with the old.
  */
 export class P9FrameAssembler {
+  /**
+   * Scratch for the bytes of a frame that has not all arrived yet.
+   *
+   * A *compacting* buffer — live bytes are `[#start, #end)`, the space before
+   * `#start` is reusable, and it grows geometrically — rather than a fresh
+   * concatenation per delivery. The difference is not academic: a peer that
+   * dribbles a frame a byte at a time made the old shape re-copy everything it
+   * held on every `push`, which is quadratic in the frame size and, since this
+   * class now faces arbitrary TCP peers, a way to spend the event loop from the
+   * other end of a socket. Copying each delivery in once and each frame out
+   * once is linear.
+   */
   #buffer: Uint8Array = EMPTY;
+  /** First live byte in {@link #buffer}. */
+  #start = 0;
+  /** One past the last live byte. */
+  #end = 0;
   #limit: number;
   /** Set by the first failure; every later `push` refuses. */
   #failure: P9Error | undefined;
@@ -1662,7 +1678,7 @@ export class P9FrameAssembler {
 
   /** Bytes held for a partially received frame; `0` once a failure has latched. */
   get pending(): number {
-    return this.#buffer.byteLength;
+    return this.#end - this.#start;
   }
 
   /** Has a framing error latched? The stream is unusable until {@link reset}. */
@@ -1693,40 +1709,102 @@ export class P9FrameAssembler {
       this.#failure = isP9Error(error)
         ? error
         : new P9Error(`framing failed: ${String(error)}`, { cause: error });
-      this.#buffer = EMPTY;
+      this.#drop();
       throw error;
     }
   }
 
+  /**
+   * Frames out of one delivery.
+   *
+   * Two paths, and the difference between them is one copy per byte. With
+   * nothing held over, the frames are cut straight out of `chunk` — the copy
+   * they are made of is the only one. With a partial frame held, the delivery
+   * is appended to the scratch buffer first and the frames come out of that.
+   * The common case on a socket is the first one.
+   */
   #parse(chunk: Uint8Array): Uint8Array[] {
-    const buffer = this.#buffer.byteLength === 0 ? chunk : concat(this.#buffer, chunk);
     const frames: Uint8Array[] = [];
-    let at = 0;
-    for (;;) {
-      if (buffer.byteLength - at < P9_HDRSZ) {
-        break;
+    if (this.#end === this.#start) {
+      let at = 0;
+      for (;;) {
+        if (chunk.byteLength - at < P9_HDRSZ) {
+          break;
+        }
+        const size = this.#sizeAt(readSize(chunk, at), at);
+        if (chunk.byteLength - at < size) {
+          break;
+        }
+        frames.push(copyBytes(chunk, at, at + size));
+        at += size;
       }
-      const size = readSize(buffer, at);
-      if (size < P9_HDRSZ) {
-        throw new P9Error(`frame size ${size} is below the ${P9_HDRSZ}-byte header`, {
-          offset: at,
-        });
+      if (at < chunk.byteLength) {
+        // The remainder is copied rather than kept as a view: `chunk` may be a
+        // socket buffer the transport re-arms as soon as this call returns.
+        this.#append(chunk.subarray(at));
       }
-      if (size > this.#limit) {
-        throw new P9Error(`frame of ${size} bytes exceeds the ${this.#limit}-byte limit`, {
-          offset: at,
-        });
-      }
-      if (buffer.byteLength - at < size) {
-        break;
-      }
-      frames.push(copyBytes(buffer, at, at + size));
-      at += size;
+      return frames;
     }
-    // The remainder is copied rather than kept as a view: `chunk` may be a
-    // socket buffer the transport re-arms as soon as this call returns.
-    this.#buffer = at === buffer.byteLength ? EMPTY : copyBytes(buffer, at, buffer.byteLength);
+
+    this.#append(chunk);
+    for (;;) {
+      if (this.#end - this.#start < P9_HDRSZ) {
+        break;
+      }
+      const size = this.#sizeAt(readSize(this.#buffer, this.#start), 0);
+      if (this.#end - this.#start < size) {
+        break;
+      }
+      frames.push(copyBytes(this.#buffer, this.#start, this.#start + size));
+      this.#start += size;
+    }
+    if (this.#start === this.#end) {
+      this.#start = 0;
+      this.#end = 0;
+    }
     return frames;
+  }
+
+  /** The two things a `size` field has to be, before it is believed. */
+  #sizeAt(size: number, offset: number): number {
+    if (size < P9_HDRSZ) {
+      throw new P9Error(`frame size ${size} is below the ${P9_HDRSZ}-byte header`, { offset });
+    }
+    if (size > this.#limit) {
+      throw new P9Error(`frame of ${size} bytes exceeds the ${this.#limit}-byte limit`, { offset });
+    }
+    return size;
+  }
+
+  /** Copy `bytes` in behind whatever is already held, compacting or growing. */
+  #append(bytes: Uint8Array): void {
+    const live = this.#end - this.#start;
+    const needed = live + bytes.byteLength;
+    if (needed > this.#buffer.byteLength) {
+      let capacity = Math.max(this.#buffer.byteLength, 1024);
+      while (capacity < needed) {
+        capacity *= 2;
+      }
+      const grown = new Uint8Array(capacity);
+      grown.set(this.#buffer.subarray(this.#start, this.#end));
+      this.#buffer = grown;
+      this.#start = 0;
+      this.#end = live;
+    } else if (this.#end + bytes.byteLength > this.#buffer.byteLength) {
+      // It fits, just not where it is: slide the live bytes back to the front.
+      this.#buffer.copyWithin(0, this.#start, this.#end);
+      this.#start = 0;
+      this.#end = live;
+    }
+    this.#buffer.set(bytes, this.#end);
+    this.#end += bytes.byteLength;
+  }
+
+  /** Forget the partial frame, and the memory it was held in. */
+  #drop(): void {
+    this.#buffer = EMPTY;
+    this.#start = 0;
+    this.#end = 0;
   }
 
   /**
@@ -1736,7 +1814,7 @@ export class P9FrameAssembler {
    * *not* for continuing after a framing error, which cannot be done.
    */
   reset(): void {
-    this.#buffer = EMPTY;
+    this.#drop();
     this.#failure = undefined;
   }
 }
@@ -1745,13 +1823,6 @@ function readSize(bytes: Uint8Array, at: number): number {
   return (
     (bytes[at]! | (bytes[at + 1]! << 8) | (bytes[at + 2]! << 16) | (bytes[at + 3]! << 24)) >>> 0
   );
-}
-
-function concat(left: Uint8Array, right: Uint8Array): Uint8Array {
-  const joined = new Uint8Array(left.byteLength + right.byteLength);
-  joined.set(left);
-  joined.set(right, left.byteLength);
-  return joined;
 }
 
 /**

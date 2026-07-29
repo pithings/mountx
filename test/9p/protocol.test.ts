@@ -779,6 +779,64 @@ describe("the frame assembler", () => {
     expect(assembler.pending).toBe(0);
   });
 
+  it("reassembles a large frame delivered a byte at a time without going quadratic", () => {
+    // Regression, and a security one now that this faces arbitrary TCP peers:
+    // re-concatenating the held bytes on every `push` cost O(n²), and a peer
+    // dribbling a 256 KiB frame one byte at a time spent ~7.5 s of event loop
+    // for 256 KiB of traffic. The compacting buffer makes it linear (~20 ms
+    // here); the bound below is loose enough for a slow CI box and still two
+    // orders of magnitude under the old cost.
+    const size = 256 * 1024;
+    const big = new Uint8Array(size);
+    new DataView(big.buffer).setUint32(0, size, true);
+    big[4] = P9_TWRITE;
+    const assembler = new P9FrameAssembler(size);
+    const started = performance.now();
+    const out: Uint8Array[] = [];
+    for (let at = 0; at < big.byteLength; at++) {
+      out.push(...assembler.push(big.subarray(at, at + 1)));
+    }
+    const elapsed = performance.now() - started;
+    expect(out).toHaveLength(1);
+    expect([...out[0]!]).toEqual([...big]);
+    expect(assembler.pending).toBe(0);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  it("keeps its place when the held bytes have to slide back to the front", () => {
+    // The compaction branch: the buffer has room for the delivery, just not
+    // after the bytes already handed out, so the live region slides to offset
+    // zero. Deliveries that divide into no frame size walk that region along
+    // until it has to, repeatedly — and every frame has to survive the move.
+    const sizes = [41, 97, 13, 233, 8];
+    const made = Array.from({ length: 200 }, (_, index) => {
+      const size = sizes[index % sizes.length]!;
+      const frame = new Uint8Array(size);
+      const view = new DataView(frame.buffer);
+      view.setUint32(0, size, true);
+      frame[4] = P9_TWRITE;
+      view.setUint16(5, index & 0xff_ff, true);
+      for (let at = P9_HDRSZ; at < size; at++) {
+        frame[at] = (index + at) & 0xff;
+      }
+      return frame;
+    });
+    const wire = new Uint8Array(made.reduce((total, frame) => total + frame.byteLength, 0));
+    let at = 0;
+    for (const frame of made) {
+      wire.set(frame, at);
+      at += frame.byteLength;
+    }
+
+    const assembler = new P9FrameAssembler();
+    const out: Uint8Array[] = [];
+    for (let start = 0; start < wire.byteLength; start += 37) {
+      out.push(...assembler.push(wire.subarray(start, Math.min(start + 37, wire.byteLength))));
+    }
+    expect(out.map((frame) => [...frame])).toEqual(made.map((frame) => [...frame]));
+    expect(assembler.pending).toBe(0);
+  });
+
   it("copies, so a caller may reuse the buffer it fed in", () => {
     const assembler = new P9FrameAssembler();
     const chunk = Uint8Array.prototype.slice.call(stream);
