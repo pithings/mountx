@@ -97,6 +97,16 @@ export interface S3ErrorSpec {
  */
 export const S3_ERRORS = {
   AccessDenied: { code: "AccessDenied", status: 403, message: "Access Denied" },
+  /**
+   * The `Content-MD5` a client attached to a request document does not match
+   * the document. Only ever produced for a *request body* this gateway parses
+   * (`DeleteObjects`); object bytes are the transport's to protect.
+   */
+  BadDigest: {
+    code: "BadDigest",
+    status: 400,
+    message: "The Content-MD5 you specified did not match what we received.",
+  },
   AuthorizationHeaderMalformed: {
     code: "AuthorizationHeaderMalformed",
     status: 400,
@@ -418,6 +428,23 @@ export interface S3Response {
   /** Lowercase header names, single values. */
   headers: Record<string, string>;
   body: Uint8Array;
+}
+
+/**
+ * A reply whose body may not be in memory yet.
+ *
+ * The session's boundary streams (plan decision): a `GET` of a 5 GiB object
+ * answers an `AsyncIterable` of bounded pieces, and a `204` or a `HEAD` answers
+ * no body at all. Every {@link S3Response} is one of these — an error document
+ * is bytes and stays bytes — so `s3ErrorResponse()` composes with the session
+ * without a conversion anywhere.
+ */
+export interface S3StreamResponse {
+  status: number;
+  /** Lowercase header names, single values. */
+  headers: Record<string, string>;
+  /** Bytes, a stream of bytes, or nothing. */
+  body?: Uint8Array | AsyncIterable<Uint8Array>;
 }
 
 /** What the caller knows about the request that the error document names. */

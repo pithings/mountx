@@ -128,7 +128,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       `x-amz-meta-mtime` header parsing, response header building, S3 XML error
       responses. Tests: `test/s3/protocol.test.ts` routing table + goldens.
       Verify: unknown ops route to `NotImplemented`, never fall through.
-- [ ] **5. `src/s3/session.ts` (core ops)** — `S3Session` with the streaming
+- [x] **5. `src/s3/session.ts` (core ops)** — `S3Session` with the streaming
       interface; GET/HEAD (ETag, conditionals, Range), PUT (incl. mtime meta,
       chunked bodies), DELETE, DeleteObjects, CopyObject, HeadBucket,
       ListBuckets, ListObjectsV2 (both delimiter modes, effective-key ordering,
