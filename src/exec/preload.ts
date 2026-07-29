@@ -1,6 +1,20 @@
 /**
- * SPIKE B — `execPreload()`: run a command with an `FsDriver` grafted onto its
- * filesystem view by an `LD_PRELOAD` interposer, with no kernel mount anywhere.
+ * `execPreload()`: run a command with an `FsDriver` grafted onto its filesystem
+ * view by an `LD_PRELOAD` interposer, with no kernel mount anywhere.
+ *
+ * **Rejected, and kept as the evidence for why.** `mountx/exec` cannot choose
+ * this mechanism and nothing imports it but `demo-preload.ts` and
+ * `test/exec/compare.sh`. The measured case against it is in
+ * `.agents/proot-plan.md`, and it is short: its coverage excludes Go and static
+ * binaries *by construction* (a syscall that never goes through a PLT entry is
+ * invisible to it), its symbol surface tracks other projects' releases rather
+ * than a fixed ABI, it has a hole that cannot be closed from inside the process
+ * (a descriptor it created does not survive `exec`, so `wc -l < /mountx/f`
+ * silently reads an empty file), and its characteristic failure is a confident
+ * wrong answer rather than an error — `sha256sum` on a 3 MiB file returned the
+ * hash of the empty string with exit status 0. For a filesystem library that is
+ * the wrong failure mode to design in. `src/exec/seccomp.ts` is what this was
+ * trying to be, with a boundary the kernel defines instead of glibc.
  *
  * The parent stays exactly what it already is: a 9P server over a private unix
  * socket, `createP9Server()` verbatim, the same one `mount9p()` points the

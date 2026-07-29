@@ -1,4 +1,16 @@
-/** SPIKE A runner: `node src/exec/spike-a.ts [command...]` */
+/**
+ * The user-namespace mechanism, run against the shared demo tree.
+ *
+ * ```sh
+ * node src/exec/demo-userns.ts [command...]
+ * ```
+ *
+ * A test bench rather than an entry point — `mountx/exec` is the entry point,
+ * and this is what `test/exec/compare.sh` drives to fill one column of the
+ * comparison in `.agents/proot-plan.md`. It calls `execUserns()` by name on
+ * purpose: the value of that comparison is that each column is one *named*
+ * mechanism rather than whatever the picker would have chosen.
+ */
 
 import { createDemoDriver } from "./demo-driver.ts";
 import { execUserns } from "./userns.ts";
@@ -17,6 +29,6 @@ const command =
 const driver = await createDemoDriver();
 const result = await execUserns(driver, command, { debug: process.env.MOUNTX_DEBUG === "1" });
 process.stderr.write(
-  `\n[spike-a] mountpoint=${result.mountpoint} code=${result.code} signal=${result.signal}\n`,
+  `\n[userns] mountpoint=${result.mountpoint} code=${result.code} signal=${result.signal}\n`,
 );
 process.exitCode = result.code ?? 1;
