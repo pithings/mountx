@@ -197,6 +197,18 @@ describe.skipIf(refusal !== undefined)("a command traced by the seccomp supervis
     expect(decoder.decode(await fs.readFile("/made.txt"))).toBe("relative\n");
   });
 
+  it("stays inside the tree when a working directory outside it cannot be reached", async () => {
+    const { driver } = await fixture();
+    // A `cd` that fails leaves a shell exactly where it was. A supervisor that
+    // forgot the virtual working directory on the *attempt* would resolve every
+    // relative path afterwards against somewhere else entirely.
+    const result = await shell(
+      driver,
+      'cd "$MOUNTX_ROOT" && { cd /nonexistent-mountx-xyz 2>/dev/null || true; }; pwd; cat hello.txt; cd /tmp && pwd',
+    );
+    expect(result.stdout).toBe("/mountx\nhello from a driver\n/tmp\n");
+  });
+
   it("resolves `..` inside the tree and clamps it at the root", async () => {
     const { driver } = await fixture();
     const result = await shell(

@@ -1189,9 +1189,11 @@ fn handleMknod(call: *const Call, dirfd: i32, path_index: usize, mode: u32, dev:
     };
     defer client.clunk(parent.fid);
     // `Tmknod` carries major and minor as separate words, which is the opposite
-    // of `Rgetattr`'s single packed `rdev`.
-    const major: u32 = @intCast((dev >> 8) & 0xfff);
-    const minor: u32 = @intCast((dev & 0xff) | ((dev >> 12) & 0xfff_ff00));
+    // of `Rgetattr`'s single packed `rdev`. The unpacking is glibc's
+    // `gnu_dev_major`/`gnu_dev_minor` (`bits/sysmacros.h`), which is the
+    // encoding `mknod(2)`'s `dev_t` argument uses.
+    const major: u32 = @truncate(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(u64, 0xfff)));
+    const minor: u32 = @truncate((dev & 0xff) | ((dev >> 12) & ~@as(u64, 0xff)));
     const masked = (mode & ~umaskOf(call.tid) & 0o7777) | (mode & linux.S_IFMT);
     _ = client.mknod(parent.fid, parent.name, masked, major, minor, 0) catch |err|
         return remote(err);
@@ -1325,6 +1327,16 @@ fn handleLink(call: *const Call, olddirfd: i32, old_index: usize, newdirfd: i32,
 // Where a process thinks it is
 // ---------------------------------------------------------------------------
 
+/// Would a `chdir` to this host path succeed? Absolute paths only, which is the
+/// only shape that can reach here: a relative path from a process with a
+/// virtual working directory is always resolved inside the tree.
+fn reachableDirectory(raw: []const u8) bool {
+    if (raw.len == 0 or raw[0] != '/' or raw.len >= auxbuf.len) return false;
+    @memcpy(auxbuf[0..raw.len], raw);
+    auxbuf[raw.len] = 0;
+    return c.access(@ptrCast(&auxbuf), c.X_OK) == 0;
+}
+
 /// `chdir` into the tree is answered without the kernel ever moving.
 ///
 /// There is nowhere for it to move *to* — the tree is not mounted — so the
@@ -1338,7 +1350,13 @@ fn handleChdir(call: *const Call) Reply {
     const target = resolveAt(call.pid, linux.AT_FDCWD, raw, &joinbuf);
     const rel = switch (target) {
         .outside => {
-            tables.clearCwd(call.pid);
+            // Leaving the tree, *if the kernel agrees*. Clearing unconditionally
+            // would hand the process a real working directory it never reached:
+            // a `cd /nowhere` that fails leaves a shell exactly where it was,
+            // and every relative path afterwards would then be resolved against
+            // somewhere else entirely. The supervisor carries no filter, so it
+            // can simply ask.
+            if (reachableDirectory(raw)) tables.clearCwd(call.pid);
             return .cont;
         },
         .err => |e| return fail(e),
@@ -1765,6 +1783,16 @@ fn dispatch(call: *const Call, nr: i32) Reply {
 fn sweep(pid: i32) void {
     tables.unbindAll(pid);
     tables.clearCwd(pid);
+    // The thread-id cache is the one table keyed on something that dies with
+    // the process rather than being reused, so it is also the one that would
+    // otherwise grow for the whole run of a command that spawns steadily.
+    var kept: usize = 0;
+    for (tgids.items) |entry| {
+        if (entry.tgid == pid) continue;
+        tgids.items[kept] = entry;
+        kept += 1;
+    }
+    tgids.shrinkRetainingCapacity(kept);
 }
 
 /// Clunk the fid of everything whose last descriptor went during this
