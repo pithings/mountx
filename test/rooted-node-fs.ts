@@ -14,6 +14,8 @@
 
 import * as fsPromises from "node:fs/promises";
 import { join } from "node:path";
+import { fsError } from "../src/errors.ts";
+import { normalizePath } from "../src/path.ts";
 import type { FsDriver } from "../src/types.ts";
 
 export function rootedNodeFs(root: string): FsDriver {
@@ -27,7 +29,15 @@ export function rootedNodeFs(root: string): FsDriver {
     readdir: (path, options) => fsPromises.readdir(real(path), options),
     open: (path, flags, mode) => fsPromises.open(real(path), flags, mode),
     mkdir: (path, options) => fsPromises.mkdir(real(path), options),
-    rmdir: (path) => fsPromises.rmdir(real(path)),
+    // The one place joining onto the root is not enough: `join(root, "/")` is
+    // `root`, so `rmdir("/")` would delete the directory this oracle is rooted
+    // at — the temp directory in `drivers.test.ts`, the *mountpoint* in the
+    // FUSE column. A real filesystem answers `EBUSY` for `rmdir("/")`, which is
+    // what every driver in the matrix says too.
+    rmdir: (path) =>
+      normalizePath(path) === "/"
+        ? Promise.reject(fsError("EBUSY", { syscall: "rmdir", path: "/" }))
+        : fsPromises.rmdir(real(path)),
     unlink: (path) => fsPromises.unlink(real(path)),
     rename: (from, to) => fsPromises.rename(real(from), real(to)),
     link: (from, to) => fsPromises.link(real(from), real(to)),
