@@ -67,9 +67,17 @@ driver, ... } }, opts?)` serves several. Path-style URLs only.
   order (offsets are unknowable until all prior part sizes exist — parts
   arrive out of order and vary in size); Abort and server close clean it up.
 - **Key ↔ path:** key `a/b` → path `/a/b` via `src/path.ts`. Keys that do not
-  survive the round-trip (empty segments `a//b`, `.`/`..` segments, NUL,
-  anything colliding with the staging prefix) → 400 `InvalidArgument` rather
-  than quiet corruption — same posture as the unstorage driver's `EINVAL`.
+  survive the round-trip (empty segments `a//b`, `.`/`..` segments, NUL) →
+  400 `InvalidArgument` rather than quiet corruption — same posture as the
+  unstorage driver's `EINVAL`; over-length keys → S3's own `KeyTooLongError`.
+  Staging-prefix keys are answered the way an **absent** key is answered, by
+  method — invisibility, per the multipart decision; a 400 would advertise the
+  reserved name and disagree with listings (this bullet originally said 400,
+  contradicting the multipart bullet; resolved toward invisibility during step
+  4). `DELETE` → 204 (S3's answer for deleting a missing key), `GET`/`HEAD` →
+  `NoSuchKey` 404, `PUT`/`POST` → `NoSuchKey` 404, which is the one remaining
+  tell and is accepted knowingly: the alternatives are a 200 that drops the
+  bytes or an `AccessDenied` that says the name is guarded.
 - **Session boundary is streaming** (unlike `NfsSession.handleCall(bytes)`):
   `S3Session.handleRequest(head, body: AsyncIterable<Uint8Array>)` →
   `{ status, headers, body?: Uint8Array | AsyncIterable<Uint8Array> }`.
@@ -113,7 +121,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       signature verification (and unsigned-chunked passthrough), trailer
       handling. Tests: golden frames, split-across-read-boundary cases. Verify:
       decoder copies retained bytes; malformed framing → clean error, not hang.
-- [ ] **4. `src/s3/protocol.ts`** — pure request parsing/routing: path-style
+- [x] **4. `src/s3/protocol.ts`** — pure request parsing/routing: path-style
       URL → (bucket, key), the op-name table and op discrimination from
       method + query
       (`list-type=2`, `uploads`, `uploadId`, `delete`, ...), Range/conditional/
