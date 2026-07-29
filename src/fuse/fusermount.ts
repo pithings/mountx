@@ -378,22 +378,47 @@ export async function mountViaFusermount(
 }
 
 /**
+ * How long the undo below gets before it is written off.
+ *
+ * Every `fusermount3 -u` this library spawns is bounded — that is the teardown
+ * invariant, and it is what the transport docs now claim without qualification.
+ * This one has no phase budget to draw on, because it is not a teardown: it is
+ * the mount path cleaning up after itself, and nothing above it is counting.
+ * Ten seconds is the same backstop {@link mountViaFusermount} gives the
+ * descriptor, chosen for the same reason — a helper unmounting a filesystem
+ * nothing has touched yet returns immediately, so a wait anyone can observe is
+ * already the failure.
+ */
+const UNDO_TIMEOUT = 10_000;
+
+/**
  * Unmount what a failed receive left behind, and say what to throw.
  *
  * `cause` is the failure that got us here and stays the diagnostic when the
  * unmount works. When it does not, the leftover mount is the thing the caller
  * cannot fix from the error alone, so that becomes the message and `cause`
  * keeps the detail.
+ *
+ * Both ways of not working count. A helper that never answers reports
+ * `timedOut` instead of throwing, and treating that as success would report a
+ * clean undo over a mount that is still there — the one outcome this function
+ * exists to avoid.
  */
 async function undoMount(mountpoint: string, cause: unknown): Promise<unknown> {
-  try {
-    await unmountViaFusermount(mountpoint);
-  } catch (failure) {
-    return new Error(
+  const leftover = (detail: string): Error =>
+    new Error(
       `mountx: ${mountpoint} was mounted, no descriptor for it arrived, and unmounting ` +
-        `it failed too (${errorMessage(failure)}) — unmount it by hand`,
+        `it failed too (${detail}) — unmount it by hand`,
       { cause },
     );
+  let result: { timedOut: boolean };
+  try {
+    result = await unmountViaFusermount(mountpoint, { timeout: UNDO_TIMEOUT });
+  } catch (failure) {
+    return leftover(errorMessage(failure));
+  }
+  if (result.timedOut) {
+    return leftover(`fusermount3 -u gave no answer within ${UNDO_TIMEOUT}ms`);
   }
   return cause;
 }
@@ -408,11 +433,18 @@ async function undoMount(mountpoint: string, cause: unknown): Promise<unknown> {
  * Detaching does get there in the end — the superblock is destroyed once the
  * last reference goes, and *that* aborts the connection — but it is a
  * consequence rather than a request, so it is slower and less certain.
+ *
+ * `timeout` is the caller's remaining teardown budget, and expiry is **not** an
+ * error: the helper blocks in the kernel for exactly the reason the caller is
+ * about to escalate for, so `{ timedOut: true }` comes back and the decision
+ * stays with `mount.ts`, which is the only thing that knows what the next rung
+ * of its ladder is. Everything else — a helper that is missing, that will not
+ * spawn, or that answered with a non-zero status — still throws.
  */
 export async function unmountViaFusermount(
   mountpoint: string,
-  options: { lazy?: boolean } = {},
-): Promise<void> {
+  options: { lazy?: boolean; timeout?: number } = {},
+): Promise<{ timedOut: boolean }> {
   const helper = fusermountPath();
   if (helper === undefined) {
     throw new Error(`mountx: ${rootlessProbe().reason}`);
@@ -420,13 +452,20 @@ export async function unmountViaFusermount(
   const args = options.lazy === true ? ["-u", "-z", "--", mountpoint] : ["-u", "--", mountpoint];
   let result;
   try {
-    result = await run(helper, args, { stdio: ["ignore", "ignore", "pipe"] });
+    result = await run(helper, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+      timeout: options.timeout,
+    });
   } catch (error) {
     throw new Error(`mountx: could not run ${helper}: ${errorMessage(error)}`);
+  }
+  if (result.timedOut === true) {
+    return { timedOut: true };
   }
   if (result.status !== 0) {
     throw new Error(describe(`${helper} ${args.slice(0, -2).join(" ")}`, result));
   }
+  return { timedOut: false };
 }
 
 function closeQuietly(fd: number): void {

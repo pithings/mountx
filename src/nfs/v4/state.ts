@@ -468,11 +468,15 @@ class Slot {
    */
   fresh = true;
 
-  constructor(
-    readonly slotid: number,
-    /** The session's negotiated `ca_maxresponsesize_cached` (§18.36.3). */
-    readonly maxCachedBytes: number,
-  ) {}
+  readonly slotid: number;
+
+  /** The session's negotiated `ca_maxresponsesize_cached` (§18.36.3). */
+  readonly maxCachedBytes: number;
+
+  constructor(slotid: number, maxCachedBytes: number) {
+    this.slotid = slotid;
+    this.maxCachedBytes = maxCachedBytes;
+  }
 }
 
 /**
@@ -501,13 +505,15 @@ export interface SlotTicket {
 }
 
 class Ticket implements SlotTicket {
+  readonly slot: Slot;
+  readonly slotid: number;
+  readonly sequenceid: number;
   readonly maxCachedBytes: number;
 
-  constructor(
-    readonly slot: Slot,
-    readonly slotid: number,
-    readonly sequenceid: number,
-  ) {
+  constructor(slot: Slot, slotid: number, sequenceid: number) {
+    this.slot = slot;
+    this.slotid = slotid;
+    this.sequenceid = sequenceid;
     this.maxCachedBytes = slot.maxCachedBytes;
   }
 }

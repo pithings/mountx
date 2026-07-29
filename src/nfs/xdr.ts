@@ -264,17 +264,66 @@ export class XdrWriter {
     return this.#length;
   }
 
+  /**
+   * Make room for exactly `count` more bytes, writing none of them.
+   *
+   * Growth is otherwise geometric, so a writer that starts small and ends at a
+   * megabyte copies about twice its final size getting there. A caller that
+   * knows what it is about to write says so once and pays a single allocation.
+   *
+   * **Exactly**, not the next doubling — because {@link XdrWriter.view} hands
+   * out the buffer rather than an exact-size copy of it, so whatever capacity
+   * this leaves unused is retained for as long as the caller holds the view.
+   * Doubling here would mean a 1 MiB reply pinning 2 MiB in a socket's write
+   * queue. That also means this is for a caller that knows its **total**: call
+   * it once, with the whole of what is coming. Calling it per item, in a loop,
+   * is quadratic — that is what the geometric path exists for.
+   */
+  ensure(count: number): this {
+    const needed = this.#length + count;
+    if (needed > this.#bytes.byteLength) {
+      this.#reallocate(needed);
+    }
+    return this;
+  }
+
+  /**
+   * Discard everything written past `length`.
+   *
+   * For the one caller that has to encode a message to find out how big it is
+   * and then encode a different one (NFSv4.1's `NFS4ERR_REP_TOO_BIG_TO_CACHE`,
+   * §2.10.6.4). Rewriting a span is safe here because every writer below
+   * covers every byte it claims — see {@link XdrWriter.fixedOpaque}, the only
+   * one where that is not obvious.
+   */
+  truncate(length: number): this {
+    if (length < 0 || length > this.#length) {
+      throw new XdrError(`cannot truncate to ${length} bytes of ${this.#length} written`);
+    }
+    this.#length = length;
+    return this;
+  }
+
+  /** Growth nobody predicted: double until it fits, so appending stays amortized O(1). */
+  #grow(needed: number): void {
+    let capacity = this.#bytes.byteLength * 2;
+    while (capacity < needed) {
+      capacity *= 2;
+    }
+    this.#reallocate(capacity);
+  }
+
+  #reallocate(capacity: number): void {
+    const grown = new Uint8Array(capacity);
+    grown.set(this.#bytes.subarray(0, this.#length));
+    this.#bytes = grown;
+    this.#view = new DataView(grown.buffer);
+  }
+
   #room(count: number): number {
     const needed = this.#length + count;
     if (needed > this.#bytes.byteLength) {
-      let capacity = this.#bytes.byteLength * 2;
-      while (capacity < needed) {
-        capacity *= 2;
-      }
-      const grown = new Uint8Array(capacity);
-      grown.set(this.#bytes.subarray(0, this.#length));
-      this.#bytes = grown;
-      this.#view = new DataView(grown.buffer);
+      this.#grow(needed);
     }
     const at = this.#length;
     this.#length = needed;
@@ -315,11 +364,26 @@ export class XdrWriter {
     return this.u32(value ? 1 : 0);
   }
 
-  /** `opaque[n]`: exactly `length` bytes (zero-filled if short), then padding. */
+  /**
+   * `opaque[n]`: exactly `length` bytes (zero-filled if short), then padding.
+   *
+   * The two writes below cover the whole span between them — `set` takes
+   * `[at, at + copied)` and the `fill` takes the rest — so nothing needs
+   * pre-zeroing, and nothing here depends on what the buffer held before.
+   * (It used to `fill` the whole span first and then overwrite most of it: a
+   * second full pass over every `READ` payload the server sends, measured at
+   * 15–20 µs per MiB, ~15% of `varOpaque`.) Keep that total-coverage property
+   * if this is ever rearranged — {@link XdrWriter.truncate} lets a span be
+   * written twice, so "the buffer is still zero here" is not available.
+   */
   fixedOpaque(value: Uint8Array, length = value.byteLength): this {
-    const at = this.#room(xdrAlign(length));
-    this.#bytes.fill(0, at, at + xdrAlign(length));
-    this.#bytes.set(value.subarray(0, length), at);
+    const size = xdrAlign(length);
+    const at = this.#room(size);
+    const copied = Math.min(value.byteLength, length);
+    this.#bytes.set(value.subarray(0, copied), at);
+    if (copied < size) {
+      this.#bytes.fill(0, at + copied, at + size);
+    }
     return this;
   }
 
@@ -374,6 +438,27 @@ export class XdrWriter {
   /** The message, copied out. */
   bytes(): Uint8Array {
     return this.#bytes.slice(0, this.#length);
+  }
+
+  /**
+   * The message **without** copying it: a view of this writer's own buffer.
+   *
+   * The rule is ownership, and it is the mirror of the one `rpc.ts`'s
+   * `RecordAssembler` follows on the way in. There a record is always copied,
+   * because the buffer underneath it belongs to the socket and will be written
+   * again. Here the buffer belongs to *this writer* and to nothing else, so
+   * handing out a view is safe exactly when the writer is finished with:
+   *
+   * - **One writer per reply, never pooled or reused.** The sessions build one
+   *   per call and drop it at `return`; two concurrent calls never share one.
+   * - **No writing after `view()`.** Any `u32`/`raw`/`truncate` past that point
+   *   rewrites bytes the caller is holding, and a grow would leave it holding
+   *   the *old* buffer — silently stale rather than loudly wrong.
+   *
+   * When neither can be guaranteed, {@link XdrWriter.bytes} is the honest call.
+   */
+  view(): Uint8Array {
+    return this.#bytes.subarray(0, this.#length);
   }
 }
 

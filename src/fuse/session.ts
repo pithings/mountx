@@ -107,6 +107,7 @@ import {
   type FuseNotifyInvalInodeOut,
 } from "./notify.ts";
 import {
+  allocReply,
   decodeInHeader,
   decodeRequest,
   direntPlusSize,
@@ -117,6 +118,7 @@ import {
   encodeErrorReplyFor,
   encodeReply,
   encodeReplyFor,
+  finishReply,
   nameByteLength,
   type FuseAttr,
   type FuseAttrOut,
@@ -387,6 +389,20 @@ export class FuseSession {
 
   readonly #inodes: InodeTable;
   readonly #files = new Map<bigint, OpenFile>();
+  /**
+   * The same open files, indexed by inode — the reverse of `#files`.
+   *
+   * Exists for {@link FuseSession.#handleFor}, whose second case is the
+   * *normal* `fstat(2)` path for `mkstemp` + `unlink`: an orphaned inode has no
+   * path, so the only way to describe it is a live handle on it. Finding one by
+   * scanning `#files` made every such stat O(open files) — a process holding a
+   * few thousand descriptors paid for all of them on each one.
+   *
+   * Maintained wherever `#files` is, and nowhere else: `#addFile`, `#release`
+   * and `destroy`. An inode's set is deleted when its last handle goes, so this
+   * map never outgrows the number of *distinct* inodes with something open.
+   */
+  readonly #filesByInode = new Map<Inode, Set<OpenFile>>();
   readonly #inflight = new Set<bigint>();
   readonly #lock = new PathLock();
   readonly #debug: boolean;
@@ -535,6 +551,7 @@ export class FuseSession {
     this.#destroyed = true;
     const files = [...this.#files.values()];
     this.#files.clear();
+    this.#filesByInode.clear();
     for (const file of files) {
       try {
         await file.handle?.close();
@@ -1007,17 +1024,30 @@ export class FuseSession {
     if (!wantAtime || !wantMtime) {
       current = await this.#statOf(path);
     }
+    // `fuse_setattr_in.atime`/`.mtime` are a POSIX `tv_sec`, which is **signed**
+    // — `touch -d 1960-01-01` is an ordinary thing to do and arrives as a
+    // two's-complement negative. `decodeSetattrIn` reads them with `r.u64()`,
+    // and it must keep doing so: the same 64-bit field is unsigned in the reply
+    // direction (`fuse_attr.atime`), and the encoder's `BigInt.asUintN` is what
+    // puts a negative second back on the wire correctly. So the sign is
+    // restored here, at the one place that knows this is a request. Without it
+    // a pre-1970 stamp round-tripped 128 s off and a driver implementing
+    // `mountx.utimens` was handed ~1.8e28 ns. `atimensec` is a genuine
+    // `uint32` 0..999999999 and is added unchanged, exactly as a `timespec`
+    // composes.
+    const atimeSec = BigInt.asIntN(64, body.atime);
+    const mtimeSec = BigInt.asIntN(64, body.mtime);
     const atimeNs =
       (body.valid & FATTR_ATIME_NOW) !== 0
         ? BigInt(Math.round(nowMs * 1e6))
         : (body.valid & FATTR_ATIME) !== 0
-          ? body.atime * 1_000_000_000n + BigInt(body.atimensec)
+          ? atimeSec * 1_000_000_000n + BigInt(body.atimensec)
           : BigInt(Math.round(current!.atimeMs * 1e6));
     const mtimeNs =
       (body.valid & FATTR_MTIME_NOW) !== 0
         ? BigInt(Math.round(nowMs * 1e6))
         : (body.valid & FATTR_MTIME) !== 0
-          ? body.mtime * 1_000_000_000n + BigInt(body.mtimensec)
+          ? mtimeSec * 1_000_000_000n + BigInt(body.mtimensec)
           : BigInt(Math.round(current!.mtimeMs * 1e6));
 
     const utimens = this.driver.mountx?.utimens;
@@ -1201,7 +1231,22 @@ export class FuseSession {
       dir: dir ? { entries: undefined } : undefined,
     };
     this.#files.set(file.fh, file);
+    let byInode = this.#filesByInode.get(inode);
+    if (byInode === undefined) {
+      byInode = new Set();
+      this.#filesByInode.set(inode, byInode);
+    }
+    byInode.add(file);
     return file;
+  }
+
+  /** Drop an open file from both indexes. The only way `#files` shrinks. */
+  #removeFile(file: OpenFile): void {
+    this.#files.delete(file.fh);
+    const byInode = this.#filesByInode.get(file.inode);
+    if (byInode !== undefined && byInode.delete(file) && byInode.size === 0) {
+      this.#filesByInode.delete(file.inode);
+    }
   }
 
   /**
@@ -1231,8 +1276,9 @@ export class FuseSession {
     if (inode.paths.size > 0) {
       return undefined;
     }
-    for (const file of this.#files.values()) {
-      if (file.inode === inode && file.handle !== undefined) {
+    // Indexed, not scanned: see `#filesByInode`.
+    for (const file of this.#filesByInode.get(inode) ?? []) {
+      if (file.handle !== undefined) {
         return file.handle;
       }
     }
@@ -1356,13 +1402,20 @@ export class FuseSession {
     return encodeReplyFor(request.header.unique, FUSE_CREATE, reply, this.protocol);
   }
 
+  /**
+   * `OPENDIR` allocates a handle and reads nothing.
+   *
+   * There is deliberately **no type check here**. `OPENDIR` names a nodeid the
+   * kernel resolved from attributes this server supplied, so re-`lstat`ing it
+   * to re-learn `S_IFDIR` cost a driver round trip per `opendir(3)` to
+   * second-guess our own reply — and nothing else in this method used the
+   * result. `ENOTDIR` for a non-directory is still reported, one message later:
+   * the first `READDIR` calls `driver.readdir`, which is the call that actually
+   * needs a directory and the authority on whether it has one.
+   */
   async #opendir(request: FuseRequest): Promise<Uint8Array> {
     const body = request.body as FuseOpenIn;
     const inode = this.#inodes.require(request.header.nodeid);
-    const stats = await this.#statOf(this.#inodes.pathOf(inode));
-    if (!stats.isDirectory()) {
-      throw fsError("ENOTDIR", { syscall: "opendir", path: this.#inodes.pathOf(inode) });
-    }
     const file = this.#addFile(inode, driverOpenFlags(body.flags), undefined, true);
     const reply: FuseOpenOut = { fh: file.fh, openFlags: 0, backingId: 0 };
     return encodeReplyFor(request.header.unique, FUSE_OPENDIR, reply, this.protocol);
@@ -1373,7 +1426,7 @@ export class FuseSession {
     const file = this.#requireFile(body.fh, request.header.opcode === FUSE_RELEASEDIR);
     // Freed before the close can fail: a handle the kernel has released must
     // never be reachable again, whatever the driver says on the way out.
-    this.#files.delete(file.fh);
+    this.#removeFile(file);
     await file.handle?.close();
     return encodeReply(request.header.unique);
   }
@@ -1418,11 +1471,20 @@ export class FuseSession {
     const file = this.#requireFile(body.fh, false);
     const size = Math.min(body.size, this.#readBudget());
     const offset = toOffset(body.offset, "read");
-    const buffer = new Uint8Array(size);
+    // One allocation for header **and** body: the driver fills the body region
+    // in place and `finishReply` writes the `fuse_out_header` into the front of
+    // that same buffer. The obvious spelling — read into a fresh buffer, then
+    // `encodeReply` — allocates twice and copies the whole payload a second
+    // time on the way out, which was ~14% of the read path at 1 MiB.
+    const reply = allocReply(size);
     const { bytesRead } = await this.#withHandle(file, (handle) =>
-      handle.read(buffer, 0, size, offset),
+      handle.read(reply.body, 0, size, offset),
     );
-    return encodeReply(request.header.unique, buffer.subarray(0, Math.max(0, bytesRead)));
+    // A short read is the normal case at EOF, so `len` and the returned bytes
+    // describe what the driver actually produced, never what was allocated.
+    // Clamped both ways: a driver reporting more than it was given a buffer for
+    // must not widen the reply past its own body.
+    return finishReply(reply, request.header.unique, Math.min(size, Math.max(0, bytesRead)));
   }
 
   async #write(request: FuseRequest): Promise<Uint8Array> {
@@ -1478,17 +1540,28 @@ export class FuseSession {
       const nameLength = nameByteLength(entry.name);
       const needed = plus ? direntPlusSize(nameLength, this.protocol) : direntSize(nameLength);
       // Measure before doing any work: an entry that will not fit must not
-      // allocate a nodeid, and must be handed to the next page untouched.
+      // allocate a nodeid, nor cost a driver `lstat`, and must be handed to the
+      // next page untouched. This pre-check exists **only** for that ordering —
+      // `packer.add` below is the authority on whether an entry fits, and every
+      // call site now reads its answer. The two agree today because they call
+      // the same size helpers; if they ever stop agreeing, the packer wins and
+      // the loop stops, rather than `off` advancing past an entry that was
+      // silently dropped — a directory entry missing from `ls` with no error
+      // anywhere.
       if (needed > packer.remaining) {
         break;
       }
       // `.` and `..` go out with `nodeid == 0`: the kernel skips them for cache
       // linking, so counting a lookup for them would leak one forever.
       if (entry.name === "." || entry.name === "..") {
-        packer.add(
-          { ino: file.inode.nodeid, off: BigInt(index + 1), type: entry.type, name: entry.name },
-          plus ? IGNORED_ENTRY : undefined,
-        );
+        if (
+          !packer.add(
+            { ino: file.inode.nodeid, off: BigInt(index + 1), type: entry.type, name: entry.name },
+            plus ? IGNORED_ENTRY : undefined,
+          )
+        ) {
+          break;
+        }
         continue;
       }
       const childPath = joinPath(path, entry.name);
@@ -1501,10 +1574,47 @@ export class FuseSession {
         stats = undefined;
       }
       if (stats === undefined) {
-        packer.add(
-          { ino: 0n, off: BigInt(index + 1), type: entry.type, name: entry.name },
-          plus ? IGNORED_ENTRY : undefined,
-        );
+        if (
+          !packer.add(
+            { ino: 0n, off: BigInt(index + 1), type: entry.type, name: entry.name },
+            plus ? IGNORED_ENTRY : undefined,
+          )
+        ) {
+          break;
+        }
+        continue;
+      }
+      if (!plus) {
+        // **A `fuse_dirent.ino` is a fileid, not a nodeid.** The kernel neither
+        // links it into a dentry nor counts a lookup for it, so an inode minted
+        // here would sit at `nlookup == 0n` forever — and `InodeTable.forget`,
+        // the only thing that deletes from `byNodeid`, can never name it. A
+        // plain `find` over a large tree used to retain one `Inode` + `Set` +
+        // two `Map` entries per file for the life of the mount, which also
+        // slowed every later directory rename, since `remap()` is O(tracked
+        // paths). So: report an identity, bind nothing.
+        //
+        // The number reported is `stats.ino`, byte for byte the expression
+        // `#attrOf` puts in `fuse_attr.ino` — that is what keeps `ls -i` and
+        // `stat` agreeing about the same file.
+        //
+        // A driver with no inode numbers at all (`ino <= 0`) is the one case
+        // that still needs the table: there the nodeid *is* the only stable
+        // identity, and `#attrOf` falls back to it too, so the two still agree.
+        // `bind` is idempotent, and none of the built-in drivers take this
+        // branch — all three number their files from 1.
+        const ino =
+          stats.ino > 0 ? toBigUint(stats.ino) : this.#inodes.bind(childPath, stats).nodeid;
+        if (
+          !packer.add({
+            ino,
+            off: BigInt(index + 1),
+            type: direntType(stats.mode),
+            name: entry.name,
+          })
+        ) {
+          break;
+        }
         continue;
       }
       const inode = this.#inodes.bind(childPath, stats);
@@ -1514,12 +1624,12 @@ export class FuseSession {
         type: direntType(stats.mode),
         name: entry.name,
       };
-      packer.add(dirent, plus ? this.#entryOut(inode, stats) : undefined);
-      if (plus) {
-        // READDIRPLUS folds a LOOKUP into every entry it reports, so every
-        // entry that made it into the page owes a FORGET later.
-        this.#inodes.acquire(inode);
+      if (!packer.add(dirent, this.#entryOut(inode, stats))) {
+        break;
       }
+      // READDIRPLUS folds a LOOKUP into every entry it reports, so every entry
+      // that made it into the page owes a FORGET later.
+      this.#inodes.acquire(inode);
     }
     return encodeReply(request.header.unique, packer.build());
   }

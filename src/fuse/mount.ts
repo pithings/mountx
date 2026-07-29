@@ -84,7 +84,16 @@ import { resolve as resolveNative } from "node:path";
 import type { FsDriver } from "../types.ts";
 import { S_IFDIR, S_IFMT } from "../types.ts";
 import { FUSE_MAX_MAX_PAGES, FUSE_MIN_READ_BUFFER, FUSE_PAGE_SIZE } from "./constants.ts";
-import { describe, errorMessage, run, type SpawnResult, stdioWith } from "./exec.ts";
+import {
+  type Deadline,
+  deadlineIn,
+  delay,
+  describe,
+  errorMessage,
+  run,
+  type SpawnResult,
+  stdioWith,
+} from "./exec.ts";
 import { mountViaFusermount, rootlessProbe, unmountViaFusermount } from "./fusermount.ts";
 import { DEFAULT_MAX_WRITE } from "./init.ts";
 import { FuseSession, type FuseSessionOptions } from "./session.ts";
@@ -180,6 +189,10 @@ export interface MountOptions extends FuseSessionOptions {
    * caching is off by default, so there is nothing to flush, only in-flight
    * requests to finish. A driver that can legitimately take longer to quiesce
    * should raise it.
+   *
+   * It bounds each of the two phases, not their sum: asking nicely gets this
+   * long, and the forcing that follows gets its own budget of the same size, so
+   * a teardown that has to escalate settles in at most twice it.
    */
   unmountTimeout?: number;
   /**
@@ -230,10 +243,13 @@ export interface Mount extends AsyncDisposable {
    * Unmount and tear down. Idempotent, concurrency-safe, and a no-op beyond
    * awaiting {@link Mount.closed} if the mount is already gone.
    *
-   * Always settles, within `unmountTimeout`. It throws if `umount(8)` refused
-   * — a busy mountpoint, essentially — or if the deadline passed and the
-   * connection had to be aborted; both messages say how to recover, and a
-   * failed unmount can be retried.
+   * Always settles: within `unmountTimeout` when asking nicely works, and
+   * within twice it when the connection has to be forced down instead — every
+   * spawn on both paths is bounded by the phase's remaining budget and
+   * abandoned when it runs out. It throws if `umount(8)` refused — a busy
+   * mountpoint, essentially — or if the deadline passed and the connection had
+   * to be aborted; both messages say how to recover, and a failed unmount can
+   * be retried.
    */
   unmount(): Promise<void>;
   /** Drop the kernel's cached data (and optionally attributes) for one inode. */
@@ -884,18 +900,28 @@ class MountImpl implements Mount {
    * behind it never sees `ENODEV`. Without a deadline that is an `unmount()`
    * that never settles — and since `await using` and the signal handlers both
    * wait on it, one wedged driver takes the process with it.
+   *
+   * **Two budgets, not one.** The graceful phase gets `unmountTimeout` and the
+   * escalation gets its own, so a teardown that has to force costs at most
+   * twice it rather than however long the spawns inside each phase happen to
+   * take. Giving the ladder what is left of the first budget would mean giving
+   * it nothing, since it only runs once that budget is gone — and the ladder is
+   * the part that actually detaches the mount. Everything `#force` does,
+   * settle window included, comes out of the second budget, so twice is the
+   * whole of it and not "twice plus whatever the tail costs".
    */
   async #unmount(): Promise<void> {
     const timeout = this.#options.unmountTimeout ?? 10_000;
+    const bounded = Number.isFinite(timeout) && timeout > 0;
     let failure: unknown;
-    const steps = this.#unmountSteps().then(
-      () => "done" as const,
+    const steps = this.#unmountSteps(deadlineIn(bounded ? timeout : undefined)).then(
+      (outcome) => outcome,
       (error: unknown) => {
         failure = error;
         return "failed" as const;
       },
     );
-    if (!Number.isFinite(timeout) || timeout <= 0) {
+    if (!bounded) {
       // Explicitly opted out of the deadline.
       if ((await steps) === "failed") {
         throw failure;
@@ -912,21 +938,30 @@ class MountImpl implements Mount {
     if (outcome === "failed") {
       throw failure;
     }
-    if (outcome === "expired") {
+    // "timeout" is the same situation as "expired", reached the better way: the
+    // `umount` spawn ran out of budget and has already been let go of, so
+    // nothing is still holding the mount the ladder is about to escalate
+    // against. Without it the two would race — the spawn's deadline and the
+    // one below expire together — and the loser decided whether `unmount()`
+    // escalated or just threw.
+    if (outcome === "expired" || outcome === "timeout") {
       await this.#force(timeout);
     }
   }
 
-  async #unmountSteps(): Promise<void> {
+  async #unmountSteps(deadline: Deadline): Promise<"done" | "timeout"> {
     // Someone else already unmounted us and the loop noticed: there is nothing
     // to run, only teardown to wait for.
     if (!this.#stopping && !this.#finished) {
-      await this.#runUnmount();
+      if ((await this.#runUnmount(deadline)) === "timeout") {
+        return "timeout";
+      }
     }
     // The loop is what ends the mount, in both directions: `umount(8)` makes
     // the kernel abort the connection, every outstanding read returns `ENODEV`,
     // and `#finish` destroys the session and closes the fd.
     await this.closed;
+    return "done";
   }
 
   /**
@@ -935,19 +970,37 @@ class MountImpl implements Mount {
    * Root uses plain `umount(8)` even though `fusermount3` may be installed: as
    * root the helper is strictly worse, because it refuses mounts that are
    * missing from its own mtab. Unprivileged has only the helper.
+   *
+   * Both spawns are bounded by `deadline`, and both report expiry as
+   * `"timeout"` rather than as a failure: a `umount(8)` parked in `D` state is
+   * precisely what the escalation exists for, and the child is written off at
+   * the same moment — leaving it running would keep this process's event loop
+   * alive and keep it holding the mount `#force` is about to force down.
    */
-  async #runUnmount(): Promise<void> {
+  async #runUnmount(deadline: Deadline): Promise<"done" | "timeout"> {
     let failure: unknown;
     if (this.#rootless) {
-      await unmountViaFusermount(this.mountpoint).catch((error: unknown) => {
+      const outcome = await unmountViaFusermount(this.mountpoint, {
+        timeout: deadline.remaining(),
+      }).catch((error: unknown) => {
         failure = error;
+        return undefined;
       });
+      if (outcome?.timedOut === true) {
+        return "timeout";
+      }
     } else {
       let result: SpawnResult;
       try {
-        result = await run("umount", [this.mountpoint], { stdio: ["ignore", "ignore", "pipe"] });
+        result = await run("umount", [this.mountpoint], {
+          stdio: ["ignore", "ignore", "pipe"],
+          timeout: deadline.remaining(),
+        });
       } catch (error) {
         throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
+      }
+      if (result.timedOut === true) {
+        return "timeout";
       }
       if (result.status !== 0) {
         failure = new Error(describe("umount", result));
@@ -955,7 +1008,7 @@ class MountImpl implements Mount {
     }
     // A failure that raced an external unmount is not a failure.
     if (failure === undefined || !isMounted(this.mountpoint)) {
-      return;
+      return "done";
     }
     throw new Error(
       `mountx: could not unmount ${this.mountpoint} (${errorMessage(failure)}). ` +
@@ -997,6 +1050,10 @@ class MountImpl implements Mount {
    * answering can leave reads parked here where root would not.
    */
   async #force(timeout: number): Promise<void> {
+    // The escalation's own budget, shared across the whole ladder: two rungs
+    // each given the full `timeout` would take twice as long as the deadline
+    // that sent us here, which is the arithmetic the invariant is about.
+    const budget = deadlineIn(timeout);
     const error = new Error(
       `mountx: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the ` +
         `driver has probably stopped answering. The connection has been aborted, so anything ` +
@@ -1006,7 +1063,10 @@ class MountImpl implements Mount {
     this.#report(error);
     if (this.#rootless) {
       if (isMounted(this.mountpoint)) {
-        await unmountViaFusermount(this.mountpoint, { lazy: true }).catch(() => {
+        await unmountViaFusermount(this.mountpoint, {
+          lazy: true,
+          timeout: budget.remaining(),
+        }).catch(() => {
           // Nothing to add: the next check of the mount table is the verdict.
         });
       }
@@ -1018,14 +1078,24 @@ class MountImpl implements Mount {
         if (!isMounted(this.mountpoint)) {
           break;
         }
-        await run("umount", args, { stdio: ["ignore", "ignore", "pipe"] }).catch(() => {
+        await run("umount", args, {
+          stdio: ["ignore", "ignore", "pipe"],
+          timeout: budget.remaining(),
+        }).catch(() => {
           // Nothing to add: the next check of the mount table is the verdict.
         });
       }
     }
     // The abort should have ended the loop by itself. Give it a moment to do
     // so, then stop waiting and tear down from this side regardless.
-    await Promise.race([this.closed, delay(1000)]);
+    //
+    // The moment comes *out of* the ladder's budget rather than on top of it: a
+    // fixed second added here is a second the stated bound does not cover, and
+    // at `unmountTimeout: 100` it would be twelve times the deadline rather
+    // than twice it. A ladder that spent everything leaves no settle, which is
+    // the right answer — `#finish(true)` below forces the teardown either way,
+    // and waiting past a spent budget is what this whole file is against.
+    await Promise.race([this.closed, delay(Math.min(1000, budget.remaining() ?? 1000))]);
     await this.#finish(true);
     throw error;
   }
@@ -1090,12 +1160,6 @@ class MountImpl implements Mount {
       this.#drained?.();
     }
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => {
-    setTimeout(resolvePromise, ms).unref();
-  });
 }
 
 /**

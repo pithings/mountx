@@ -57,6 +57,73 @@ function setupFailingWrites(): {
   };
 }
 
+/** What the store was asked, by method. Every one of these is a round trip. */
+interface Calls {
+  hasItem: number;
+  getItemRaw: number;
+  setItemRaw: number;
+  removeItem: number;
+  getKeys: number;
+  bytesRead: number;
+}
+
+/**
+ * A store that counts what it is asked for.
+ *
+ * The cost that matters for a remote driver is the number of round trips, not
+ * the time they take, so the assertions here are on counts.
+ */
+function setupCounting(): { fs: Loopback; storage: Storage; calls: Calls; reset: () => void } {
+  const backing = memoryStorageDriver();
+  const calls: Calls = {
+    hasItem: 0,
+    getItemRaw: 0,
+    setItemRaw: 0,
+    removeItem: 0,
+    getKeys: 0,
+    bytesRead: 0,
+  };
+  const storage = createStorage({
+    driver: {
+      ...backing,
+      hasItem(key, options) {
+        calls.hasItem++;
+        return backing.hasItem(key, options);
+      },
+      getItemRaw(key, options) {
+        calls.getItemRaw++;
+        const value = backing.getItemRaw!(key, options);
+        if (value instanceof Uint8Array) {
+          calls.bytesRead += value.byteLength;
+        }
+        return value;
+      },
+      setItemRaw(key, value, options) {
+        calls.setItemRaw++;
+        return backing.setItemRaw!(key, value, options);
+      },
+      removeItem(key, options) {
+        calls.removeItem++;
+        return backing.removeItem!(key, options);
+      },
+      getKeys(base, options) {
+        calls.getKeys++;
+        return backing.getKeys(base, options);
+      },
+    },
+  });
+  return {
+    fs: createLoopback(createUnstorageDriver(storage)),
+    storage,
+    calls,
+    reset: () => {
+      for (const name of Object.keys(calls) as (keyof Calls)[]) {
+        calls[name] = 0;
+      }
+    },
+  };
+}
+
 const read = async (fs: Loopback, path: string): Promise<string> =>
   decoder.decode(await fs.readFile(path));
 
@@ -260,6 +327,24 @@ describe("unstorage driver: handles", () => {
     await reader.close();
   });
 
+  /**
+   * `read(buffer, offset, 0)` past the end of the buffer copies nothing, and
+   * `node:fs` answers `bytesRead: 0` rather than refusing — but `TypedArray.set`
+   * rejects the out-of-bounds offset regardless of the length, and the bare
+   * `RangeError` it throws has no `code`, so a transport could only report it
+   * as `EIO`. `memory` guards the same call the same way.
+   */
+  it("answers a zero-length read at an out-of-range offset with bytesRead: 0", async () => {
+    const { fs } = setup();
+    await fs.writeFile("/f", "data");
+    const handle = await fs.open("/f", "r");
+
+    const buffer = new Uint8Array(4);
+    expect(await handle.read(buffer, 10, 0, 0)).toMatchObject({ bytesRead: 0 });
+    expect(await handle.read(buffer, 4, 0, 0)).toMatchObject({ bytesRead: 0 });
+    await handle.close();
+  });
+
   it("writes back on the last close", async () => {
     const { fs, storage } = setup();
     const handle = await fs.open("/f", "w");
@@ -423,6 +508,155 @@ describe("unstorage driver: handles", () => {
       expect(await read(fresh, "/to")).toBe("bbcc");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("unstorage driver: round trips", () => {
+  const contents = new Uint8Array(64 * 1024).fill(65);
+
+  it("does not fetch the object O_TRUNC is about to discard", async () => {
+    const { fs, storage, calls, reset } = setupCounting();
+    await fs.writeFile("/f", contents);
+    reset();
+
+    const handle = await fs.open("/f", "w");
+    await handle.write(new TextEncoder().encode("new"), 0, 3, 0);
+    await handle.close();
+
+    expect(calls.getItemRaw).toBe(0);
+    expect(calls.bytesRead).toBe(0);
+    expect(await stored(storage, "f")).toBe("new");
+  });
+
+  it("does not fetch the object truncate(path, 0) is about to discard", async () => {
+    const { fs, storage, calls, reset } = setupCounting();
+    await fs.writeFile("/f", contents);
+    reset();
+
+    await fs.truncate("/f", 0);
+
+    expect(calls.getItemRaw).toBe(0);
+    expect((await fs.stat("/f")).size).toBe(0);
+    expect(await stored(storage, "f")).toBe("");
+  });
+
+  /** Any other length keeps a prefix of the value, so it has to be read. */
+  it("still fetches for a truncation to a non-zero length", async () => {
+    const { fs, calls, reset } = setupCounting();
+    await fs.writeFile("/f", "abcdef");
+    reset();
+
+    await fs.truncate("/f", 3);
+
+    expect(calls.getItemRaw).toBe(1);
+    expect(await read(fs, "/f")).toBe("abc");
+  });
+
+  /**
+   * The truncation still has to reach a file somebody else is holding: the
+   * shared buffer *is* the file's contents while it is open, which is what
+   * `memory` and `node-fs` do through the same handle.
+   */
+  it("truncates the shared buffer when the path is already open", async () => {
+    const { fs, calls, reset } = setupCounting();
+    await fs.writeFile("/f", "abcdef");
+    const reader = await fs.open("/f", "r");
+    reset();
+
+    const truncating = await fs.open("/f", "w");
+    expect(calls.getItemRaw).toBe(0);
+
+    const buffer = new Uint8Array(6);
+    const { bytesRead } = await reader.read(buffer, 0, 6, 0);
+    expect(bytesRead).toBe(0);
+    expect((await fs.stat("/f")).size).toBe(0);
+
+    await truncating.close();
+    await reader.close();
+  });
+
+  /**
+   * One listing settles the whole walk, rather than one per component. The
+   * point lookups stay — they are what catches a store holding both `a` and
+   * `a:b` — and they are the cheap half.
+   *
+   * Seeded through the store rather than through the driver, so the in-process
+   * directory overlay is empty: that is the state a mount is in for everything
+   * it did not itself create, and the only one where the walk costs anything.
+   */
+  it("walks a deep path with one listing per prefix it has to ask about", async () => {
+    const { fs, storage, calls, reset } = setupCounting();
+    await storage.setItem("a:b:c:d:real", "x");
+
+    reset();
+    await expect(fs.stat("/a/b/c/d/missing")).rejects.toMatchObject({ code: "ENOENT" });
+    // One for the leaf — is it a directory? — and one for the deepest parent,
+    // which vouches for every component above it.
+    expect(calls.getKeys).toBe(2);
+    expect(calls.hasItem).toBe(5);
+  });
+
+  /** `classify` lists the directory; `readdir` and `hasEntries` reuse it. */
+  it("lists a directory once per call", async () => {
+    const { fs, storage, calls, reset } = setupCounting();
+    await storage.setItem("d:f", "x");
+
+    reset();
+    expect((await fs.readdir("/d", { withFileTypes: true })).length).toBe(1);
+    expect(calls.getKeys).toBe(1);
+
+    reset();
+    await expect(fs.rmdir("/d")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+    expect(calls.getKeys).toBe(1);
+  });
+
+  /**
+   * Asked once per call and never again: the store is shared and this driver
+   * outlives any one operation, so an answer that survived a call would be a
+   * stale answer the next time somebody else wrote to the store.
+   */
+  it("re-asks the store on the next call", async () => {
+    const { fs, storage, calls, reset } = setupCounting();
+    await storage.setItem("f", "one");
+    expect((await fs.stat("/f")).isFile()).toBe(true);
+
+    await storage.removeItem("f");
+    reset();
+    await expect(fs.stat("/f")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(calls.hasItem).toBeGreaterThan(0);
+  });
+});
+
+describe("unstorage driver: a shadowed key deeper than the root", () => {
+  /**
+   * `test/unstorage.test.ts`'s flat case pinned `/a` against `a:b`. The same
+   * rule has to hold at every depth, which is what the walk's point lookups are
+   * for: a component that is a key makes everything below it `ENOTDIR`, and a
+   * component that is simply absent makes it `ENOENT`.
+   */
+  const layout = async (): Promise<Loopback> => {
+    const storage = createStorage();
+    await storage.setItem("a:b", "shadowing");
+    await storage.setItem("a:b:c:d", "deep");
+    return createLoopback(createUnstorageDriver(storage));
+  };
+
+  it("answers ENOTDIR below a shadowing component", async () => {
+    const fs = await layout();
+    expect((await fs.stat("/a/b")).isFile()).toBe(true);
+    for (const path of ["/a/b/c", "/a/b/c/d/e", "/a/b/zz"]) {
+      await expect(fs.stat(path)).rejects.toMatchObject({ code: "ENOTDIR" });
+    }
+    // `a:b:c:d` is a key, and only its *immediate* parent is tested for
+    // shadowing — which is what makes `/a/b/c` `ENOTDIR` and stops there.
+    expect((await fs.stat("/a/b/c/d")).isFile()).toBe(true);
+  });
+
+  it("answers ENOENT for a component that is simply absent", async () => {
+    const fs = await layout();
+    for (const path of ["/a/zz/c", "/zz/b/c"]) {
+      await expect(fs.stat(path)).rejects.toMatchObject({ code: "ENOENT" });
     }
   });
 });

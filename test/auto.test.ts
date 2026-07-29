@@ -14,7 +14,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { type P9ClientProbe, p9ClientProbe } from "../src/9p/probe.ts";
 import {
   type AutoMountOptions,
@@ -208,8 +208,127 @@ describe("mount", () => {
 describe("liveMounts and unmountAll", () => {
   it("answer without loading a transport that was never used", async () => {
     // Both are safe to call in a process that has mounted nothing — which is
-    // also the only way to assert that they load nothing.
+    // also the only way to assert that they load nothing. It is also the one
+    // documented gap in their coverage: a transport `mountx/auto` never loaded
+    // is never asked, so a mount somebody made by importing that transport
+    // directly is invisible to both.
     expect(await liveMounts()).toEqual([]);
     expect(await unmountAll()).toEqual([]);
+  });
+
+  /*
+   * Both of these are about the teardown path having no `catch`. `unmountAll`
+   * is documented "never rejects" precisely because it is called from a signal
+   * handler and from a `finally`, so every way it could throw has to become a
+   * value in the array instead — including the two that are not the
+   * transport's fault: a module that would not load, and a module that loaded
+   * and then failed.
+   *
+   * A fresh `src/auto.ts` per case because the set of loaded transports is
+   * module state; `vi.resetModules()` is what makes each one start empty.
+   */
+  describe("loading the transport module", () => {
+    afterEach(() => {
+      vi.doUnmock("../src/fuse/mount.ts");
+      vi.resetModules();
+    });
+
+    async function freshAuto(): Promise<typeof import("../src/auto.ts")> {
+      vi.resetModules();
+      return await import("../src/auto.ts");
+    }
+
+    it("does not remember a transport whose module failed to load", async () => {
+      vi.doMock("../src/fuse/mount.ts", () => Promise.reject(new Error("mountx-test: no module")));
+      const auto = await freshAuto();
+
+      // Vitest reports a mock factory's own failure in its own words, so what
+      // is pinned is that the import rejected and no mount happened — not the
+      // wording of an error this file made up.
+      const failure = await auto
+        .mount(createMemoryDriver(), "/mountx-test/never-created", { transport: "fuse" })
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      expect(failure).toBeInstanceOf(Error);
+
+      // The point of the fix: a transport that never loaded has no mounts, so
+      // asking it would only re-import the module that just failed and re-raise
+      // the same error out of a call documented never to reject.
+      await expect(auto.unmountAll()).resolves.toEqual([]);
+      await expect(auto.liveMounts()).resolves.toEqual([]);
+    });
+
+    it("collects a transport's teardown failure instead of rejecting", async () => {
+      const boom = new Error("mountx-test: unmountAll failed");
+      vi.doMock("../src/fuse/mount.ts", () => ({
+        mount: (_driver: unknown, mountpoint: string) =>
+          Promise.resolve({ mountpoint, unmount: () => Promise.resolve() }),
+        unmountAll: () => Promise.reject(boom),
+        liveMounts: () => [],
+      }));
+      const auto = await freshAuto();
+
+      const mounted = await auto.mount(createMemoryDriver(), "/mountx-test/fake", {
+        transport: "fuse",
+      });
+      expect(mounted.transport).toBe("fuse");
+
+      await expect(auto.unmountAll()).resolves.toEqual([boom]);
+    });
+
+    it("covers a loaded transport's mounts whoever made them", async () => {
+      /*
+       * The scope both functions document, pinned because the prose is easy to
+       * get backwards. A transport keeps *one* process-wide registry of its
+       * live mounts — `src/fuse/mount.ts`'s `live` set, and the same set in the
+       * other two — filled by the one `mount()` it has, whichever caller
+       * reached it. `auto` asks for that whole set and cannot filter it. So a
+       * mount made by importing `mountx/fuse` directly is reported here *and*
+       * is torn down by `auto.unmountAll()`.
+       *
+       * Modelled with the real shape: one registry, two callers.
+       */
+      const live: { mountpoint: string; unmount: () => Promise<void> }[] = [];
+      const fuse = {
+        mount: (_driver: unknown, mountpoint: string) => {
+          const mounted = {
+            mountpoint,
+            unmount: () => {
+              const at = live.indexOf(mounted);
+              if (at !== -1) live.splice(at, 1);
+              return Promise.resolve();
+            },
+          };
+          live.push(mounted);
+          return Promise.resolve(mounted);
+        },
+        unmountAll: async () => {
+          // A copy, because each `unmount()` removes itself from `live` — the
+          // real `unmountAll` snapshots for the same reason.
+          const pending = live.slice();
+          for (const mounted of pending) await mounted.unmount();
+          return [];
+        },
+        liveMounts: () => [...live],
+      };
+      vi.doMock("../src/fuse/mount.ts", () => fuse);
+      const auto = await freshAuto();
+
+      await auto.mount(createMemoryDriver(), "/mountx-test/via-auto", { transport: "fuse" });
+      // What `import { mount } from "mountx/fuse"` reaches: the same function,
+      // and therefore the same registry.
+      await fuse.mount(createMemoryDriver(), "/mountx-test/direct");
+
+      expect((await auto.liveMounts()).map((mounted) => mounted.mountpoint)).toEqual([
+        "/mountx-test/via-auto",
+        "/mountx-test/direct",
+      ]);
+      await expect(auto.unmountAll()).resolves.toEqual([]);
+      // Including the one `auto` never made — which is the surprise the docs
+      // exist to remove.
+      expect(live).toEqual([]);
+    });
   });
 });

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createNodeFsDriver } from "../src/drivers/node-fs.ts";
 import { createLoopback, type Loopback } from "../src/harness.ts";
 import type { FsDriver } from "../src/types.ts";
+import { rootedNodeFs } from "./rooted-node-fs.ts";
 
 describe("node-fs driver", () => {
   let sandbox: string;
@@ -97,10 +98,67 @@ describe("node-fs driver", () => {
     expect(created).toBe("/other");
   });
 
+  it("refuses to remove its own root", async () => {
+    // `secure("/")` has no components to walk and so returns the root itself,
+    // which `rmdir(2)` was happy to delete once it was empty — permanently
+    // killing the driver, in the file the conformance and differential suites
+    // treat as the oracle. Every other operation on the root is caught by the
+    // host kernel; this one is not, because from its side the root is an
+    // ordinary directory.
+    for (const path of ["/", "/.", "/a/..", "//"]) {
+      await expect(fs.rmdir(path)).rejects.toMatchObject({ code: "EBUSY" });
+    }
+    // ...and the root is still there, still usable.
+    await fs.writeFile("/still-here", "x");
+    expect((await fs.stat("/")).isDirectory()).toBe(true);
+    expect(await readFile(join(root, "still-here"), "utf8")).toBe("x");
+  });
+
+  it("resolves both paths of a rename or link once, together", async () => {
+    // Two sequential walks over `/a/b/c` cost six `lstat`s where four will do,
+    // and each is a libuv threadpool job — the pool `fuse/mount.ts` documents
+    // as the wedge hazard. The memo lives for the one call and no longer.
+    await fs.mkdir("/a/b/c", { recursive: true });
+    await fs.writeFile("/a/b/c/f", "content");
+    await fs.rename("/a/b/c/f", "/a/b/c/g");
+    await fs.link("/a/b/c/g", "/a/b/c/h");
+    expect(await readFile(join(root, "a/b/c/h"), "utf8")).toBe("content");
+    expect((await fs.stat("/a/b/c/g")).nlink).toBe(2);
+    // A failure still names the *first* path, as it did when the two ran in
+    // sequence: a symlink loop on the source is the source's error.
+    await fs.symlink("loop", "/loop");
+    await expect(fs.rename("/loop/x", "/a/b/c/z")).rejects.toMatchObject({ code: "ELOOP" });
+    await expect(fs.link("/a/b/c/z", "/loop/x")).rejects.toMatchObject({ code: "ELOOP" });
+  });
+
   it("declares its capabilities", () => {
     expect(fs.capabilities).toMatchObject({ hardlinks: true, symlinks: true, readOnly: false });
     expect(createLoopback(createNodeFsDriver(root, { readOnly: true })).capabilities.readOnly).toBe(
       true,
     );
+  });
+});
+
+describe("rooted node:fs oracle", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "mountx-oracle-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("refuses to remove the directory it is rooted at", async () => {
+    // `join(root, "/")` is `root`, so this oracle deleted its own root as
+    // readily as the driver it is the oracle for — the temp directory in
+    // `drivers.test.ts`, and the *mountpoint* in the FUSE conformance column.
+    const fs = createLoopback(rootedNodeFs(root));
+    for (const path of ["/", "/.", "/a/..", "//"]) {
+      await expect(fs.rmdir(path)).rejects.toMatchObject({ code: "EBUSY" });
+    }
+    await fs.writeFile("/still-here", "x");
+    expect(await readFile(join(root, "still-here"), "utf8")).toBe("x");
   });
 });

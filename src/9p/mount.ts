@@ -82,7 +82,15 @@ import * as fs from "node:fs";
 import { mkdtemp, realpath, rm, stat as statPath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve as resolveNative } from "node:path";
-import { describe, errorMessage, run, type SpawnResult } from "../fuse/exec.ts";
+import {
+  type Deadline,
+  deadlineIn,
+  delay,
+  describe,
+  errorMessage,
+  run,
+  type SpawnResult,
+} from "../fuse/exec.ts";
 import type { FsDriver } from "../types.ts";
 import { P9_IOHDRSZ, P9_MIN_MSIZE } from "./constants.ts";
 import { p9ClientProbe } from "./probe.ts";
@@ -248,6 +256,10 @@ export interface MountP9Options extends P9ServerOptions {
   /**
    * Milliseconds {@link P9Mount.unmount} may spend before it forces the mount
    * down. Default `10_000`; `0` or `Infinity` waits forever.
+   *
+   * It bounds each of the two phases, not their sum: asking nicely gets this
+   * long, and the forcing that follows gets its own budget of the same size, so
+   * a teardown that has to escalate settles in at most twice it.
    */
   unmountTimeout?: number;
   /**
@@ -281,7 +293,8 @@ export interface P9Mount extends AsyncDisposable {
   readonly closed: Promise<void>;
   /**
    * Unmount and shut the server down. Idempotent, concurrency-safe, retryable
-   * after a failure. Always settles, within `unmountTimeout`.
+   * after a failure. Always settles: within `unmountTimeout` when asking nicely
+   * works, and within twice it when the mount has to be forced down instead.
    */
   unmount(): Promise<void>;
 }
@@ -711,12 +724,6 @@ function isMounted(target: string): boolean | undefined {
   return entry === null ? undefined : entry !== undefined;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => {
-    setTimeout(resolvePromise, ms).unref();
-  });
-}
-
 /** Everything spawned here talks only through its exit status and stderr. */
 const QUIET_STDIO: Array<"ignore" | "pipe" | number> = ["ignore", "ignore", "pipe"];
 
@@ -894,12 +901,19 @@ class P9MountImpl implements P9Mount {
    * The deadline is not paranoia: `umount(8)` quiesces the filesystem before it
    * detaches, so a driver that has stopped answering blocks it in `D` state —
    * and with it `unmount()`, `await using`, and the signal handlers.
+   *
+   * **One budget per phase, shared by its steps**, the same discipline
+   * `src/nfs/mount.ts` keeps: the deadline is built once at the top and each
+   * spawn gets what is left of it, so two `umount`s in a row cannot cost two
+   * deadlines. The escalation then gets a budget of its own, because it runs
+   * only once this one is spent.
    */
   async #unmount(): Promise<void> {
     const timeout = this.#options.unmountTimeout ?? 10_000;
     const bounded = Number.isFinite(timeout) && timeout > 0;
+    const budget = deadlineIn(bounded ? timeout : undefined);
     let failure: unknown;
-    const steps = this.#unmountSteps(bounded ? timeout : undefined).then(
+    const steps = this.#unmountSteps(budget).then(
       (outcome) => outcome,
       (error: unknown) => {
         failure = error;
@@ -913,7 +927,7 @@ class P9MountImpl implements P9Mount {
         // gets `EIO`. `unmount()` is retryable for exactly this case.
         throw failure;
       }
-      await this.#finish();
+      await this.#settle(budget);
       return;
     }
     let timer: NodeJS.Timeout | undefined;
@@ -932,21 +946,26 @@ class P9MountImpl implements P9Mount {
     if (outcome === "failed") {
       throw failure;
     }
-    await this.#finish();
+    // Whatever the steps left of the budget is what shutting the server down
+    // gets — the phase is one budget, and this is the last step in it.
+    await this.#settle(budget);
   }
 
   /**
    * `umount(8)`, under `deadline`. `"timeout"` means it never answered — the
    * caller escalates; anything genuinely wrong throws.
    */
-  async #unmountSteps(deadline: number | undefined): Promise<"done" | "timeout"> {
+  async #unmountSteps(deadline: Deadline): Promise<"done" | "timeout"> {
     if (isMounted(this.mountpoint) === false) {
       // Someone else already unmounted us.
       return "done";
     }
     let result: SpawnResult;
     try {
-      result = await run("umount", [this.mountpoint], { stdio: QUIET_STDIO, timeout: deadline });
+      result = await run("umount", [this.mountpoint], {
+        stdio: QUIET_STDIO,
+        timeout: deadline.remaining(),
+      });
     } catch (error) {
       throw new Error(`mountx: could not run umount(8): ${errorMessage(error)}`);
     }
@@ -979,6 +998,9 @@ class P9MountImpl implements P9Mount {
    * or not the ladder worked.
    */
   async #force(timeout: number): Promise<void> {
+    // The escalation's own budget, shared by both rungs: given the full
+    // `timeout` apiece they would cost twice the deadline that sent us here.
+    const budget = deadlineIn(timeout);
     const error = new Error(
       `mountx: unmounting ${this.mountpoint} did not finish within ${timeout}ms — the driver ` +
         `has probably stopped answering. The mount has been forced down, so anything in flight ` +
@@ -995,13 +1017,57 @@ class P9MountImpl implements P9Mount {
       }
       // Bounded for the same reason the first `umount` is: a step that never
       // returns must not outlive the ladder it is a step of.
-      await run("umount", args, { stdio: QUIET_STDIO, timeout }).catch(() => {
+      await run("umount", args, { stdio: QUIET_STDIO, timeout: budget.remaining() }).catch(() => {
         // Nothing to add: the next read of the mount table is the verdict.
       });
     }
-    await this.#finish();
-    await delay(0);
+    // Under the ladder's own budget, not unbounded: see `#settle`, and note
+    // that the driver this is closing fids through is by hypothesis the one
+    // that stopped answering.
+    await this.#settle(budget);
     throw error;
+  }
+
+  /**
+   * {@link P9MountImpl.#finish}, and stop waiting when the phase's budget runs
+   * out. This is what makes "settles within twice `unmountTimeout`" true.
+   *
+   * `#finish()` is not the quick bookkeeping it looks like. `server.close()`
+   * ends by awaiting every connection's `close()`, each of which awaits
+   * `P9Session.destroy()` — which closes the fids the session still holds
+   * **through the driver**, and a driver that has stopped answering is the
+   * stated premise of every path that gets here. Awaiting that unconditionally
+   * would hand back the hang the deadline exists to prevent, one step down.
+   *
+   * Abandoning it is safe in the way that matters, because of the order
+   * `P9ServerImpl.#close()` works in: the listener is closed and every owned
+   * stream destroyed *before* the per-connection teardown is awaited. So what a
+   * lapsed budget walks away from is only the driver's own `close()` calls —
+   * precisely what the FUSE transport's `#finish(true)` skips for the same
+   * reason. One consequence is worth naming: the `mkdtemp` socket directory is
+   * removed at the *end* of `#doFinish`, so a close that never finishes leaves
+   * that directory behind in `tmpdir` — an empty `0700` directory and a dead
+   * socket, against a hang that would otherwise never return.
+   */
+  async #settle(budget: Deadline): Promise<void> {
+    // Started before the budget is read, so an already-spent one still gets the
+    // synchronous half — the listener closing and the streams going down.
+    const finished = this.#finish().catch((error: unknown) => {
+      this.#options.onTransportError?.(error, undefined);
+    });
+    const remaining = budget.remaining();
+    if (remaining === undefined) {
+      // No deadline at all, which is what `unmountTimeout: 0` asked for.
+      await finished;
+      return;
+    }
+    await Promise.race([finished, delay(remaining)]);
+    // `closed` settles here rather than only at the end of `#doFinish`: by now
+    // the mount is detached and nothing can reach the server, which is what
+    // this promise means, and leaving it pending would let a caller that
+    // awaits it inherit exactly the hang `unmount()` just refused to. Resolving
+    // twice is a no-op, so `#doFinish` finishing later changes nothing.
+    this.#closedResolve();
   }
 
   /** Stop serving, forget the mount, and take the socket directory with it. */

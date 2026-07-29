@@ -23,7 +23,7 @@
  */
 
 import { fsError } from "../errors.ts";
-import { isPathInside } from "../path.ts";
+import { remapSubtree, type SubtreeRemapOps } from "../subtree.ts";
 import type { StatsLike } from "../types.ts";
 import { FUSE_ROOT_ID } from "./constants.ts";
 
@@ -85,6 +85,15 @@ export class InodeTable {
   /** Only holds inodes with at least one path — see {@link detach}. */
   private readonly byKey = new Map<string, Inode>();
   private nextNodeid = FUSE_ROOT_ID + 1n;
+  /**
+   * The pair {@link InodeTable.remap} hands to `remapSubtree`. Built once
+   * rather than per rename, and pointing at the same two private methods every
+   * other mutation here goes through — the walk is shared, the meaning is not.
+   */
+  private readonly remapOps: SubtreeRemapOps<Inode> = {
+    detach: (inode, path) => this.detachPath(inode, path),
+    attach: (inode, path) => this.attachPath(inode, path),
+  };
 
   constructor(options: InodeTableOptions = {}) {
     this.useDriverIno = options.useDriverIno ?? true;
@@ -223,37 +232,18 @@ export class InodeTable {
    *
    * The subtree walk is what makes `rename` of a directory correct: the kernel
    * goes on using the nodeids it already has for everything underneath, and
-   * every one of them must resolve to its new path afterwards. It is O(tracked
-   * paths); a prefix tree would make it O(subtree), which is a benchmark-
-   * milestone concern, not a v1 one.
+   * every one of them must resolve to its new path afterwards.
+   *
+   * The walk itself is `src/subtree.ts`'s — the same one `FileHandleTable` and
+   * `FidTable` do — driven by *this* table's {@link InodeTable.detachPath} and
+   * {@link InodeTable.attachPath}, so what a replaced destination means here is
+   * unchanged: the orphan keeps its nodeid and stays reachable until the kernel
+   * forgets it. It costs two full scans of the path map per rename, i.e.
+   * O(tracked paths) rather than O(subtree); see that module for why a prefix
+   * tree is the fix and why it is a benchmark-milestone concern, not a v1 one.
    */
   remap(from: string, to: string): void {
-    // Whatever used to live at the destination has just been replaced.
-    if (from !== to) {
-      this.unbind(to);
-      // Deleting the current key mid-iteration is well defined for a Map, and
-      // `unbind` never touches any other one.
-      for (const path of this.byPath.keys()) {
-        if (path !== to && isPathInside(path, to)) {
-          this.unbind(path);
-        }
-      }
-    }
-    const moved: { inode: Inode; from: string; to: string }[] = [];
-    for (const [path, inode] of this.byPath) {
-      if (isPathInside(path, from)) {
-        moved.push({ inode, from: path, to: to + path.slice(from.length) });
-      }
-    }
-    // Two passes: a one-pass rewrite would clobber a destination that is also
-    // a source (`mv a b` inside the same subtree).
-    for (const move of moved) {
-      this.byPath.delete(move.from);
-      move.inode.paths.delete(move.from);
-    }
-    for (const move of moved) {
-      this.attachPath(move.inode, move.to);
-    }
+    remapSubtree(this.byPath, from, to, this.remapOps);
   }
 
   /** Every nodeid currently known, for teardown and tests. */

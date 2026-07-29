@@ -66,7 +66,7 @@ landing:
       description: What your driver supports is declared or inferred from its shape. Anything unsupported answers `ENOSYS`/`ENOTSUP` instead of pretending.
     - title: Kernel caching you control
       icon: lucide:gauge
-      description: Attribute and entry timeouts are worth 8–15× on a real workload, and `notifyInvalInode()` drops a cache the moment your storage changes.
+      description: Attribute and entry timeouts are worth 10–15× on a real workload, and `notifyInvalInode()` drops a cache the moment your storage changes.
 
 # No blog section — redirect the built-in /blog route so it is not
 # prerendered into a 404.

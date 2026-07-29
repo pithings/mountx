@@ -10,7 +10,7 @@ import { constants } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
 import { createNodeFsDriver } from "../../src/drivers/node-fs.ts";
 import { ERRNO_CODES } from "../../src/errors.ts";
@@ -37,6 +37,7 @@ import {
   decodeNotifyInvalInode,
 } from "../../src/fuse/notify.ts";
 import {
+  DirentPacker,
   encodeReply,
   encodeRequest,
   type FuseEntryOut,
@@ -492,6 +493,84 @@ describe("readdir", () => {
     expectHealthy(session);
   });
 
+  it("mints no inodes for a plain READDIR", async () => {
+    // A `fuse_dirent.ino` is a fileid, not a nodeid: the kernel never links it
+    // into a dentry, so an inode minted here would sit at `nlookup == 0n` and
+    // `InodeTable.forget` — the only thing that deletes from `byNodeid` — could
+    // never name it. A `find` over a large tree used to retain one per file for
+    // the life of the mount. On base this grows by `names.length`.
+    const { session, kernel } = await mount();
+    const dir = await populate(kernel);
+    const before = session.inodes.size;
+
+    const { fh } = await kernel.opendir(dir);
+    expect(await kernel.readdirAll(dir, fh, 256)).toEqual([".", "..", ...names]);
+    await kernel.releasedir(dir, fh);
+
+    expect(session.inodes.size).toBe(before);
+    // Nothing unforgettable was left behind either: every tracked inode is
+    // either the root, reachable by path, or owed a FORGET the kernel can send.
+    for (const nodeid of session.inodes.nodeids()) {
+      const inode = session.inodes.get(nodeid)!;
+      expect(inode.nlookup > 0n || inode.paths.size > 0).toBe(true);
+    }
+    expectHealthy(session);
+  });
+
+  it("reports the driver's own st_ino, so ls -i agrees with stat", async () => {
+    // The fileid packed into a dirent is byte for byte what `#attrOf` puts in
+    // `fuse_attr.ino`. If they ever diverge, `ls -i` and `stat` disagree about
+    // the same file — which is exactly what packing a nodeid would have done.
+    const { session, kernel } = await mount();
+    const dir = await populate(kernel);
+    const { fh } = await kernel.opendir(dir);
+    const page = await kernel.readdir(dir, fh, 2n, 4096);
+    expect(page.entries.length).toBeGreaterThan(0);
+
+    for (const entry of page.entries) {
+      const looked = await kernel.lookup(dir, entry.name);
+      expect(entry.ino).toBe(looked.attr.ino);
+      await kernel.forgetAll(looked.nodeid);
+    }
+    await kernel.releasedir(dir, fh);
+    expectHealthy(session);
+  });
+
+  it("never advances past an entry the packer refused", async () => {
+    // The loop pre-computes `needed > packer.remaining` for the ordering it
+    // documents, but `DirentPacker.add` is the authority — and on base its
+    // answer was discarded at all three call sites. If the two ever disagree,
+    // the entry is silently dropped while `off` advances past it: a directory
+    // entry that never appears in `ls`, with no error anywhere.
+    //
+    // Forced here by making `add` refuse exactly once, for one name.
+    const { session, kernel } = await mount();
+    const dir = await populate(kernel);
+    const { fh } = await kernel.opendir(dir);
+
+    const victim = names[3]!;
+    const real = DirentPacker.prototype.add;
+    let refused = false;
+    const spy = vi
+      .spyOn(DirentPacker.prototype, "add")
+      .mockImplementation(function (this: DirentPacker, dirent, entry) {
+        if (!refused && dirent.name === victim) {
+          refused = true;
+          return false;
+        }
+        return real.call(this, dirent, entry);
+      });
+    try {
+      expect(await kernel.readdirAll(dir, fh, 4096)).toEqual([".", "..", ...names]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(refused).toBe(true);
+
+    await kernel.releasedir(dir, fh);
+    expectHealthy(session);
+  });
+
   it("folds a lookup into every READDIRPLUS entry except . and ..", async () => {
     const { session, kernel } = await mount();
     const dir = await populate(kernel);
@@ -548,10 +627,22 @@ describe("readdir", () => {
     expectHealthy(session);
   });
 
-  it("answers -ENOTDIR for OPENDIR on a file and -EBADF for a mismatched handle", async () => {
+  it("answers -ENOTDIR at the first READDIR on a file, and -EBADF for a mismatched handle", async () => {
     const { session, kernel } = await mount();
     const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
-    await expect(kernel.opendir(file.entry.nodeid)).rejects.toMatchObject({ code: "ENOTDIR" });
+    // `ENOTDIR` used to arrive from `OPENDIR` itself, which paid a driver
+    // `lstat` on every `opendir(3)` to re-check a type the kernel had taken
+    // from attributes this server supplied. `OPENDIR` now just allocates a
+    // handle, and the rejection moved one message later to the first `READDIR`
+    // — the call that genuinely needs a directory, and the authority on whether
+    // it has one. Nothing observable is lost: the VFS refuses `O_DIRECTORY` on
+    // a regular file before FUSE is ever asked, so a real kernel never gets
+    // here, and a caller that does still cannot read a single entry.
+    const dirFh = await kernel.opendir(file.entry.nodeid);
+    await expect(kernel.readdir(file.entry.nodeid, dirFh.fh, 0n)).rejects.toMatchObject({
+      code: "ENOTDIR",
+    });
+    await kernel.releasedir(file.entry.nodeid, dirFh.fh);
     // A directory handle is not a file handle, and vice versa.
     await expect(kernel.read(file.entry.nodeid, file.open.fh + 99n, 0, 8)).rejects.toMatchObject({
       code: "EBADF",
@@ -606,6 +697,66 @@ describe("SETATTR", () => {
     });
     expect(after.attr.mtime).toBe(1_234_567n);
     expect(after.attr.atime).toBe(before.attr.atime);
+    expectHealthy(session);
+  });
+
+  it("round-trips a pre-1970 timestamp", async () => {
+    // `fuse_setattr_in.atime`/`.mtime` are a POSIX `tv_sec`, which is signed —
+    // `touch -d 1960-01-01` is an ordinary thing to do. The decoder reads the
+    // field as `u64` (correctly: the same field is unsigned in the *reply*
+    // direction), so the session has to restore the sign before multiplying.
+    // On base this came back 128 s off.
+    const { session, kernel } = await mount();
+    const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    await kernel.release(file.entry.nodeid, file.open.fh);
+
+    const seconds = -315_619_200n; // 1960-01-01T00:00:00Z
+    const attr = await kernel.setattr(file.entry.nodeid, {
+      valid: FATTR_ATIME | FATTR_MTIME,
+      atime: seconds,
+      atimensec: 0,
+      mtime: seconds,
+      mtimensec: 0,
+    });
+
+    // `fuse_attr.atime` is unsigned on the wire; the kernel reads it back as a
+    // signed `tv_sec`, which is what `BigInt.asIntN` does here.
+    expect(BigInt.asIntN(64, attr.attr.mtime)).toBe(seconds);
+    expect(BigInt.asIntN(64, attr.attr.atime)).toBe(seconds);
+    const again = await kernel.getattr(file.entry.nodeid);
+    expect(BigInt.asIntN(64, again.attr.mtime)).toBe(seconds);
+    expectHealthy(session);
+  });
+
+  it("hands mountx.utimens a signed nanosecond value", async () => {
+    // The extension takes nanoseconds as a `bigint`, so an unsigned read did
+    // not merely lose 128 s here — it handed the driver ~1.8e28 ns.
+    const seen: { atime: bigint; mtime: bigint }[] = [];
+    const base = createMemoryDriver();
+    const driver: FsDriver = {
+      ...base,
+      mountx: {
+        ...base.mountx,
+        utimens: async (_path: string, atime: bigint, mtime: bigint) => {
+          seen.push({ atime, mtime });
+        },
+      },
+    };
+    const { session, kernel } = await mount(driver);
+    const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    await kernel.release(file.entry.nodeid, file.open.fh);
+
+    await kernel.setattr(file.entry.nodeid, {
+      valid: FATTR_ATIME | FATTR_MTIME,
+      atime: -315_619_200n,
+      atimensec: 250_000_000,
+      mtime: -1n,
+      mtimensec: 0,
+    });
+
+    expect(seen).toEqual([
+      { atime: -315_619_200n * 1_000_000_000n + 250_000_000n, mtime: -1_000_000_000n },
+    ]);
     expectHealthy(session);
   });
 

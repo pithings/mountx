@@ -1442,9 +1442,14 @@ export class P9Session {
    * Refuse a mutating request on a read-only session.
    *
    * The gate is the session option and not `driver.capabilities.readOnly`: a
-   * driver that cannot write says so by throwing, one method at a time, and
-   * turning its inference into a blanket refusal here would answer `EROFS` for
-   * a driver that merely has no `rename`. See {@link P9SessionOptions.readOnly}.
+   * driver that cannot write says so by throwing, one method at a time, and a
+   * capability describing the driver is not a licence to refuse on its behalf.
+   * `readOnly` is declared-only now — it used to be inferred from the absence
+   * of `unlink`/`mkdir`/`rename`, and gating here would then have answered
+   * `EROFS` for a driver that merely had no `rename` — but the conclusion does
+   * not depend on that: a driver may declare `readOnly: false` and still refuse
+   * an individual write, and only the driver knows which.
+   * See {@link P9SessionOptions.readOnly}.
    *
    * Every caller checks its fids **first**, so a request that is both malformed
    * and forbidden reports the client's own mistake — `EBADF` for a fid this
@@ -1656,9 +1661,12 @@ export class P9Session {
    * gives an `fd`, the memory driver gives a handle, others answer `EISDIR`).
    * What the open owes the client is the *check*, and an `lstat` is the check:
    * it is what says the fid names a directory, and it is what `Treaddir` needs
-   * a moment later anyway. `src/fuse/session.ts`'s `OPENDIR` decides the same
-   * way, for the same reason; `NfsSession` never faces the question, because
-   * NFSv3 has no open.
+   * a moment later anyway. `src/fuse/session.ts`'s `OPENDIR` decides the *other*
+   * way and is not a precedent here: the VFS refuses `O_DIRECTORY` on a regular
+   * file before FUSE is ever asked, so the check there was second-guessing
+   * attributes that server had itself supplied. 9P has no VFS in front of it —
+   * the check is this server's to make or skip. `NfsSession` never faces the
+   * question, because NFSv3 has no open.
    *
    * **`iounit` is `0`**, which the protocol defines as "no preference" and
    * `p9_client_open()` reads as `msize - P9_IOHDRSZ`. That is exactly the bound

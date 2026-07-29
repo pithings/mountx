@@ -8,16 +8,24 @@ Numbers, and what they do and do not say.
    the benchmark suite is a v1 deliverable rather than a nice-to-have.
 
 Both are answered below, with the numbers they were answered from. **Anything
-the README says about performance must come from this file**, and must carry the
-host line with it.
+the README or `docs/` says about performance must come from this file**, and must
+carry the host line with it.
 
 ## Host
 
-Every number here was taken on one machine, on one day. They are not portable.
+**Every number in this file was taken on one host, in one sitting, on one day.**
+That has not always been true of this file — the loopback/NFS columns and the
+FUSE column are two separate commands (`pnpm bench` and `pnpm bench:root`) and
+have previously been regenerated apart — so it is stated here rather than
+assumed. Four runs went into it: both commands on the shipping tree, and both
+again on a pre-sweep baseline (below).
 
 |                          |                                                                                                               |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| Date                     | 2026-07-28                                                                                                    |
+| Date                     | 2026-07-29                                                                                                    |
+| Tree                     | `95c2c44`, i.e. after the `c7ee989..95c2c44` performance sweep                                                |
+| Baseline tree            | `0f359e7` + the type-stripping fix only (see below)                                                           |
+| Columns                  | loopback, NFSv3 and FUSE — all three measured together, on both trees, this sitting                           |
 | OS                       | Linux 6.12.96+deb13-amd64 (container, Fedora 44 userland)                                                     |
 | CPU                      | 16 × Intel(R) Core(TM) i7-10700K @ 3.80 GHz                                                                   |
 | Memory                   | 31.3 GiB                                                                                                      |
@@ -35,69 +43,109 @@ pnpm bench -- --json out.json    # either one, machine-readable
 
 `bench/` is scripts only — nothing here runs inside `pnpm test`.
 
-## What is being measured
+### The baseline, and why there is one
 
-The same scenarios, written once (`bench/scenarios.ts`) against the driver
-interface and run in every column, exactly as the conformance matrix does it. So
-the client code is identical; the difference between columns is transport.
+Every "the sweep made this faster" claim below is against a **paired run on the
+tree immediately before the sweep, in the same sitting on the same idle host,
+minutes apart.** The method, because it matters:
 
-- **loopback** — the driver behind `createLoopback`, no transport at all. The
-  ceiling: whatever FUSE and NFS cost, they cost it on top of this.
-- **FUSE mount** — a real kernel mount, served by the benchmark process and
-  driven from a **child process** (`bench/fuse-client.ts`). It has to be a child:
-  a process that serves a mount and is also its client parks a threadpool thread
-  per in-flight operation, and the read loop needs one of those threads (see the
-  note at the top of `src/fuse/mount.ts`). Putting the client in another process
-  removes the hazard instead of tiptoeing around it, and it is the shape a real
-  workload has.
-- **NFSv3** — the server over a real TCP socket, driven by the JS client in
-  `test/nfs/v3/client.ts`. **This is protocol + TCP overhead, not kernel-client
-  overhead.** This host has no NFS client at all (`.agents/environment.md`), so
-  there is no way to measure the thing a user would actually mount; a kernel
-  client would add its own attribute and page caching — which would make several
-  of these numbers much better — and its own RPC scheduling.
+- A git worktree at **`0f359e7`**, the commit before `c7ee989..95c2c44`.
+- Onto it, and _only_ it, `git checkout 95c2c44 -- src/nfs/v4/state.ts src/s3/session.ts`.
+  `95c2c44` is the fix that made every entry point loadable by node's type
+  stripping, and without it `node bench/index.ts` does not start at all on the old
+  tree. Those two files are the whole of that commit's change to `src/`, and the
+  change is three constructors' parameter properties rewritten as explicit field
+  assignments — same emit, so it cannot move a number. Nothing else was taken from
+  the swept tree.
+- Both benchmark commands run on it, in the same sitting as the swept pair.
+
+This exists because the first draft of this file compared the new runs against
+**the numbers already written in this file**, which had been measured on another
+day and another tree. That comparison produced six apparent regressions, and the
+paired baseline shows that five of them were not regressions at all — one of them
+(`NFS write 4 KiB`) was a **1.74× improvement** reading as an 11% loss. The
+methodological rule that falls out of it is worth stating plainly, because the
+mistake is cheap to repeat:
+
+> **This file's own previous numbers are not a baseline for a code change.** They
+> are a record of what a tree measured on a day. To attribute a delta to a diff,
+> measure both trees in one sitting.
+
+### Reading these numbers
 
 A warmup, then iterations until a second has been spent, then ops/sec and
 p50/p99 (`bench/harness.ts`). No regression detection, no confidence intervals.
 
-Two things to know about how the numbers are computed. **`ops/sec` comes from the
-wall window and `p50`/`p99` come from inside the timed bracket**, so `1 / p50` is
-deliberately not `ops/sec`: the gap between them is the harness's own bookkeeping
-(~90 ns an iteration), invisible against a FUSE round trip and worth 5–20% on a
-loopback `stat`. Throughput divides by the wall clock because that is the number
-that cannot flatter the ceiling column at the transports' expense. And **the
-low-`n` rows are the 100 MiB throughput scenarios and `create 500 small files`**,
-all of which run exactly three iterations by construction: read those as ±10%,
-not as precision.
+**`ops/sec` comes from the wall window and `p50`/`p99` come from inside the timed
+bracket**, so `1 / p50` is deliberately not `ops/sec`: the gap between them is the
+harness's own bookkeeping (~90 ns an iteration), invisible against a FUSE round
+trip and worth 5–20% on a loopback `stat`. Throughput divides by the wall clock
+because that is the number that cannot flatter the ceiling column at the
+transports' expense.
+
+**Run-to-run spread on this host is about ±8%, even on the high-`n` rows.** This
+sitting measures that directly rather than guessing at it, twice over:
+
+- `write 4 KiB` over FUSE appears in three variants that cannot differ for it — a
+  4 KiB write is far under either `max_write`, and attribute timeouts do not touch
+  the write path — and on the shipping tree reads 10,961 / 11,895 / 11,900 ops/s
+  at `n ≈ 12,000`, an 8% spread.
+- The same three on the baseline tree read 11,987 / 11,894 / 12,548, an equally
+  wide spread with the members in a different order.
+
+So **treat anything under ~1.15× as no difference**, and read the `n = 3` rows —
+the 100 MiB throughput scenarios and `create 500 small files`, all of which run
+exactly three iterations by construction — as ±10% on top of that. Two `n = 3`
+rows in this sitting make the point on their own: the FUSE `sequential read`
+scenario measured 5,936 MiB/s in the baseline `default` variant and 7,124 MiB/s in
+the baseline `maxWrite=128KiB` variant, a knob that cannot touch reads at all.
+
+This calibration is what makes the rest of the file readable. The deltas the sweep
+produced are 1.2× to 3.0×; the three unexplained residues are 9–15%. Those are
+different kinds of number and must not be read the same way.
 
 ---
 
 ## Loopback baseline (memory driver, no transport)
 
-| scenario                  |   ops/sec |                rate | p50 ms | p99 ms |      n |
-| ------------------------- | --------: | ------------------: | -----: | -----: | -----: |
-| stat                      |   615,333 |                   — |  0.001 |  0.003 | 100000 |
-| open + read 4 KiB         |   439,582 |                   — |  0.002 |  0.004 | 100000 |
-| write 4 KiB               | 2,012,584 |                   — |  0.000 |  0.001 | 100000 |
-| readdir (100 entries)     |    82,470 | 8,246,976 entries/s |  0.011 |  0.023 |  82470 |
-| sequential read, 100 MiB  |    147.82 |        14,782 MiB/s |  6.677 |  6.940 |      3 |
-| sequential write, 100 MiB |     13.82 |         1,382 MiB/s | 72.476 | 72.552 |      3 |
-| create 500 small files    |    526.13 |     263,063 files/s |  1.922 |  2.018 |      3 |
-| ls -l (1000 entries)      |    470.89 |   470,895 entries/s |  2.192 |  3.324 |     20 |
-| stat walk (500 files)     |     1,174 |     587,188 stats/s |  0.826 |  1.162 |     50 |
-| stat ×64 in flight        |    12,436 |       795,900 ops/s |  0.078 |  0.102 |   2000 |
+| scenario                  |   ops/sec |                 rate | p50 ms | p99 ms |      n |
+| ------------------------- | --------: | -------------------: | -----: | -----: | -----: |
+| stat                      | 1,093,940 |                    — |  0.001 |  0.002 | 100000 |
+| open + read 4 KiB         |   731,105 |                    — |  0.001 |  0.003 | 100000 |
+| write 4 KiB               | 1,983,062 |                    — |  0.000 |  0.001 | 100000 |
+| readdir (100 entries)     |   108,480 | 10,847,957 entries/s |  0.008 |  0.022 | 100000 |
+| sequential read, 100 MiB  |    121.71 |         12,171 MiB/s |  8.283 |  8.332 |      3 |
+| sequential write, 100 MiB |     12.57 |          1,257 MiB/s | 76.954 | 84.854 |      3 |
+| create 500 small files    |    623.20 |      311,601 files/s |  1.602 |  1.636 |      3 |
+| ls -l (1000 entries)      |    992.24 |    992,239 entries/s |  0.908 |  1.700 |     20 |
+| stat walk (500 files)     |     2,305 |    1,152,689 stats/s |  0.425 |  0.714 |     50 |
+| stat ×64 in flight        |    24,862 |      1,591,151 ops/s |  0.038 |  0.071 |   2000 |
 
 **Interpretation.** This is a JavaScript `Map` walk behind a promise, and it
-prices the _harness_, not a filesystem: hundreds of thousands of metadata ops per
-second, a memcpy-bound 14.8 GiB/s read. Its only job is to be the denominator —
-every transport number below is a fraction of a row in this table, and the
-fraction is the transport's cost. Two rows are worth keeping in mind when reading
-the rest: `write 4 KiB` at 2.0 M/s says the driver contributes essentially
-nothing to the FUSE and NFS write numbers, and `sequential write` at 1,382 MiB/s
-(against 14,782 MiB/s for read) is the driver's remaining asymmetry — growing a
-file still reallocates geometrically and zero-fills, which is ~4× the memory
-traffic of the bytes written. That is a driver property, not a transport one, and
-it is one bug fix old (below).
+prices the _harness_, not a filesystem: a million metadata ops per second, a
+memcpy-bound 12.2 GiB/s read. Its only job is to be the denominator — every
+transport number below is a fraction of a row in this table, and the fraction is
+the transport's cost.
+
+The sweep moved this column hard, and it moved it exactly where the commit
+messages said it would. Against the paired baseline: `stat` **1.79×**, `stat walk`
+**2.72×**, `ls -l` **1.75×**, `stat ×64` **2.03×**, `open + read` **1.73×** — the
+loopback's per-call rebind going away and `normalizePath` growing a canonical fast
+path (`0ee70d6` measured 837 ns → 355 ns for a `stat` through the loopback in
+isolation, and the whole-scenario numbers agree with it). `readdir` **1.47×** is
+`memory.readdir` deriving its type predicates from `mode & S_IFMT` instead of
+building and discarding a `StatsLike` per entry (`e80c8ff`). The full pairing is in
+[What the sweep moved](#what-the-sweep-moved).
+
+Two rows are worth keeping in mind when reading the rest. `write 4 KiB` at 2.0 M/s
+says the driver contributes essentially nothing to the FUSE and NFS write numbers
+— it is unchanged by the sweep (1.04×), and it was never the thing in the way.
+`sequential write` at 1,257 MiB/s against 12,171 MiB/s for read is the driver's
+remaining asymmetry: growing a file still reallocates geometrically and zero-fills,
+which is ~4× the memory traffic of the bytes written. That is a driver property,
+not a transport one, and it is one bug fix old (below). Neither throughput row was
+a target of the sweep and neither moved meaningfully (write 1.04×, read 0.90× at
+`n = 3` — see [what is left open](#what-is-left-open-and-small)).
 
 ---
 
@@ -108,161 +156,240 @@ it is one bug fix old (below).
 
 | scenario                   | ops/sec |              rate |  p50 ms |  p99 ms |     n |
 | -------------------------- | ------: | ----------------: | ------: | ------: | ----: |
-| stat                       |  31,097 |                 — |   0.031 |   0.047 | 31097 |
-| open + read 4 KiB          |   4,989 |                 — |   0.195 |   0.307 |  4990 |
-| write 4 KiB                |  12,882 |                 — |   0.075 |   0.114 | 12883 |
-| readdir (100 entries)      |   1,191 | 119,076 entries/s |   0.718 |   2.742 |  1191 |
-| sequential read, 100 MiB   |   75.37 |       7,537 MiB/s |  13.366 |  13.418 |     3 |
-| sequential write, 100 MiB  |    7.96 |      796.46 MiB/s | 125.701 | 126.626 |     3 |
-| create 500 small files     |    5.06 |     2,528 files/s | 197.971 | 199.378 |     3 |
-| ls -l (1000 entries)       |   27.25 |  27,246 entries/s |  36.706 |  38.945 |    20 |
-| ls -l (1000 entries, cold) |   10.35 |  10,345 entries/s |  94.200 | 102.783 |     8 |
-| stat walk (500 files)      |   67.63 |    33,813 stats/s |  14.738 |  15.451 |    50 |
-| stat ×64 in flight         |   1,966 |     125,796 ops/s |   0.491 |   0.752 |  1966 |
+| stat                       |  33,434 |                 — |   0.027 |   0.071 | 33434 |
+| open + read 4 KiB          |   4,190 |                 — |   0.209 |   0.889 |  4191 |
+| write 4 KiB                |  10,961 |                 — |   0.086 |   0.155 | 10961 |
+| readdir (100 entries)      |   1,483 | 148,273 entries/s |   0.617 |   1.297 |  1483 |
+| sequential read, 100 MiB   |   62.21 |       6,221 MiB/s |  16.262 |  16.448 |     3 |
+| sequential write, 100 MiB  |    6.37 |      636.75 MiB/s | 155.900 | 160.963 |     3 |
+| create 500 small files     |    4.61 |     2,303 files/s | 217.077 | 225.309 |     3 |
+| ls -l (1000 entries)       |   28.96 |  28,958 entries/s |  34.234 |  38.603 |    20 |
+| ls -l (1000 entries, cold) |    9.60 |   9,602 entries/s | 102.551 | 112.218 |     8 |
+| stat walk (500 files)      |   60.79 |    30,397 stats/s |  16.352 |  20.716 |    50 |
+| stat ×64 in flight         |   2,009 |     128,600 ops/s |   0.476 |   0.790 |  2000 |
 
 **Interpretation.** Read this table knowing that **most of it never reaches the
 daemon**. With 10-second attribute and entry timeouts a repeated `stat` is a
-kernel cache hit (31 k/s, 31 µs — an order of magnitude off the uncached number
-below), and with `FOPEN_KEEP_CACHE` a re-read of a file the page cache still
-holds is a memcpy (7,537 MiB/s). That is not cheating; it is what the negotiated
+kernel cache hit (33 k/s, 27 µs — an order of magnitude off the uncached 3,429/s
+below), and with `FOPEN_KEEP_CACHE` a re-read of a file the page cache still holds
+is a memcpy (6,221 MiB/s). That is not cheating; it is what the negotiated
 defaults are _for_, and it is what a real workload gets. But it means the honest
 per-request cost of the transport is in the next section, and that the rows here
-which do reach the driver on every call — `write 4 KiB` at 12,882/s, `create 500
-small files` at 2,528 files/s, `sequential write` at 796 MiB/s — are the ones
+which do reach the driver on every call — `write 4 KiB` at 10,961/s, `create 500
+small files` at 2,303 files/s, `sequential write` at 636.75 MiB/s — are the ones
 describing the daemon rather than the kernel.
+
+This is the column the sweep moved least, and the first paragraph is the reason:
+at the shipped defaults, the scenarios that would exercise the changed paths are
+answered by the kernel instead. Where the sweep does show through it shows through
+cleanly — `sequential write` **1.25×**, `readdir` **1.20×**, `ls -l` **1.09×** —
+and the sharper evidence is in the degraded variants, where the cache is out of the
+way: the uncached sequential read (`keepCache=off`) is **1.19×** and the
+plain-`READDIR` path (`readdirplus=off`) is **1.20×**, both attributable to a named
+commit. Everything else here is inside the spread, except `open + read 4 KiB`,
+which is [open](#what-is-left-open-and-small).
 
 ---
 
 ## Negotiation, measured
 
 One mount per row, each giving up exactly one negotiated win. This is the
-evidence for IDEA.md's central performance claim, and it holds: **every one of
-these deltas is larger than anything a JS-side micro-optimization has been worth
-in this codebase.** Where a variant also sets the timeouts to zero it is because
-the comparison would otherwise be against the kernel's cache rather than against
-the knob being moved.
+evidence for IDEA.md's central performance claim. Where a variant also sets the
+timeouts to zero it is because the comparison would otherwise be against the
+kernel's cache rather than against the knob being moved.
 
 `default ÷ changed`, so a number **above 1 is what the default buys** and a
-number below 1 is a configuration that beat the default.
+number below 1 is a configuration that beat the default. Every row here is from
+the shipping tree; the last column is the same ratio computed from the pre-sweep
+run, and it is there because a negotiation finding that replicates on two trees in
+one sitting is worth much more than one that does not.
 
-| what was changed                          | scenario                   |           default |           changed |                        default ÷ changed |
-| ----------------------------------------- | -------------------------- | ----------------: | ----------------: | ---------------------------------------: |
-| `attr_timeout`/`entry_timeout` 10 s → 0   | stat                       |      31,097 ops/s |       3,332 ops/s |                                 **9.3×** |
-|                                           | stat walk (500 files)      |    33,813 stats/s |     2,236 stats/s |                                **15.1×** |
-|                                           | ls -l (1000 entries)       |  27,246 entries/s |   3,410 entries/s |                                 **8.0×** |
-|                                           | open + read 4 KiB          |       4,989 ops/s |       2,069 ops/s |                                 **2.4×** |
-|                                           | readdir (100 entries)      | 119,076 entries/s | 112,004 entries/s |                                    1.06× |
-| `FOPEN_KEEP_CACHE` on → off               | sequential read, 100 MiB   |       7,537 MiB/s |       1,526 MiB/s |                                 **4.9×** |
-|                                           | open + read 4 KiB          |       4,989 ops/s |       3,713 ops/s |                                    1.34× |
-| `max_write` 1 MiB → 128 KiB               | sequential write, 100 MiB  |      796.46 MiB/s |      660.50 MiB/s |                                    1.21× |
-|                                           | write 4 KiB                |      12,882 ops/s |      13,181 ops/s |                                    0.98× |
-| `READDIRPLUS` on → off, cold dir          | ls -l (1000 entries, cold) |  10,345 entries/s |  10,427 entries/s |                 0.99× — _no win to lose_ |
-| `READDIRPLUS_AUTO` on → **off**, cold dir | ls -l (1000 entries, cold) |  10,345 entries/s |  25,047 entries/s |   **0.41× — the default is losing this** |
-|                                           | readdir (100 entries)      | 119,076 entries/s | 100,347 entries/s |      1.19× — _and this is what it costs_ |
-| writeback cache off → **on**              | write 4 KiB                |      12,882 ops/s |      33,363 ops/s | **0.39× — left on the table on purpose** |
-|                                           | create 500 small files     |     2,528 files/s |     2,237 files/s |                                    1.13× |
-|                                           | sequential write, 100 MiB  |      796.46 MiB/s |      665.65 MiB/s |                                    1.20× |
-| 2 readers → 1                             | stat ×64 in flight         |     9,499 ops/s\* |       8,148 ops/s |                                    1.17× |
-| 2 readers → 4                             | stat ×64 in flight         |     9,499 ops/s\* |      10,007 ops/s |                                    0.95× |
+| what was changed                          | scenario                   |            default |           changed |                        default ÷ changed | on baseline |
+| ----------------------------------------- | -------------------------- | -----------------: | ----------------: | ---------------------------------------: | ----------: |
+| `attr_timeout`/`entry_timeout` 10 s → 0   | stat                       |       33,434 ops/s |       3,429 ops/s |                                 **9.8×** |       10.9× |
+|                                           | stat walk (500 files)      |     30,397 stats/s |     2,052 stats/s |                                **14.8×** |       15.5× |
+|                                           | ls -l (1000 entries)       |   28,958 entries/s |   2,970 entries/s |                                 **9.8×** |        8.3× |
+|                                           | open + read 4 KiB          |        4,190 ops/s |       1,924 ops/s |                                 **2.2×** |        2.5× |
+|                                           | readdir (100 entries)      |  148,273 entries/s | 121,865 entries/s |                                    1.22× |       1.17× |
+| `FOPEN_KEEP_CACHE` on → off               | sequential read, 100 MiB   |        6,221 MiB/s |       1,568 MiB/s |                                 **4.0×** |        4.5× |
+|                                           | open + read 4 KiB          |        4,190 ops/s |       3,765 ops/s |                                    1.11× |       1.27× |
+| `max_write` 1 MiB → 128 KiB               | sequential write, 100 MiB  |       636.75 MiB/s |      517.51 MiB/s |                                    1.23× |   **0.95×** |
+|                                           | write 4 KiB                |       10,961 ops/s |      11,900 ops/s |                      0.92× — _no change_ |       0.96× |
+|                                           | sequential read, 100 MiB   |        6,221 MiB/s |       6,460 MiB/s |                      0.96× — _no change_ |       0.83× |
+| `READDIRPLUS` on → off, cold dir          | ls -l (1000 entries, cold) |    9,602 entries/s |  10,208 entries/s |                 0.94× — _no win to lose_ |       1.02× |
+|                                           | ls -l (1000 entries)       |   28,958 entries/s |  28,439 entries/s |                                    1.02× |       1.05× |
+|                                           | readdir (100 entries)      |  148,273 entries/s | 171,638 entries/s |    0.86× — _and this is what plus costs_ |       0.87× |
+| `READDIRPLUS_AUTO` on → **off**, cold dir | ls -l (1000 entries, cold) |    9,602 entries/s |  24,976 entries/s |   **0.38× — the default is losing this** |   **0.41×** |
+|                                           | ls -l (1000 entries)       |   28,958 entries/s |  24,794 entries/s |                                    1.17× |       1.11× |
+|                                           | readdir (100 entries)      |  148,273 entries/s |  95,297 entries/s |  **1.56× — _and this is what it costs_** |       1.32× |
+| `READDIRPLUS` on → off, timeouts 0        | ls -l (1000 entries, cold) |   3,074 entries/s† |   2,952 entries/s |                                    1.04× |       1.01× |
+|                                           | ls -l (1000 entries)       |   2,970 entries/s† |   2,842 entries/s |                                    1.05× |       0.99× |
+|                                           | readdir (100 entries)      | 121,865 entries/s† | 138,655 entries/s |                                    0.88× |       1.02× |
+| writeback cache off → **on**              | write 4 KiB                |       10,961 ops/s |      34,481 ops/s | **0.32× — left on the table on purpose** |   **0.37×** |
+|                                           | create 500 small files     |      2,303 files/s |     2,229 files/s |                                    1.03× |       1.08× |
+|                                           | sequential write, 100 MiB  |       636.75 MiB/s |      639.66 MiB/s |                                    1.00× |       0.87× |
+| 2 readers → 1                             | stat ×64 in flight         |      9,132 ops/s\* |       7,479 ops/s |                                    1.22× |       1.17× |
+|                                           | stat                       |      3,429 ops/s\* |       3,589 ops/s |                                    0.96× |       0.97× |
+| 2 readers → 4                             | stat ×64 in flight         |      9,132 ops/s\* |       8,736 ops/s |                                    1.05× |       1.18× |
+|                                           | stat                       |      3,429 ops/s\* |       3,449 ops/s |                                    0.99× |       0.86× |
 
 \* the reader rows all run at `timeout=0`, so the default they are compared
-against is `attr/entry timeout=0`'s 9,499 ops/s, not the cached 125,796.
+against is `attr/entry timeout=0`'s 9,132 ops/s, not the cached 128,600.
+
+† likewise: the `timeouts 0` readdirplus rows are compared against
+`attr/entry timeout=0`, which still has `READDIRPLUS` (with `AUTO`) on.
 
 **Interpretation, one paragraph per finding.**
 
-_Attribute and entry timeouts are the whole ballgame._ An 8–15× swing from two
-numbers in a struct, against a driver that is already as fast as a `Map` lookup.
-Nothing in the JS below them could move a metadata workload by that much, and a
-hand-rolled binding that forgets to set them starts 8× behind. This is the claim,
-and it is not close.
+_Attribute and entry timeouts are the whole ballgame._ A 9.8–14.8× swing from two
+numbers in a struct on the shipping tree, and 8.3–15.5× on the pre-sweep one — the
+same finding twice, against a driver that is already as fast as a `Map` lookup.
+This is the claim, and it is not close.
 
-_`FOPEN_KEEP_CACHE` is worth 4.9× on re-read, and the 1,526 MiB/s is the real
-number._ The 7,537 MiB/s in the default table is the page cache answering without
-the daemon; with the flag off, the same 100 MiB genuinely crosses `/dev/fuse` in
-1 MiB replies at 1,526 MiB/s. Both numbers are true and they answer different
-questions — "how fast is a re-read" and "how fast is the transport".
+_But "the wins are in negotiation, not in micro-optimizing JS" needs qualifying,
+and there is now real evidence for the qualification rather than a stale-file
+inference._ The claim as written said every negotiated delta beats anything
+JS-side. The paired baseline shows a two-tier picture instead. The **top**
+negotiated wins still dwarf everything: timeouts at 9.8–14.8×, `FOPEN_KEEP_CACHE`
+at 4.0×. Below them, one sweep of ordinary JS work is worth **3.01× on NFS
+sequential read, 2.72× on loopback `stat walk`, 2.03× on 64-in-flight loopback
+stats, 1.86× on NFS `readdir`, 1.74× on NFS `write 4 KiB`** — which beats
+`READDIRPLUS_AUTO` (2.6×, and a win we are not taking), and beats `max_write`, the
+reader count and warm `READDIRPLUS` several times over. The honest form of the
+claim is: _get the handshake right first, because no amount of JS recovers a 10×
+cache miss — and then the JS is worth more than every remaining knob put together._
 
-_`max_write` at 1 MiB is worth ~20% here, far less than IDEA.md's framing
-suggests, and the reason is the driver._ At 128 KiB the same 100 MiB is 800
-`WRITE` requests instead of 100, and 8× the request count buys only ~20% because
-each request is cheap and the memory driver's own copy dominates. Expect this gap
-to widen with a driver that does real I/O per request (an S3 or content-addressed
-backend, where per-request overhead is a network round trip) and to stay small
-for anything memcpy-bound. `n = 3`, and earlier runs of the same pair read 1.15×
-and 1.4×; call it 15–40% and do not quote a sharper number than that.
+_`FOPEN_KEEP_CACHE` is worth 4.0× on re-read, the 1,568 MiB/s is the real number,
+and the ratio fell for a good reason._ The 6,221 MiB/s in the default table is the
+page cache answering without the daemon; with the flag off, the same 100 MiB
+genuinely crosses `/dev/fuse` in 1 MiB replies at 1,568 MiB/s. Both numbers are
+true and they answer different questions — "how fast is a re-read" and "how fast is
+the transport". The ratio went 4.5× → 4.0× across the sweep, and that is the
+_transport_ improving rather than the cache degrading: the uncached read went
+**1,314 → 1,568 MiB/s, 1.19×**, which is `c7ee989`'s READ reply built in one buffer
+instead of two (measured there at 180 → 73 µs per 1 MiB reply). Making the slow
+path faster is exactly what shrinks the value of the cache in front of it.
 
-_`READDIRPLUS` is worth nothing as we currently ask for it, and 2.4× if we stop
+_`max_write` at 1 MiB is real in principle and not reliably measurable on this
+driver._ At 128 KiB the same 100 MiB is 800 `WRITE` requests instead of 100, and 8×
+the request count ought to cost something. It measures 1.23× on the shipping tree
+— and **0.95× on the baseline tree in the same sitting**, i.e. the default losing.
+Across every paired run this file has recorded, the comparison reads 0.95×, 1.15×,
+1.21×, 1.23× and 1.4×. All are `n = 3`, and the neighbouring control rows — a 4 KiB
+write and a page-cached read, both of which any `max_write` covers — come back at
+0.83×–0.96×, which is the size of the noise on the same scenarios. **Do not quote a
+number for this knob on an in-memory driver.** What can be said: the mechanism is
+request count, so expect it to matter with a driver that does real I/O per request
+(an S3 or content-addressed backend, where per-request overhead is a network round
+trip) and to stay lost in the noise for anything memcpy-bound.
+
+_`READDIRPLUS` is worth nothing as we currently ask for it, and ~2.5× if we stop
 asking for the `AUTO` variant._ This is the one place the benchmark found a
-defaults problem rather than confirming one. `FUSE_READDIRPLUS_AUTO` is in
+defaults problem rather than confirming one, and it now replicates on both trees:
+0.38× on the shipping tree, 0.41× on the baseline. `FUSE_READDIRPLUS_AUTO` is in
 `DEFAULT_WANTED_FLAGS`, and the kernel's `fuse_use_readdirplus` only uses plus for
 the **first page** of a listing unless a lookup in that directory has recently
 missed. A 1000-entry directory is ~10 pages, so 90% of it arrives as plain
-`READDIR` and the following `stat`s are 900 `LOOKUP`s: 10,345 entries/s with plus,
-10,427 without it — identical, and the "often 2–3×" in IDEA.md is simply absent.
-Drop `AUTO` (`init: { withoutFlags: FUSE_READDIRPLUS_AUTO }`) and the same cold
-listing runs at 25,047 entries/s, **2.4×**, which is the figure IDEA.md predicted.
-The cost of dropping it is visible too and it is real: a names-only `readdir` of
-100 entries goes 119,076 → 100,347 entries/s, because plus sends attributes
-nobody asked for. **Not changed here** — this is a benchmark milestone, not a
-defaults milestone — but it is the best-supported open question in the file, and
-the honest reading is that the current default optimizes `readdir` at the cost of
-`ls -l`, which is backwards for the workloads this library is for. Note also that
-the _warm_ `ls -l` rows are all 24–27 k entries/s regardless of readdirplus: once
-the entry cache holds the names, nothing else matters.
+`READDIR` and the following `stat`s are 900 `LOOKUP`s: 9,602 entries/s with plus,
+10,208 with it off — the same number, and the "often 2–3×" in IDEA.md is simply
+absent. Drop `AUTO` (`init: { withoutFlags: FUSE_READDIRPLUS_AUTO }`) and the same
+cold listing runs at 24,976 entries/s, **2.6×**, which is the figure IDEA.md
+predicted. The cost is visible too: a names-only `readdir` of 100 entries goes
+148,273 → 95,297 entries/s, **1.56×**, because plus sends attributes nobody asked
+for. That cost grew across the sweep — it was 1.32× before — and the pairing says
+exactly why, which is a direct confirmation of `7185f33`: the plain-`READDIR` path
+stopped binding an inode per entry and went **142,526 → 171,638 entries/s (1.20×)**,
+while the always-plus path, which legitimately still acquires one, went 93,874 →
+95,297 (1.02×). Making plain `readdir` cheaper makes plus look dearer. Turning plus
+off entirely moves the row to 171,638, so the shipped default sits about a third of
+the way along that line, which is what `AUTO` means in practice. **Not changed
+here** — this is a benchmark milestone, not a defaults milestone — but it is the
+best-supported open question in the file, and the honest reading is that the
+current default optimizes `readdir` at the cost of `ls -l`, which is backwards for
+the workloads this library is for. Note also that the _warm_ `ls -l` rows are all
+24.8–29.0 k entries/s regardless of readdirplus: once the entry cache holds the
+names, nothing else matters. And the `timeouts 0` pair is the control that rules
+out the cache as the explanation — with no cache to hide behind at all, turning
+plus off still costs only 4–5%, because with `AUTO` in the way there was never much
+plus happening to lose.
 
-_Writeback caching is worth 2.6× on small writes and we are deliberately not
-taking it._ `FUSE_WRITEBACK_CACHE` turns `write 4 KiB` from 12,882 to 33,363
-ops/s by making the kernel the write buffer and collapsing the writes — and it
-makes the kernel authoritative for size and mtime and lets writes arrive after
-`release`, which is the reason `src/fuse/init.ts` leaves it off. It buys nothing
-on the 1 MiB-chunked sequential write (666 vs 796 MiB/s — if anything worse, and
-`n = 3`), because there is nothing to collapse. The trade is a semantics one, not
-a performance one, and this is what the semantics cost.
+_Writeback caching is worth ~3× on small writes and we are deliberately not taking
+it._ `FUSE_WRITEBACK_CACHE` turns `write 4 KiB` from 10,961 to 34,481 ops/s (3.1×;
+2.7× on the baseline tree) by making the kernel the write buffer and collapsing the
+writes — and it makes the kernel authoritative for size and mtime and lets writes
+arrive after `release`, which is the reason `src/fuse/init.ts` leaves it off. It
+buys **nothing** on the 1 MiB-chunked sequential write (1.00× on the shipping tree,
+0.87× on the baseline) or on file creation (1.03× / 1.08×), because in neither is
+there anything to collapse. The trade is a semantics one, not a performance one,
+and this is what the semantics cost: ~3× on the one workload shaped to benefit, and
+nothing anywhere else.
 
-_The reader count is not a knob worth turning._ 1, 2 and 4 readers produce
-8,148 / 9,499 / 10,007 ops/s on 64 concurrent stats, with peak request rates of
-41,539 / 48,549 / 50,349 per second — a ~20% spread across a 4× change, and one
-that has reordered itself between runs. That is the expected result and it is
-worth stating plainly: `readers` bounds how many requests can be _pulled off_
+_The reader count is not a knob worth turning, and the paired runs settle it._ 1, 2
+and 4 readers produce 7,479 / **9,132** / 8,736 ops/s on 64 concurrent stats on the
+shipping tree, and 7,555 / **8,866** / 7,509 on the baseline — two readers best both
+times, a 15–22% spread across a 4× change, and **not monotonic in either**. Between
+the two runs the ordering of 1 against 4 inverted, and an older sweep had it
+monotonically rising; three orderings from three runs is the strongest possible
+statement that the ordering is not real. On the strictly sequential `stat` row all
+three are within 5% of each other on the shipping tree, as they must be — one
+outstanding operation cannot use a second reader. That is the expected result and
+it is worth stating plainly: `readers` bounds how many requests can be _pulled off_
 `/dev/fuse` at once, and pulling is not the bottleneck. Every completion lands on
-the same main thread, and that thread is the ceiling. Raising `readers` matters
-when the driver blocks (it does not here), and the modes that would actually
-change the picture — sync-worker and relay — do not exist yet.
+the same main thread, and that thread is the ceiling. Raising `readers` matters when
+the driver blocks (it does not here), and the modes that would actually change the
+picture — sync-worker and relay — do not exist yet.
 
 ### The transport's own ceiling
 
 Scenario ops/sec undercount the transport, because one syscall is often several
 FUSE requests: a `stat(2)` at `entry_timeout = 0` is a `LOOKUP` **and** a
-`GETATTR`, and an `open`+`read`+`close` is five. So the session's request counter
-is sampled directly while the client works, over the interval the sampler
-actually took rather than the one it asked for:
+`GETATTR`, and an `open`+`read`+`close` is five.
 
-| variant                      | peak FUSE requests/sec | requests in the run |
-| ---------------------------- | ---------------------: | ------------------: |
-| `default`                    |                 20,468 |              79,775 |
-| `attr/entry timeout=0`       |                 48,549 |             234,262 |
-| `maxWrite=128KiB`            |                 13,512 |              18,068 |
-| `writebackCache=on`          |                 18,003 |              22,525 |
-| `readdirplus, no AUTO`       |                 14,094 |              20,393 |
-| `readdirplus=off`            |                 14,061 |              26,708 |
-| `readdirplus=off, timeout=0` |                 20,620 |              94,037 |
-| `keepCache=off`              |                 16,885 |              18,228 |
-| `readers=1, timeout=0`       |                 41,539 |              62,459 |
-| `readers=4, timeout=0`       |                 50,349 |              70,634 |
+**The direct request-counter measurement was not repeated in this sitting.**
+`bench/fuse.ts` samples `session.stats.requests` while the client works, but it
+reports the result only through `notes` in the `--json` output, and neither run was
+taken with `--json`. The table below is therefore **the 2026-07-28 sweep's, on an
+older tree**, kept because nothing has replaced it and marked because it is the one
+block in this file that does not share the others' vintage. Do not quote it beside
+a number from the tables above without saying so.
 
-The rate is per _variant_, not per scenario — it is one counter on one session —
-so the three rows that reach 41–50 k are exactly the ones whose variant included
-the 64-in-flight scenario at zero timeouts, and the rest are bounded by whatever
-their own scenario mix asked for rather than by the transport.
+| variant (2026-07-28, tree `c7ee989~1`) | peak FUSE requests/sec | requests in the run |
+| -------------------------------------- | ---------------------: | ------------------: |
+| `default`                              |                 20,468 |              79,775 |
+| `attr/entry timeout=0`                 |                 48,549 |             234,262 |
+| `maxWrite=128KiB`                      |                 13,512 |              18,068 |
+| `writebackCache=on`                    |                 18,003 |              22,525 |
+| `readdirplus, no AUTO`                 |                 14,094 |              20,393 |
+| `readdirplus=off`                      |                 14,061 |              26,708 |
+| `readdirplus=off, timeout=0`           |                 20,620 |              94,037 |
+| `keepCache=off`                        |                 16,885 |              18,228 |
+| `readers=1, timeout=0`                 |                 41,539 |              62,459 |
+| `readers=4, timeout=0`                 |                 50,349 |              70,634 |
+
+The rate is per _variant_, not per scenario — it is one counter on one session,
+sampled across the whole child-driven period including each scenario's setup and
+teardown — so a row's peak is whatever the busiest 250 ms of that variant's mix
+happened to be, and the rows that reach 41–50 k are the ones whose variant included
+the 64-in-flight scenario at zero timeouts.
+
+**What _this_ sitting does support, without that counter**, is a lower bound read
+straight off the scenario tables, using the request counts above:
+
+| what the client was doing                              | FUSE requests/sec |
+| ------------------------------------------------------ | ----------------: |
+| `write 4 KiB`, timeouts 0 — one `WRITE`, one at a time |        **11,895** |
+| `open + read 4 KiB`, timeouts 0 — five requests each   |        **~9,600** |
+| `stat ×64 in flight`, timeouts 0 — ≥2 requests each    |       **≥18,300** |
 
 **Does IDEA.md's "low tens of thousands of ops/sec" hold? Yes, at the request
-level, at the upper end of that range.** The transport sustained **41,500–50,300
-FUSE requests per second** with requests in flight, and **13,600 per second** for
-a strictly sequential client (`write 4 KiB` at zero timeouts: one request per
-syscall, no concurrency and no cache). A single-threaded client therefore sees
-2,000–4,000 _syscalls_ per second on uncached metadata, because each of those
-syscalls is two to five requests — a number worth quoting alongside the request
-rate, since it is the one a user experiences.
+level.** A strictly sequential client — one request outstanding, no concurrency and
+no cache — gets **11,900 requests per second**, and a client with 64 operations in
+flight sustains **at least 18,300**, with the older sweep's direct sampling putting
+the peak nearer 50,000. A single-threaded client therefore sees roughly
+**2,000–3,500 _syscalls_ per second** on uncached metadata (`stat` at 3,429/s,
+`open+read+close` at 1,924/s, `stat walk` at 2,052/s), because each of those
+syscalls is two to five requests — and that is the number a user experiences, so
+quote it alongside the request rate rather than instead of it.
 
 ---
 
@@ -275,31 +402,155 @@ pages and would pipeline differently.
 
 | scenario                  | ops/sec |              rate |  p50 ms |  p99 ms |     n |
 | ------------------------- | ------: | ----------------: | ------: | ------: | ----: |
-| stat                      |   5,217 |                 — |   0.165 |   0.573 |  5217 |
-| open + read 4 KiB         |   4,113 |                 — |   0.222 |   0.487 |  4113 |
-| write 4 KiB               |  15,304 |                 — |   0.060 |   0.124 | 15305 |
-| readdir (100 entries)     |   1,117 | 111,740 entries/s |   0.809 |   1.734 |  1118 |
-| sequential read, 100 MiB  |    3.65 |      364.61 MiB/s | 273.908 | 275.133 |     3 |
-| sequential write, 100 MiB |    3.08 |      308.03 MiB/s | 323.886 | 330.117 |     3 |
-| create 500 small files    |    5.11 |     2,557 files/s | 194.198 | 201.073 |     3 |
-| ls -l (1000 entries)      |    4.98 |   4,980 entries/s | 201.094 | 204.465 |     5 |
-| stat walk (500 files)     |    7.14 |     3,571 stats/s | 139.614 | 141.033 |     8 |
-| stat ×64 in flight        |  188.83 |      12,085 ops/s |   4.689 |  13.408 |   189 |
+| stat                      |   5,177 |                 — |   0.169 |   0.442 |  5177 |
+| open + read 4 KiB         |   4,115 |                 — |   0.217 |   0.612 |  4115 |
+| write 4 KiB               |  13,653 |                 — |   0.060 |   0.191 | 13653 |
+| readdir (100 entries)     |   1,309 | 130,860 entries/s |   0.674 |   1.650 |  1309 |
+| sequential read, 100 MiB  |    9.77 |      977.16 MiB/s | 102.501 | 102.517 |     3 |
+| sequential write, 100 MiB |    4.12 |      411.79 MiB/s | 240.057 | 255.704 |     3 |
+| create 500 small files    |    4.80 |     2,399 files/s | 185.709 | 255.225 |     3 |
+| ls -l (1000 entries)      |    4.97 |   4,972 entries/s | 199.735 | 214.353 |     5 |
+| stat walk (500 files)     |    7.63 |     3,816 stats/s | 130.303 | 133.396 |     8 |
+| stat ×64 in flight        |  200.38 |      12,824 ops/s |   4.394 |   9.803 |   201 |
 
-**Interpretation.** Per _request_ the NFS server is in the same class as the FUSE
-session — 15,304 4 KiB writes per second against FUSE's 12,882, and 12,085 ops/s
-with 64 in flight against FUSE's 9,499 at zero timeouts — which is the useful
-result, because the two share nothing but the driver interface. Where it looks
-much worse is anything path-shaped: `stat walk` is 3,571 stats/s against FUSE's
-33,813, and `ls -l` is 4,980 entries/s against 27,246. That is not the protocol
-being slow, it is the **absence of a kernel client**: NFS has no path resolution
-on the wire, so `test/nfs/v3/client.ts` walks every component with its own `LOOKUP`s
-and repeats the walk for every operation, where a real client would have a dentry
-cache. Read the four core rows as the server's cost and the path-shaped rows as
-an artifact of the test client. Throughput (365 MiB/s read, 308 MiB/s write in
-1 MiB RPCs) is the one place the JS client is not in the way, and it is a fifth
-of what the FUSE transport does — XDR framing and a socket against a `writeSync`
-to a character device.
+**This is the column the sweep changed most, and it is not close.** Against the
+paired baseline: sequential read **3.01×** (325 → 977 MiB/s), `readdir` **1.86×**,
+`write 4 KiB` **1.74×**, sequential write **1.56×**, `open + read 4 KiB` **1.41×**.
+Those are `16e99b8` collapsing six full-size passes over a 1 MiB READ payload to
+two, `5488085` making record reassembly linear (8 MiB: 81 ms → 1.13 ms) and dropping
+`fixedOpaque`'s pointless memset, `2b52975` unchaining replies so a call no longer
+waits on the one before it, and `0747df0` resolving `READDIR` pages concurrently
+instead of one serialized `lstat` per entry. Every one of those commits predicted a
+direction and the paired run produced it. The tail moved with the mean, which is
+`2b52975`'s signature specifically: `write 4 KiB` p99 went 0.626 → 0.191 ms and
+`open + read 4 KiB` p99 1.407 → 0.612 ms.
+
+**Interpretation.** Per _request_ the NFS server is now comfortably ahead of the
+FUSE session — 13,653 4 KiB writes per second against FUSE's 10,961, and 12,824
+ops/s with 64 in flight against FUSE's 9,132 at zero timeouts — which is the useful
+result, because the two share nothing but the driver interface.
+
+Where it looks much worse is anything path-shaped: `stat walk` is 3,816 stats/s
+against FUSE's 30,397, and `ls -l` is 4,972 entries/s against 28,958. That is not
+the protocol being slow, it is the **absence of a kernel client**: NFS has no path
+resolution on the wire, so `test/nfs/v3/client.ts` walks every component with its
+own `LOOKUP`s and repeats the walk for every operation, where a real client would
+have a dentry cache. The pairing confirms this from a new direction and settles it.
+The loopback column underneath went 1.7–2.7× on exactly these shapes, and **these
+rows did not move**: `stat` 1.01×, `ls -l` 1.03×, `stat walk` 1.06×. Whatever bounds
+them is not the driver, the loopback, or the path helpers that got faster. It is the
+round trips. Read the four core rows as the server's cost and the path-shaped rows
+as an artifact of the test client.
+
+**Throughput is where this sweep landed, and it changes the conclusion this section
+used to draw.** The old reading — "a fifth of what the FUSE transport does, XDR
+framing and a socket against a `writeSync` to a character device" — no longer holds
+and must not be repeated. Compared like for like against the number that also
+crosses a real transport rather than a page cache, NFS sequential read is now **62%
+of FUSE's** (977 vs 1,568 MiB/s with `keepCache` off) where before the sweep it was
+**25%** (325 vs 1,314), and NFS sequential write **65%** (412 vs 637) where it was
+52%. A socket and XDR framing now cost roughly half again what a `writeSync` to
+`/dev/fuse` costs, not four times it. Against the loopback ceiling the two
+transports are 8% and 13% of 12,171 MiB/s respectively, which is the number to keep
+if you want one that does not depend on which transport you started from.
+
+---
+
+## What the sweep moved
+
+`0f359e7` (+ the type-stripping fix) against `95c2c44`, both measured in this
+sitting on this host. Ratios are swept ÷ baseline, so **above 1 is faster after**.
+Read anything from 0.93× to 1.15× as no change (see
+[the calibration](#reading-these-numbers)); the `n = 3` rows are marked.
+
+**Loopback** — `0ee70d6` (loopback rebind, `normalizePath` fast path) and
+`e80c8ff` (`memory.readdir`, `memory.statfs`).
+
+| scenario                  |            baseline |                swept |       ratio |
+| ------------------------- | ------------------: | -------------------: | ----------: |
+| stat walk (500 files)     |     423,052 stats/s |    1,152,689 stats/s |   **2.72×** |
+| stat ×64 in flight        |       782,082 ops/s |      1,591,151 ops/s |   **2.03×** |
+| stat                      |       611,564 ops/s |      1,093,940 ops/s |   **1.79×** |
+| ls -l (1000 entries)      |   567,300 entries/s |    992,239 entries/s |   **1.75×** |
+| open + read 4 KiB         |       423,127 ops/s |        731,105 ops/s |   **1.73×** |
+| readdir (100 entries)     | 7,362,071 entries/s | 10,847,957 entries/s |   **1.47×** |
+| create 500 small files    |     266,961 files/s |      311,601 files/s | 1.17× (n=3) |
+| write 4 KiB               |     1,912,490 ops/s |      1,983,062 ops/s |       1.04× |
+| sequential write, 100 MiB |         1,210 MiB/s |          1,257 MiB/s | 1.04× (n=3) |
+| sequential read, 100 MiB  |        13,537 MiB/s |         12,171 MiB/s | 0.90× (n=3) |
+
+**NFSv3** — `16e99b8`, `5488085`, `2b52975`, `0747df0`.
+
+| scenario                  |         baseline |             swept |           ratio |
+| ------------------------- | ---------------: | ----------------: | --------------: |
+| sequential read, 100 MiB  |     324.74 MiB/s |      977.16 MiB/s | **3.01×** (n=3) |
+| readdir (100 entries)     | 70,180 entries/s | 130,860 entries/s |       **1.86×** |
+| write 4 KiB               |      7,844 ops/s |      13,653 ops/s |       **1.74×** |
+| sequential write, 100 MiB |     264.61 MiB/s |      411.79 MiB/s | **1.56×** (n=3) |
+| open + read 4 KiB         |      2,924 ops/s |       4,115 ops/s |       **1.41×** |
+| stat ×64 in flight        |     11,483 ops/s |      12,824 ops/s |           1.12× |
+| create 500 small files    |    2,243 files/s |     2,399 files/s |     1.07× (n=3) |
+| stat walk (500 files)     |    3,588 stats/s |     3,816 stats/s |           1.06× |
+| ls -l (1000 entries)      |  4,812 entries/s |   4,972 entries/s |           1.03× |
+| stat                      |      5,102 ops/s |       5,177 ops/s |           1.01× |
+
+**FUSE** — `c7ee989`, `7185f33`. The `default` variant is mostly kernel cache, so
+the four indented variant rows below it are where the transport's own change is
+legible.
+
+| scenario                           |          baseline |             swept |           ratio |
+| ---------------------------------- | ----------------: | ----------------: | --------------: |
+| sequential write, 100 MiB          |      507.53 MiB/s |      636.75 MiB/s | **1.25×** (n=3) |
+| readdir (100 entries)              | 123,769 entries/s | 148,273 entries/s |       **1.20×** |
+| ls -l (1000 entries)               |  26,660 entries/s |  28,958 entries/s |           1.09× |
+| stat ×64 in flight                 |     121,608 ops/s |     128,600 ops/s |           1.06× |
+| sequential read, 100 MiB           |       5,936 MiB/s |       6,221 MiB/s |     1.05× (n=3) |
+| stat                               |      32,702 ops/s |      33,434 ops/s |           1.02× |
+| ls -l (1000 entries, cold)         |   9,680 entries/s |   9,602 entries/s |           0.99× |
+| create 500 small files             |     2,359 files/s |     2,303 files/s |     0.98× (n=3) |
+| stat walk (500 files)              |    31,755 stats/s |    30,397 stats/s |           0.96× |
+| write 4 KiB                        |      11,987 ops/s |      10,961 ops/s |           0.91× |
+| open + read 4 KiB                  |       4,918 ops/s |       4,190 ops/s |           0.85× |
+| — `keepCache=off`, seq read        |       1,314 MiB/s |       1,568 MiB/s | **1.19×** (n=3) |
+| — `readdirplus=off`, readdir       | 142,526 entries/s | 171,638 entries/s |       **1.20×** |
+| — `no AUTO` (always plus), readdir |  93,874 entries/s |  95,297 entries/s |           1.02× |
+| — `timeout=0`, write 4 KiB         |      11,894 ops/s |      11,895 ops/s |           1.00× |
+
+The last four FUSE rows are the sharpest single result in this table, because they
+split a claim into the half that should move and the half that should not.
+`7185f33` stopped a plain `READDIR` binding an inode per entry and left
+`READDIRPLUS`, which legitimately acquires one, alone — and the plain path is 1.20×
+where the always-plus path is 1.02×. That is the commit message, measured.
+
+### What is left open, and small
+
+Three rows are slower after the sweep by more than the calibration comfortably
+absorbs. They are recorded as open rather than explained, because neither available
+story is proved.
+
+- **FUSE `open + read 4 KiB`, 4,918 → 4,190 ops/s (0.85×).** The largest residue,
+  and the interesting thing about it is where the loss sits: **p50 moved only
+  0.196 → 0.209 ms (−6.6%) while p99 went 0.318 → 0.889 ms (2.8×)**. A slower code
+  path shows up in p50; this is in the tail. The same scenario is 0.99× in the
+  `timeout=0` variant and 0.97× in `keepCache=off`, i.e. flat in both variants where
+  the kernel cache is out of the way — so whatever it is, it is not in a path the
+  sweep touched.
+- **FUSE `write 4 KiB`, 11,987 → 10,961 ops/s (0.91×).** Right at the edge of the
+  ±8% spread, and the two other measurements of the same thing in the same pair are
+  1.00× (`timeout=0`) and 0.95× (`maxWrite=128KiB`). Reads as noise; it is listed
+  because the mean of the three is −5% rather than zero.
+- **Loopback `sequential read`, 13,537 → 12,171 MiB/s (0.90×), `n = 3`.** Nothing
+  in `c7ee989..95c2c44` touches `memory`'s read path — `e80c8ff` changed `readdir`
+  and `statfs`, both of which improved as advertised in the same run. The FUSE
+  page-cached read, which is the same memcpy behind a mount, went the other way
+  (1.05×, also `n = 3`).
+
+**What would settle them:** repeat the paired A/B several times and take medians
+per row, and raise the iteration count on the throughput scenarios so the `n = 3`
+rows stop being `n = 3`. One paired run cannot separate a 10% effect from this
+host's spread, and this host is a container on a shared machine. In the meantime do
+**not** claim the sweep caused these, and do not claim the host did — the first is
+contradicted by the variants that stayed flat, and the second is unproved.
 
 ---
 
@@ -312,31 +563,48 @@ growth, and a file arrives in `max_write`-sized chunks — so writing 100 MiB in
 supposed to be the ceiling, being _slower_ than the transports it was the
 denominator for:
 
-|                                    |      before |                   after |
-| ---------------------------------- | ----------: | ----------------------: |
-| loopback, sequential write 100 MiB | 60.43 MiB/s |   1,382 MiB/s (**23×**) |
-| NFS, sequential write 100 MiB      | 53.18 MiB/s | 308.03 MiB/s (**5.8×**) |
+|                                    |      before |      after (2026-07-28) | now (this sitting) |
+| ---------------------------------- | ----------: | ----------------------: | -----------------: |
+| loopback, sequential write 100 MiB | 60.43 MiB/s |   1,382 MiB/s (**23×**) |        1,257 MiB/s |
+| NFS, sequential write 100 MiB      | 53.18 MiB/s | 308.03 MiB/s (**5.8×**) |       411.79 MiB/s |
 
-Fixed in `src/drivers/memory.ts`: `node.data` is still a view of exactly the
-file's length, but the buffer under it is grown geometrically, so the copying is
-amortised. Shrinking keeps the capacity unless the file lost three quarters of
-its size, so `truncate(f, 0)` still returns the memory. The `EFBIG` behaviour
-pjdfstest pinned is preserved — doubling is attempted first and the exact size is
-the fallback, and only a failure of _both_ is `EFBIG`.
+The before/after pair is a single controlled comparison from the sweep that found
+it, and is left as it was measured. The third column is where those two rows sit
+today: the loopback within this host's spread of where the fix left it, and the NFS
+row a further **1.56×** up on its own paired baseline (264.61 MiB/s) for a reason
+that has nothing to do with the driver — `16e99b8` and `5488085`, above.
 
-Worth noticing what this says about the benchmark suite: it caught a bug that
-made a _transport_ look 5× slower than it was. Without the loopback column as a
+Fixed in `src/drivers/memory.ts`: `node.data` is still a view of exactly the file's
+length, but the buffer under it is grown geometrically, so the copying is
+amortised. Shrinking keeps the capacity unless the file lost three quarters of its
+size, so `truncate(f, 0)` still returns the memory. The `EFBIG` behaviour pjdfstest
+pinned is preserved — doubling is attempted first and the exact size is the
+fallback, and only a failure of _both_ is `EFBIG`.
+
+Worth noticing what this says about the benchmark suite: it caught a bug that made
+a _transport_ look 5× slower than it was. Without the loopback column as a
 denominator, 53 MiB/s over NFS would have looked like an NFS number.
 
 ## Known gaps
 
 - **Only one concurrency mode exists.** IDEA.md describes three — relay,
   sync-driver-in-workers, and exec mode with an async driver — and v1 has the
-  third only. Everything above is main-thread async, which is why the reader
-  count does not move the numbers and why the ceiling is ~50 k requests/s: they
-  all land on one thread. The sync-worker mode is the one IDEA.md expects to be
-  "meaningfully better and scale with worker count"; **that claim is unmeasured
-  and must not appear in the README.**
+  third only. Everything above is main-thread async, which is why the reader count
+  does not move the numbers and why the request ceiling sits in the tens of
+  thousands: they all land on one thread. The sync-worker mode is the one IDEA.md
+  expects to be "meaningfully better and scale with worker count"; **that claim is
+  unmeasured and must not appear in the README or the docs.**
+- **The FUSE request counter was not re-measured.** `bench/fuse.ts` collects it but
+  only emits it under `--json`, and this sitting was run without. The ceiling
+  section's table is therefore older than everything around it, and the numbers this
+  sitting _can_ support are lower bounds. Anyone regenerating this file should pass
+  `--json` to every command.
+- **One paired run, not several.** The baseline makes attribution possible; it does
+  not make a 10% delta readable. Medians over repeated pairs would, and would also
+  retire [the three open rows](#what-is-left-open-and-small).
+- **No 9P or NFSv4.1 column.** Both transports ship, both are in the conformance
+  matrix, and neither has a `bench/` column — so no number may be quoted for
+  either, including in `docs/2.transports/`.
 - **One driver.** Every number is against the in-memory driver, on purpose: it
   isolates the transport. A driver that does real I/O will be bounded by its own
   latency long before any of these ceilings, which is the honest thing to tell a
@@ -345,7 +613,5 @@ denominator, 53 MiB/s over NFS would have looked like an NFS number.
   cannot be anything else on this host.
 - **No `git status` / `tar -x` / build-tree macro-benchmark.** The scenarios are
   synthetic; the record/replay fixtures (`test/fixtures/*.fuse`) contain real
-  traffic from `ls -laR`, `find` and `tar -xp`, but they are correctness
-  fixtures, not timed workloads.
-- **The low-`n` rows are `n = 3`.** ±10%, and the `max_write` and writeback
-  sequential-write comparisons are where that matters.
+  traffic from `ls -laR`, `find` and `tar -xp`, but they are correctness fixtures,
+  not timed workloads.
