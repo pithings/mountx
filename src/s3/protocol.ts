@@ -510,7 +510,7 @@ const MONTH_NAMES = [
 ];
 
 /** The widest millisecond timestamp `Date` represents (ECMA-262, `Date` range). */
-const MAX_TIMESTAMP_MS = 8.64e15;
+export const MAX_TIMESTAMP_MS = 8.64e15;
 
 function two(value: number): string {
   return String(value).padStart(2, "0");

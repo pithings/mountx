@@ -137,7 +137,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       memory driver (in-process, no sockets). Verify: ordering cases
       (`a.txt`/`a/b`/`a0`), pagination resume mid-directory, zero-copy contract
       at every await.
-- [ ] **6. Multipart in `session.ts`** — the five ops, staging prefix
+- [x] **6. Multipart in `session.ts`** — the five ops, staging prefix
       invisibility, out-of-order parts, streamed assembly, abort + close
       cleanup, part-list validation (ETag echo, part numbering). Tests extend
       `session.test.ts`. Verify: staging never leaks into any listing or

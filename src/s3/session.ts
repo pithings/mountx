@@ -100,6 +100,53 @@
  * when it has no entries of its own**, and the delimiter then groups that
  * marker key like any other key.
  *
+ * ## Multipart, worked through
+ *
+ * The five multipart operations stage their parts **through the driver**, under
+ * the reserved bucket-root prefix `.mountx-multipart/<uploadId>/` (plan
+ * decision), which every other operation is blind to. Three things follow from
+ * that, and each one is a decision this file makes:
+ *
+ * - **The upload's state is a file, not a field.** `<uploadId>/upload.json`
+ *   holds the key the upload is for and the `x-amz-meta-mtime` it was created
+ *   with. An in-memory registry would have been fewer lines and would lose
+ *   every in-flight upload on a restart *while its parts stayed on disk* —
+ *   debris nothing could name, let alone clean up. With the manifest beside the
+ *   parts, a session built over the same driver an hour later can list,
+ *   complete or abort an upload the previous process created, and
+ *   {@link S3Session.close} can enumerate every upload there is by reading one
+ *   directory. The name cannot collide with a part: parts are `part-<N>` and
+ *   nothing else is read as one.
+ * - **The upload id is minted, and then it is checked.** 16 random bytes as 32
+ *   hex characters ({@link isUploadId}), and an id that is not exactly that
+ *   shape is `NoSuchUpload` **before any driver call** — the id becomes a path
+ *   component, so `?uploadId=../..` must never reach a driver, and a client
+ *   cannot learn anything from the difference between a well-formed id that is
+ *   unknown and a hostile one that is refused.
+ * - **Complete concatenates; it does not seek.** Parts arrive out of order and
+ *   vary in size, so the offset of part *N* is unknowable until every part
+ *   before it exists. The assembly therefore streams each staged part in the
+ *   order the client listed, through the same `#writeObject` machinery a `PUT`
+ *   uses — which means it inherits the same partial-object story, and the
+ *   staging area is deliberately **not** cleaned up when it fails: S3 keeps an
+ *   upload alive after a failed `CompleteMultipartUpload`, so a retry with the
+ *   same part list works.
+ *
+ * **What the races guarantee.** Nothing here is atomic over an arbitrary
+ * driver, and pretending otherwise would be the fake capability this project
+ * refuses. What is guaranteed is that every request answers *honestly*: a
+ * `Complete` and an `Abort` for the same upload are serialized against each
+ * other by a per-upload mutex ({@link S3Session}'s `#withUpload`), so the loser
+ * sees the staging area the winner left — `NoSuchUpload` after an abort,
+ * `NoSuchUpload` after a completion — rather than a half-assembled object.
+ * `UploadPart` runs **outside** that mutex, because parts are uploaded in
+ * parallel and serializing them would defeat the operation; a part racing an
+ * abort answers `NoSuchUpload` (its staging directory is gone and it is never
+ * recreated, which is why the part write is the one write in this file that
+ * does not create its parents), and a part that wins the race can leave a file
+ * the abort had already walked past. That file is invisible, and `close()`
+ * sweeps it.
+ *
  * ## Ordering
  *
  * S3 orders keys by their UTF-8 bytes. A plain JavaScript `<` orders by UTF-16
@@ -133,7 +180,13 @@ import { createLoopback, type Loopback } from "../harness.ts";
 import { dirname } from "../path.ts";
 import type { DirentLike, FileHandleLike, FsDriver, StatsLike } from "../types.ts";
 import { decodeAwsChunked, isChunkedError, type ChunkedSignature } from "./chunked.ts";
-import { MULTIPART_PREFIX, s3ErrorOf } from "./constants.ts";
+import {
+  MAX_PART_SIZE,
+  MAX_PARTS,
+  MIN_PART_SIZE,
+  MULTIPART_PREFIX,
+  s3ErrorOf,
+} from "./constants.ts";
 import {
   bodyMode,
   chunkedRefusalError,
@@ -147,6 +200,7 @@ import {
   isAnswered,
   isRefusal,
   isStagingKey,
+  MAX_TIMESTAMP_MS,
   META_MTIME_HEADER,
   objectResponseHeaders,
   parseContentLengths,
@@ -179,17 +233,22 @@ import {
   type SigV4Verified,
 } from "./sigv4.ts";
 import {
+  encodeCompleteMultipartUploadResult,
   encodeCopyObjectResult,
   encodeDeleteResult,
+  encodeInitiateMultipartUploadResult,
   encodeListAllMyBucketsResult,
   encodeListBucketResult,
+  encodeListPartsResult,
   isXmlError,
+  parseCompleteMultipartUpload,
   parseDeleteObjects,
   XML_MAX_BYTES,
   type DeletedEntry,
   type DeleteErrorEntry,
   type S3ObjectEntry,
   type S3Owner,
+  type S3PartEntry,
 } from "./xml.ts";
 
 // ---------------------------------------------------------------------------
@@ -251,6 +310,75 @@ const NO_BODY: AsyncIterable<Uint8Array> = {
     next: async () => ({ done: true as const, value: undefined }),
   }),
 };
+
+// ---------------------------------------------------------------------------
+// multipart staging
+// ---------------------------------------------------------------------------
+
+/**
+ * Random bytes in an upload id. 16 of them, as 32 hex characters: the same
+ * width as a v4 UUID, which is the width nobody has to argue about — two ids
+ * collide with probability around 2⁻¹²⁸, and a collision would be two clients
+ * writing into one staging directory.
+ */
+export const UPLOAD_ID_BYTES = 16;
+
+/**
+ * Is this an upload id **this gateway minted** — 32 lowercase hex characters
+ * and nothing else?
+ *
+ * Checked at the top of every operation that takes an `uploadId`, before a
+ * driver is touched, because the id becomes a path component: `?uploadId=../..`
+ * or `?uploadId=a/b` would otherwise reach `dirname`-shaped path arithmetic
+ * with a traversal in it. Everything that fails here is `NoSuchUpload`, which
+ * is also the answer for a well-formed id that is simply unknown — a client
+ * learns nothing from the difference.
+ */
+export function isUploadId(value: string): boolean {
+  return /^[\da-f]{32}$/.test(value);
+}
+
+/** The staging directory of one upload: `/.mountx-multipart/<uploadId>`. */
+function uploadDirectory(uploadId: string): string {
+  return `/${MULTIPART_PREFIX}/${uploadId}`;
+}
+
+/** Where one part is staged. */
+function partPath(uploadId: string, partNumber: number): string {
+  return `${uploadDirectory(uploadId)}/${PART_NAME_PREFIX}${partNumber}`;
+}
+
+/** Part files are `part-<N>`, `N` in decimal with no padding. */
+const PART_NAME_PREFIX = "part-";
+
+/** A staged part's file name, and the number in it. Leading zeros are not
+ * minted and are not read back: `part-01` is not part 1, it is not a part. */
+const PART_NAME_PATTERN = /^part-([1-9]\d*)$/;
+
+/**
+ * The upload's manifest, beside its parts. Not a part: nothing reads a file as
+ * a part unless {@link PART_NAME_PATTERN} matches it.
+ */
+const MANIFEST_NAME = "upload.json";
+
+/** What the manifest holds — the whole of an upload's state. */
+interface UploadManifest {
+  /** The key this upload will become. An `uploadId` is bound to one key. */
+  key: string;
+  /** The `x-amz-meta-mtime` from `CreateMultipartUpload`, in milliseconds. */
+  mtime?: number;
+}
+
+/**
+ * How many times a subtree delete re-reads a directory that refused to go.
+ *
+ * A staging directory can gain a file *while* it is being deleted — an
+ * `UploadPart` that opened its destination before an `Abort` walked past it —
+ * and one more pass collects it. After the last pass the delete gives up
+ * quietly rather than answering `BucketNotEmpty` for a conflict the client
+ * caused and cannot act on; what is left is invisible, and `close()` sweeps it.
+ */
+const TREE_DELETE_PASSES = 3;
 
 // ---------------------------------------------------------------------------
 // keys, tokens and tags
@@ -523,6 +651,21 @@ export interface S3SessionStats {
   assertions: number;
 }
 
+/** How one body is stored, where the two writers in this file differ. */
+interface WriteOptions {
+  /**
+   * A size limit for this write alone, in bytes. The effective cap is the
+   * smaller of this and `options.maxBodyBytes`; over it is `EntityTooLarge`.
+   */
+  cap?: number;
+  /**
+   * Create the destination's parent directories on `ENOENT` (default `true`).
+   * `false` for a staged part, whose directory is the upload and must never be
+   * conjured back into existence by a write that raced its abort.
+   */
+  makeParents?: boolean;
+}
+
 /** One entry of a listing, before it becomes a `Contents` or a `CommonPrefixes`. */
 interface ListEntry {
   /** The full key: `a/b.txt` for a file, `a/` for a directory. */
@@ -583,6 +726,12 @@ export class S3Session {
    */
   readonly #inflight = new Set<number>();
   #nextTicket = 1;
+  /**
+   * One promise chain per multipart upload with an operation running on it —
+   * see `#withUpload`. Empty in a session with nothing in flight, because the
+   * last operation on an id removes it.
+   */
+  readonly #uploadLocks = new Map<string, Promise<unknown>>();
 
   constructor(buckets: Record<string, FsDriver>, options: S3SessionOptions = {}) {
     this.buckets = new Map(
@@ -727,12 +876,35 @@ export class S3Session {
       case "DeleteObjects": {
         return await this.#deleteObjects(bucket, head, body, auth.verified, requestId);
       }
+      case "CreateMultipartUpload": {
+        return await this.#createMultipartUpload(bucket, route, head, requestId);
+      }
+      case "UploadPart": {
+        return await this.#uploadPart(bucket, route, head, body, auth.verified, requestId);
+      }
+      case "CompleteMultipartUpload": {
+        return await this.#completeMultipartUpload(
+          bucket,
+          route,
+          head,
+          body,
+          auth.verified,
+          requestId,
+        );
+      }
+      case "AbortMultipartUpload": {
+        return await this.#abortMultipartUpload(bucket, route, requestId);
+      }
+      case "ListParts": {
+        return await this.#listParts(bucket, route, requestId);
+      }
+      /* v8 ignore next 9 -- structurally unreachable: `route` is `never` here,
+         because every `S3OpName` has a case above and the router produces
+         nothing else. The branch exists so that adding an operation to the
+         table cannot silently fall through to no reply at all. */
       default: {
-        /* The five multipart operations. Step 6 fills them in; until then they
-           are refused the way every other unimplemented operation is, rather
-           than half-answered. */
         return this.#error(
-          s3Error("NotImplemented", `${route.op} is not implemented by this gateway.`),
+          s3Error("NotImplemented", `${(route as S3Request).op} is not implemented.`),
           requestId,
           target.path,
         );
@@ -975,22 +1147,7 @@ export class S3Session {
     if (route.directory) {
       return await this.#putDirectory(driver, route, body, mtime, requestId);
     }
-    const source = this.#objectBody(head, body, verified);
-    const lengths = this.#lengths(head);
-    if (source.framing === "identity" && lengths.contentLength === undefined) {
-      /* S3 answers 411 for a `PUT` whose length it cannot know, and so does
-         this: an `aws-chunked` body frames its own end, an identity body does
-         not, and a driver write loop with no idea how much is coming is how a
-         truncated upload becomes a stored object. */
-      throw refuse("MissingContentLength");
-    }
-    const written = await this.#writeObject(driver, route.path, source.bytes);
-    if (source.framing === "identity" && written !== lengths.contentLength) {
-      throw refuse(
-        "IncompleteBody",
-        `The request body was ${written} bytes, not the declared ${lengths.contentLength}.`,
-      );
-    }
+    await this.#receiveBody(driver, route.path, head, body, verified);
     await this.#applyMtime(driver, route.path, mtime);
     const stats = await driver.stat(route.path);
     return {
@@ -1042,6 +1199,43 @@ export class S3Session {
   }
 
   /**
+   * Take a request body — whatever it is framed as — and store it at `path`.
+   *
+   * The framing rules are the request's, not the destination's, which is why
+   * `PUT` and `UploadPart` share this: an `aws-chunked` body frames its own end
+   * and an identity body does not, so an identity body with no
+   * `Content-Length` is `411` (S3's own answer) rather than a write loop with
+   * no idea how much is coming, and one that stops short of the length it
+   * declared is `IncompleteBody`.
+   *
+   * What differs between the two callers is in `options`, and both differences
+   * are the part's: a smaller cap ({@link MAX_PART_SIZE}), and no parent
+   * creation — see {@link S3Session}'s module docs on the abort race.
+   */
+  async #receiveBody(
+    driver: Loopback,
+    path: string,
+    head: S3RequestHead,
+    body: AsyncIterable<Uint8Array>,
+    verified: SigV4Verified | undefined,
+    options: WriteOptions = {},
+  ): Promise<number> {
+    const source = this.#objectBody(head, body, verified);
+    const lengths = this.#lengths(head);
+    if (source.framing === "identity" && lengths.contentLength === undefined) {
+      throw refuse("MissingContentLength");
+    }
+    const written = await this.#writeObject(driver, path, source.bytes, options);
+    if (source.framing === "identity" && written !== lengths.contentLength) {
+      throw refuse(
+        "IncompleteBody",
+        `The request body was ${written} bytes, not the declared ${lengths.contentLength}.`,
+      );
+    }
+    return written;
+  }
+
+  /**
    * Stream a body into the object, and answer how many bytes it held.
    *
    * The destination is opened **lazily**, at the first byte that survives
@@ -1060,8 +1254,16 @@ export class S3Session {
     driver: Loopback,
     path: string,
     source: AsyncIterable<Uint8Array>,
+    options: WriteOptions = {},
   ): Promise<number> {
-    const cap = this.options.maxBodyBytes;
+    const caps = [this.options.maxBodyBytes, options.cap].filter(
+      (value): value is number => value !== undefined,
+    );
+    const cap = caps.length === 0 ? undefined : Math.min(...caps);
+    const open =
+      options.makeParents === false
+        ? async (): Promise<FileHandleLike> => await driver.open(path, "w", 0o666)
+        : async (): Promise<FileHandleLike> => await this.#openForWrite(driver, path);
     let handle: FileHandleLike | undefined;
     let written = 0;
     try {
@@ -1072,12 +1274,12 @@ export class S3Session {
         if (cap !== undefined && written + chunk.byteLength > cap) {
           throw refuse("EntityTooLarge");
         }
-        handle ??= await this.#openForWrite(driver, path);
+        handle ??= await open();
         await handle.write(chunk, 0, chunk.byteLength, written);
         written += chunk.byteLength;
       }
       // A zero-byte object is still an object.
-      handle ??= await this.#openForWrite(driver, path);
+      handle ??= await open();
     } finally {
       await handle?.close();
     }
@@ -1654,6 +1856,424 @@ export class S3Session {
   }
 
   // -------------------------------------------------------------------------
+  // multipart
+  // -------------------------------------------------------------------------
+
+  /**
+   * `POST key?uploads`: mint an upload id and write the manifest that *is* the
+   * upload (see the module docs on why it is a file rather than a field).
+   *
+   * The staging directory is created here rather than at the first part, so
+   * that an upload with no parts is still an upload — `ListParts` answers an
+   * empty list for it, and `Abort` removes it — and so that a driver with no
+   * `mkdir` refuses the operation now, before a client has sent 5 MiB.
+   *
+   * A key ending in `/` is refused: that key is a directory (the marker
+   * convention), and a directory is not something a concatenation of parts can
+   * become.
+   */
+  async #createMultipartUpload(
+    driver: Loopback,
+    route: S3Request & { op: "CreateMultipartUpload" },
+    head: S3RequestHead,
+    requestId: string,
+  ): Promise<S3StreamResponse> {
+    if (route.directory) {
+      throw refuse(
+        "InvalidRequest",
+        "A key ending in / names a directory and cannot be uploaded in parts.",
+      );
+    }
+    const uploadId = randomBytes(UPLOAD_ID_BYTES).toString("hex");
+    const directory = uploadDirectory(uploadId);
+    await driver.mkdir(directory, { recursive: true });
+    const manifest: UploadManifest = {
+      key: route.key,
+      mtime: parseMetaMtime(headerValue(head.headers, META_MTIME_HEADER)),
+    };
+    await driver.writeFile(`${directory}/${MANIFEST_NAME}`, JSON.stringify(manifest));
+    return this.#xml(
+      encodeInitiateMultipartUploadResult({
+        bucket: route.bucket,
+        key: route.key,
+        uploadId,
+      }),
+      requestId,
+    );
+  }
+
+  /**
+   * `PUT key?uploadId&partNumber`: stage one part.
+   *
+   * The part number is already `1..MAX_PARTS` (the router checked it), a part
+   * that is uploaded twice replaces the first, and {@link MIN_PART_SIZE} is
+   * **not** checked here — S3 enforces the minimum at `Complete`, and only for
+   * the parts that are not last, which is the only place the last part is
+   * known.
+   *
+   * `ENOENT` anywhere on this path is `NoSuchUpload`, not `NoSuchKey`: the
+   * staging directory is the upload, so a part whose directory is gone is a
+   * part of an upload that no longer exists — the honest answer for a part
+   * racing an `Abort`.
+   */
+  async #uploadPart(
+    driver: Loopback,
+    route: S3Request & { op: "UploadPart" },
+    head: S3RequestHead,
+    body: AsyncIterable<Uint8Array>,
+    verified: SigV4Verified | undefined,
+    requestId: string,
+  ): Promise<S3StreamResponse> {
+    await this.#readManifest(driver, route.uploadId, route.key);
+    const path = partPath(route.uploadId, route.partNumber);
+    try {
+      await this.#receiveBody(driver, path, head, body, verified, {
+        cap: MAX_PART_SIZE,
+        makeParents: false,
+      });
+      const stats = await driver.stat(path);
+      return {
+        status: 200,
+        headers: {
+          ...this.#headers(requestId),
+          etag: formatETag(objectETag(stats)),
+          "content-length": "0",
+        },
+      };
+    } catch (error) {
+      throw isAbsent(error) ? refuse("NoSuchUpload") : error;
+    }
+  }
+
+  /**
+   * `POST key?uploadId`: validate the part list, then concatenate.
+   *
+   * The document is read and parsed **before** the upload's mutex is taken:
+   * those are the client's bytes arriving at the client's pace, and holding an
+   * upload's lock across a network read would let one slow client block that
+   * upload's `Abort`. Everything after it — the manifest, the parts, the
+   * assembly, the cleanup — runs inside the lock, so a second `Complete` or an
+   * `Abort` sees the whole of this one or none of it.
+   *
+   * The four validations are S3's own, in S3's own order of specificity:
+   *
+   * - **Order.** Strictly ascending part numbers, or `InvalidPartOrder`. Gaps
+   *   are fine; a repeat is not.
+   * - **Existence.** A part named but never staged is `InvalidPart`.
+   * - **The ETag echo.** The client sends back what `UploadPart` answered; a
+   *   value that does not match the staged part's current ETag is `InvalidPart`
+   *   — the part it names is not the part it uploaded.
+   * - **The minimum size**, for every part but the last: `EntityTooSmall`.
+   *
+   * Parts that were staged and **not** named are simply left out of the object
+   * and removed with the rest of the staging area, which is S3's semantics: the
+   * part list, not the staging area, is the object.
+   *
+   * A failure during assembly leaves the staging area **intact**, deliberately:
+   * S3 keeps an upload alive after a failed `Complete`, so the same request can
+   * be retried. What it does not leave intact is the destination — this writes
+   * in place, like `PUT`, so a failure part way through leaves a partial object
+   * where the whole one will be after a successful retry.
+   */
+  async #completeMultipartUpload(
+    driver: Loopback,
+    route: S3Request & { op: "CompleteMultipartUpload" },
+    head: S3RequestHead,
+    body: AsyncIterable<Uint8Array>,
+    verified: SigV4Verified | undefined,
+    requestId: string,
+  ): Promise<S3StreamResponse> {
+    if (!isUploadId(route.uploadId)) {
+      throw refuse("NoSuchUpload");
+    }
+    const document = await this.#readDocument(head, body, verified);
+    const listed = parseCompleteMultipartUpload(document, { maxBytes: this.#maxXmlBytes }).parts;
+    return await this.#withUpload(route.uploadId, async () => {
+      const manifest = await this.#readManifest(driver, route.uploadId, route.key);
+      let previous = 0;
+      for (const part of listed) {
+        if (part.partNumber <= previous) {
+          throw refuse("InvalidPartOrder");
+        }
+        previous = part.partNumber;
+      }
+      const staged: { path: string; size: number }[] = [];
+      for (const [index, part] of listed.entries()) {
+        const path = partPath(route.uploadId, part.partNumber);
+        const stats = await driver.stat(path).catch((error: unknown) => {
+          throw isAbsent(error)
+            ? refuse("InvalidPart", `Part ${part.partNumber} was never uploaded.`)
+            : error;
+        });
+        if (!stats.isFile() || unquoteETag(part.etag) !== objectETag(stats)) {
+          throw refuse(
+            "InvalidPart",
+            `The ETag given for part ${part.partNumber} does not match the part that was uploaded.`,
+          );
+        }
+        if (index < listed.length - 1 && stats.size < MIN_PART_SIZE) {
+          throw refuse(
+            "EntityTooSmall",
+            `Part ${part.partNumber} is ${stats.size} bytes; every part but the last must be at ` +
+              `least ${MIN_PART_SIZE} bytes.`,
+          );
+        }
+        staged.push({ path, size: stats.size });
+      }
+      await this.#writeObject(driver, route.path, this.#assemble(driver, staged));
+      await this.#applyMtime(driver, route.path, manifest.mtime);
+      await removeTree(driver, uploadDirectory(route.uploadId));
+      const stats = await driver.stat(route.path);
+      return this.#xml(
+        encodeCompleteMultipartUploadResult({
+          location: objectLocation(head, route.bucket, route.key),
+          bucket: route.bucket,
+          key: route.key,
+          /* The **assembled object's** derived ETag, from its own `stat` — not
+             AWS's md5-of-the-part-md5s with a `-N` count, which this gateway
+             never computes for any object (plan decision: the ETag is derived,
+             and the `-1` suffix is what says it is not a content hash). A
+             client that re-`GET`s the object sees this same value. */
+          etag: formatETag(objectETag(stats)),
+        }),
+        requestId,
+      );
+    });
+  }
+
+  /** The staged parts, back to back, in the order the client listed them. */
+  async *#assemble(
+    driver: Loopback,
+    parts: readonly { path: string; size: number }[],
+  ): AsyncGenerator<Uint8Array> {
+    for (const part of parts) {
+      const handle = await driver.open(part.path, "r");
+      yield* streamHandle(handle, 0, part.size, this.#readChunkBytes);
+    }
+  }
+
+  /**
+   * `DELETE key?uploadId`: forget the upload and everything staged for it.
+   *
+   * `204` and no body, which is what S3 answers; an upload that is not there —
+   * because it never was, because it completed, or because this is the second
+   * abort — is `NoSuchUpload` (404), also S3's answer.
+   */
+  async #abortMultipartUpload(
+    driver: Loopback,
+    route: S3Request & { op: "AbortMultipartUpload" },
+    requestId: string,
+  ): Promise<S3StreamResponse> {
+    if (!isUploadId(route.uploadId)) {
+      throw refuse("NoSuchUpload");
+    }
+    return await this.#withUpload(route.uploadId, async () => {
+      await this.#readManifest(driver, route.uploadId, route.key);
+      await removeTree(driver, uploadDirectory(route.uploadId));
+      return { status: 204, headers: this.#headers(requestId) };
+    });
+  }
+
+  /**
+   * `GET key?uploadId`: the staged parts, in part-number order, paged.
+   *
+   * The page is `max-parts` parts after `part-number-marker`, and
+   * `NextPartNumberMarker` is the last part number **considered** rather than
+   * the last one emitted — the same rule the object listing's cursor follows,
+   * for the same reason: a part that vanished between the `readdir` and its
+   * `stat` still has to be stepped past, or the next page starts where this one
+   * did.
+   */
+  async #listParts(
+    driver: Loopback,
+    route: S3Request & { op: "ListParts" },
+    requestId: string,
+  ): Promise<S3StreamResponse> {
+    await this.#readManifest(driver, route.uploadId, route.key);
+    const staged = (await this.#stagedParts(driver, route.uploadId)).filter(
+      (part) => part.partNumber > route.partNumberMarker,
+    );
+    const page = staged.slice(0, route.maxParts);
+    const parts: S3PartEntry[] = [];
+    for (const part of page) {
+      const stats = await driver.stat(part.path).catch(() => undefined);
+      if (stats === undefined) {
+        continue;
+      }
+      parts.push({
+        partNumber: part.partNumber,
+        lastModified: formatIsoDate(stats.mtimeMs),
+        etag: formatETag(objectETag(stats)),
+        size: stats.size,
+      });
+    }
+    const truncated = staged.length > page.length;
+    return this.#xml(
+      encodeListPartsResult({
+        bucket: route.bucket,
+        key: route.key,
+        uploadId: route.uploadId,
+        initiator: SYNTHETIC_OWNER,
+        owner: SYNTHETIC_OWNER,
+        storageClass: STORAGE_CLASS,
+        partNumberMarker: route.partNumberMarker,
+        /* The last part *considered*, and the marker the client sent when a
+           page held nothing at all (`max-parts=0`, which S3 answers as a
+           truncated empty page): a truncated listing must always carry the
+           cursor its own `IsTruncated` promises. */
+        nextPartNumberMarker: truncated
+          ? (page.at(-1)?.partNumber ?? route.partNumberMarker)
+          : undefined,
+        maxParts: route.maxParts,
+        isTruncated: truncated,
+        parts,
+      }),
+      requestId,
+    );
+  }
+
+  /**
+   * The upload's manifest, or `NoSuchUpload`.
+   *
+   * Three things are checked and all three answer the same code, because a
+   * client can act on none of the differences: the id's shape (before any
+   * driver call — see {@link isUploadId}), the manifest's presence, and the key
+   * it names. That last one is what binds an upload id to a key: S3's
+   * `UploadPart` and `Complete` both carry the key, and one that disagrees with
+   * the upload names an upload that does not exist.
+   *
+   * An unparseable or shapeless manifest is `NoSuchUpload` as well. It is a
+   * file in a directory a client can never reach, so a broken one means the
+   * store was edited underneath this gateway, and "there is no such upload" is
+   * both true and the only thing a client can do anything about.
+   */
+  async #readManifest(driver: Loopback, uploadId: string, key: string): Promise<UploadManifest> {
+    if (!isUploadId(uploadId)) {
+      throw refuse("NoSuchUpload");
+    }
+    const bytes = await driver
+      .readFile(`${uploadDirectory(uploadId)}/${MANIFEST_NAME}`)
+      .catch((error: unknown) => {
+        throw isAbsent(error) ? refuse("NoSuchUpload") : error;
+      });
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    } catch {
+      throw refuse("NoSuchUpload");
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+      throw refuse("NoSuchUpload");
+    }
+    const manifest = parsed as { key?: unknown; mtime?: unknown };
+    if (typeof manifest.key !== "string" || manifest.key !== key) {
+      throw refuse("NoSuchUpload");
+    }
+    return {
+      key: manifest.key,
+      // Bounded like the header route's parseMetaMtime: this file answers
+      // NoSuchUpload for every other manifest defect, and an edited store must
+      // not plant a timestamp Date cannot represent (it would surface as
+      // `Last-Modified: undefined, NaN ...` on every later GET of the object).
+      mtime:
+        typeof manifest.mtime === "number" && Math.abs(manifest.mtime) <= MAX_TIMESTAMP_MS
+          ? manifest.mtime
+          : undefined,
+    };
+  }
+
+  /** Every staged part of one upload, in part-number order. */
+  async #stagedParts(
+    driver: Loopback,
+    uploadId: string,
+  ): Promise<{ partNumber: number; path: string }[]> {
+    const directory = uploadDirectory(uploadId);
+    const entries = (await this.#readdir(driver, directory)) ?? [];
+    const parts: { partNumber: number; path: string }[] = [];
+    for (const entry of entries) {
+      const match = PART_NAME_PATTERN.exec(entry.name);
+      /* The manifest is not a part, and neither is anything else that is not a
+         regular file named `part-<N>` — including a `part-<N>` that is somehow
+         a directory, which no code here creates. */
+      if (match === null || !entry.isFile()) {
+        continue;
+      }
+      const partNumber = Number(match[1]);
+      if (partNumber > MAX_PARTS) {
+        continue;
+      }
+      parts.push({ partNumber, path: `${directory}/${entry.name}` });
+    }
+    return parts.sort((a, b) => a.partNumber - b.partNumber);
+  }
+
+  /**
+   * Run `fn` with this upload to itself.
+   *
+   * A promise chain per upload id, and **not** `PathLock` from `src/lock.ts`:
+   * that lock is one writer against every reader of a session's whole path map,
+   * which is what a `RENAME` needs and the opposite of what this needs — two
+   * uploads have nothing to say to each other, and serializing them would make
+   * a gateway with ten clients behave like a gateway with one. What is
+   * serialized here is exactly `Complete` and `Abort` of the *same* upload,
+   * plus `close()`'s sweep of it; `UploadPart` and `ListParts` run outside (see
+   * the module docs on what the races guarantee).
+   *
+   * The map entry is dropped by whoever put it there when nobody chained on
+   * it, so an id is not remembered after its last operation.
+   */
+  async #withUpload<T>(uploadId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.#uploadLocks.get(uploadId) ?? Promise.resolve();
+    // Both callbacks are `fn`, so a failed operation does not wedge the next.
+    const running = previous.then(fn, fn);
+    const settled = running.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#uploadLocks.set(uploadId, settled);
+    try {
+      return await running;
+    } finally {
+      if (this.#uploadLocks.get(uploadId) === settled) {
+        this.#uploadLocks.delete(uploadId);
+      }
+    }
+  }
+
+  /**
+   * Abandon every multipart upload in every bucket, and remove what they
+   * staged.
+   *
+   * Idempotent, safe to call with requests in flight, and it **never rejects**:
+   * a driver that refuses part of the sweep reports through `options.onError`,
+   * because a cleanup that throws on the way out of a process is a cleanup that
+   * does not finish. What it does not do is fence the session — a request that
+   * arrives afterwards is answered normally, and an upload created afterwards
+   * lives until the next `close()`. Shutting the door is the transport's job
+   * (it owns the socket); this is the part that leaves nothing behind, which is
+   * what step 6's "interrupted upload leaves no debris after close" asks for.
+   */
+  async close(): Promise<void> {
+    for (const driver of this.buckets.values()) {
+      const root = `/${MULTIPART_PREFIX}`;
+      try {
+        for (const entry of (await this.#readdir(driver, root)) ?? []) {
+          const path = `${root}/${entry.name}`;
+          await (entry.isDirectory()
+            ? this.#withUpload(entry.name, async () => await removeTree(driver, path))
+            : driver.unlink(path).catch(ignoreAbsent));
+        }
+        /* The staging root itself is cosmetic: an upload created while this
+           swept it is a legitimate `ENOTEMPTY`, and an empty reserved directory
+           is invisible either way. */
+        await driver.rmdir(root).catch(() => undefined);
+      } catch (error) {
+        this.options.onError?.(error, undefined);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // bodies and documents
   // -------------------------------------------------------------------------
 
@@ -1813,6 +2433,93 @@ async function* streamHandle(
   } finally {
     await handle.close();
   }
+}
+
+/** Swallow "there is nothing there", rethrow everything else. */
+function ignoreAbsent(error: unknown): void {
+  if (!isAbsent(error)) {
+    throw error;
+  }
+}
+
+/**
+ * Remove a directory and everything under it, treating "it was already gone"
+ * as success at every step.
+ *
+ * Depth-first, and it re-reads a directory that would not go
+ * ({@link TREE_DELETE_PASSES}), because the one subtree this is ever pointed at
+ * — a multipart upload's staging directory — can gain a file while it is being
+ * removed. Recursive rather than iterative: the tree is two levels deep by
+ * construction, and the recursion is over what the driver reports rather than
+ * over anything a client controls.
+ */
+async function removeTree(driver: Loopback, path: string): Promise<void> {
+  for (let pass = 0; pass < TREE_DELETE_PASSES; pass++) {
+    let entries: DirentLike[];
+    try {
+      entries = await driver.readdir(path, { withFileTypes: true });
+    } catch (error) {
+      ignoreAbsent(error);
+      return;
+    }
+    for (const entry of entries) {
+      const child = `${path}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await removeTree(driver, child);
+        continue;
+      }
+      await driver.unlink(child).catch(ignoreAbsent);
+    }
+    try {
+      await driver.rmdir(path);
+      return;
+    } catch (error) {
+      if (errorCode(error) !== "ENOTEMPTY") {
+        ignoreAbsent(error);
+        return;
+      }
+      /* Something appeared under it between the listing and the `rmdir`: go
+         round again, and give up quietly if it keeps happening. */
+    }
+  }
+}
+
+/**
+ * An ETag as this gateway compares it: the client's `"abc-1"` against the
+ * `abc-1` a `stat` derives.
+ *
+ * Quotes are stripped because that is how the header carries it and how every
+ * client echoes it back, and the case is folded because the value is hex —
+ * `objectETag` emits lowercase, and a client that upper-cased it named the same
+ * part. Nothing else is normalized: a `W/` prefix is not an ETag S3 ever sent
+ * and does not match one.
+ */
+function unquoteETag(etag: string): string {
+  const trimmed = etag.trim();
+  const unquoted =
+    trimmed.length >= 2 && trimmed.startsWith(`"`) && trimmed.endsWith(`"`)
+      ? trimmed.slice(1, -1)
+      : trimmed;
+  return unquoted.toLowerCase();
+}
+
+/**
+ * `<Location>` for a completed multipart upload: the path-style URL of the
+ * object that was just assembled.
+ *
+ * Built from the request's own `Host` header, because a gateway does not know
+ * what name it is reached by — a client behind a proxy asked for the proxy's
+ * name and must be told that one back. The scheme is `http`, which is what the
+ * only server in this package binds (`node:http`, plan decision), and a request
+ * with no `Host` at all — HTTP/1.0, or a caller driving the session directly —
+ * gets the path alone rather than an invented origin. Each key segment is
+ * percent-encoded and the separators are kept, so the URL is one a client can
+ * fetch.
+ */
+function objectLocation(head: S3RequestHead, bucket: string, key: string): string {
+  const path = `/${uriEncode(bucket)}/${key.split("/").map(uriEncode).join("/")}`;
+  const host = headerValue(head.headers, "host");
+  return host === undefined || host === "" ? path : `http://${host}${path}`;
 }
 
 /**

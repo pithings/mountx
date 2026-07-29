@@ -31,6 +31,7 @@ import { createLoopback } from "../../src/harness.ts";
 import type { FsDriver, StatsLike } from "../../src/types.ts";
 import { signChunk, type ChunkedSignature } from "../../src/s3/chunked.ts";
 import {
+  MIN_PART_SIZE,
   MULTIPART_PREFIX,
   STREAMING_PAYLOAD,
   STREAMING_UNSIGNED_PAYLOAD_TRAILER,
@@ -1626,13 +1627,17 @@ describe("S3Session: one reply, whatever happens", () => {
     healthy();
   });
 
-  it("refuses the multipart operations until step 6 implements them", async () => {
+  it("refuses the multipart operations this gateway does not implement", async () => {
     for (const request of [
-      { method: "POST", target: `/${BUCKET}/big.bin?uploads` },
-      { method: "PUT", target: `/${BUCKET}/big.bin?uploadId=u1&partNumber=1`, body: "part" },
-      { method: "POST", target: `/${BUCKET}/big.bin?uploadId=u1`, body: "<x/>" },
-      { method: "DELETE", target: `/${BUCKET}/big.bin?uploadId=u1` },
-      { method: "GET", target: `/${BUCKET}/big.bin?uploadId=u1` },
+      /* Bucket-scoped `?uploads` is `ListMultipartUploads`, and `?uploadId`
+         with `x-amz-copy-source` is `UploadPartCopy`: neither is in the plan's
+         supported set, and both are refused rather than half-answered. */
+      { method: "GET", target: `/${BUCKET}?uploads` },
+      {
+        method: "PUT",
+        target: `/${BUCKET}/big.bin?uploadId=${"0".repeat(32)}&partNumber=1`,
+        headers: { "x-amz-copy-source": `/${BUCKET}/source.txt` },
+      },
     ] satisfies Request[]) {
       const reply = await call(session, request);
       expect(reply.status, request.target).toBe(501);
@@ -2169,5 +2174,776 @@ describe("S3Session: a prefix is not a directory", () => {
     expect(refused.status).toBe(501);
     expect(errorCodeOf(refused)).toBe("NotImplemented");
     healthy(limited);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// multipart
+// ---------------------------------------------------------------------------
+
+/**
+ * The five multipart operations, against the staging area they share.
+ *
+ * Three kinds of fact are pinned here and they are not the same kind:
+ *
+ * - **S3's semantics**, from the API Reference: parts arrive out of order and
+ *   are listed in order, a re-uploaded part replaces the first, the part list
+ *   (not the staging area) is the object, `Complete` validates order, presence,
+ *   the ETag echo and the minimum size, and an upload that is not there is
+ *   `NoSuchUpload` whichever operation asked.
+ * - **The plan's invisibility decision**, which is what step 6's verify line is
+ *   about: with an upload in flight, nothing about it is visible through any
+ *   other operation, and after `close()` nothing about it is left at all.
+ * - **The races, stated as outcomes rather than as timing**: two operations on
+ *   one upload always answer honestly, and never leave a half-assembled object
+ *   behind.
+ *
+ * The parts are real 5 MiB parts wherever a `Complete` has to succeed with more
+ * than one of them, because {@link MIN_PART_SIZE} is a rule this gateway
+ * enforces and a test that dodged it would be testing something else.
+ */
+describe("S3Session: multipart uploads", () => {
+  const KEY = "big.bin";
+  const TARGET = `/${BUCKET}/${KEY}`;
+
+  /** A deterministic byte pattern; two seeds never produce the same bytes. */
+  function pattern(size: number, seed: number): Uint8Array {
+    const bytes = new Uint8Array(size);
+    for (let index = 0; index < size; index++) {
+      bytes[index] = (index * 31 + seed * 101 + (index >> 13)) & 0xff;
+    }
+    return bytes;
+  }
+
+  /* Built once: every test that needs a part big enough to sit before the last
+     one shares these. */
+  const FIRST = pattern(MIN_PART_SIZE, 1);
+  const SECOND = pattern(MIN_PART_SIZE, 2);
+  const LAST = ascii("the last part, which may be any size at all");
+
+  interface ListedPart {
+    partNumber: number;
+    etag: string;
+    size: number;
+  }
+
+  function partsOf(xml: string): ListedPart[] {
+    return [...xml.matchAll(/<Part>(.*?)<\/Part>/g)].map((match) => {
+      const block = match[1] as string;
+      return {
+        partNumber: Number(field(block, "PartNumber")),
+        etag: field(block, "ETag"),
+        size: Number(field(block, "Size")),
+      };
+    });
+  }
+
+  async function createUpload(
+    options: { target?: string; headers?: Record<string, string>; on?: S3Session } = {},
+  ): Promise<string> {
+    const reply = await call(options.on ?? session, {
+      method: "POST",
+      target: `${options.target ?? TARGET}?uploads`,
+      headers: options.headers,
+    });
+    expect(reply.status).toBe(200);
+    return field(reply.text, "UploadId");
+  }
+
+  async function uploadPart(
+    uploadId: string,
+    partNumber: number,
+    body: Uint8Array | string,
+    options: { target?: string; on?: S3Session } = {},
+  ): Promise<Reply> {
+    return await call(options.on ?? session, {
+      method: "PUT",
+      target: `${options.target ?? TARGET}?uploadId=${uploadId}&partNumber=${partNumber}`,
+      body,
+    });
+  }
+
+  function completeDocument(parts: readonly { partNumber: number; etag: string }[]): string {
+    const rows = parts
+      .map(
+        (part) =>
+          `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${part.etag}</ETag></Part>`,
+      )
+      .join("");
+    return `<CompleteMultipartUpload>${rows}</CompleteMultipartUpload>`;
+  }
+
+  async function complete(
+    uploadId: string,
+    parts: readonly { partNumber: number; etag: string }[],
+    options: { target?: string; on?: S3Session } = {},
+  ): Promise<Reply> {
+    return await call(options.on ?? session, {
+      method: "POST",
+      target: `${options.target ?? TARGET}?uploadId=${uploadId}`,
+      headers: { host: "s3.example" },
+      body: completeDocument(parts),
+    });
+  }
+
+  function stagingPath(uploadId: string, name?: string): string {
+    return `/${MULTIPART_PREFIX}/${uploadId}${name === undefined ? "" : `/${name}`}`;
+  }
+
+  /** Is anything at all left of this upload in the store? */
+  async function staged(uploadId: string, on: FsDriver = driver): Promise<string[] | undefined> {
+    const entries = await createLoopback(on)
+      .readdir(stagingPath(uploadId), { withFileTypes: true })
+      .catch(() => undefined);
+    return entries?.map((entry) => entry.name).sort();
+  }
+
+  it("round-trips an upload whose parts arrive out of order", async () => {
+    const created = await call(session, { method: "POST", target: `${TARGET}?uploads` });
+    expect(created.status).toBe(200);
+    expect(field(created.text, "Bucket")).toBe(BUCKET);
+    expect(field(created.text, "Key")).toBe(KEY);
+    const uploadId = field(created.text, "UploadId");
+    expect(uploadId).toMatch(/^[\da-f]{32}$/);
+
+    const etags = new Map<number, string>();
+    for (const [partNumber, bytes] of [
+      [3, LAST],
+      [1, FIRST],
+      [2, SECOND],
+    ] as const) {
+      const reply = await uploadPart(uploadId, partNumber, bytes);
+      expect(reply.status, `part ${partNumber}`).toBe(200);
+      expect(reply.headers.etag).toMatch(/^"[\da-f]{32}-1"$/);
+      expect(reply.headers["content-length"]).toBe("0");
+      etags.set(partNumber, reply.headers.etag as string);
+    }
+
+    // Listed in part-number order, whatever order they arrived in.
+    const listed = await call(session, { target: `${TARGET}?uploadId=${uploadId}` });
+    expect(listed.status).toBe(200);
+    expect(field(listed.text, "Key")).toBe(KEY);
+    expect(field(listed.text, "UploadId")).toBe(uploadId);
+    expect(field(listed.text, "StorageClass")).toBe(STORAGE_CLASS);
+    expect(listed.text).toContain(`<ID>${SYNTHETIC_OWNER.id}</ID>`);
+    expect(field(listed.text, "IsTruncated")).toBe("false");
+    expect(partsOf(listed.text)).toEqual([
+      { partNumber: 1, etag: etags.get(1), size: FIRST.byteLength },
+      { partNumber: 2, etag: etags.get(2), size: SECOND.byteLength },
+      { partNumber: 3, etag: etags.get(3), size: LAST.byteLength },
+    ]);
+
+    // One part a page, resumed by part-number-marker.
+    const seen: number[] = [];
+    let marker = 0;
+    for (;;) {
+      const page = await call(session, {
+        target: `${TARGET}?uploadId=${uploadId}&max-parts=1&part-number-marker=${marker}`,
+      });
+      expect(field(page.text, "MaxParts")).toBe("1");
+      expect(field(page.text, "PartNumberMarker")).toBe(String(marker));
+      const parts = partsOf(page.text);
+      expect(parts).toHaveLength(1);
+      seen.push((parts[0] as ListedPart).partNumber);
+      if (field(page.text, "IsTruncated") === "false") {
+        expect(page.text).not.toContain("<NextPartNumberMarker>");
+        break;
+      }
+      marker = Number(field(page.text, "NextPartNumberMarker"));
+      expect(marker).toBe((parts[0] as ListedPart).partNumber);
+    }
+    expect(seen).toEqual([1, 2, 3]);
+
+    const completed = await complete(uploadId, [
+      { partNumber: 1, etag: etags.get(1) as string },
+      { partNumber: 2, etag: etags.get(2) as string },
+      { partNumber: 3, etag: etags.get(3) as string },
+    ]);
+    expect(completed.status).toBe(200);
+    expect(field(completed.text, "Bucket")).toBe(BUCKET);
+    expect(field(completed.text, "Key")).toBe(KEY);
+    expect(field(completed.text, "Location")).toBe(`http://s3.example/${BUCKET}/${KEY}`);
+
+    const object = await call(session, { target: TARGET });
+    expect(object.status).toBe(200);
+    expect(Buffer.from(object.bytes).equals(Buffer.concat([FIRST, SECOND, LAST]))).toBe(true);
+    // The reply's ETag is the assembled object's own, so a GET agrees with it.
+    expect(object.headers.etag).toBe(field(completed.text, "ETag"));
+
+    // The staging area is gone, and the upload id names nothing.
+    expect(await staged(uploadId)).toBeUndefined();
+    expect(
+      await createLoopback(driver).readdir(`/${MULTIPART_PREFIX}`, { withFileTypes: true }),
+    ).toEqual([]);
+    const after = await call(session, { target: `${TARGET}?uploadId=${uploadId}` });
+    expect(after.status).toBe(404);
+    expect(errorCodeOf(after)).toBe("NoSuchUpload");
+    healthy();
+  });
+
+  it("answers max-parts=0 as a truncated empty page that a client can resume from", async () => {
+    const uploadId = await createUpload();
+    await uploadPart(uploadId, 4, "a part");
+    const page = await call(session, { target: `${TARGET}?uploadId=${uploadId}&max-parts=0` });
+    expect(page.status).toBe(200);
+    expect(partsOf(page.text)).toEqual([]);
+    expect(field(page.text, "IsTruncated")).toBe("true");
+    expect(field(page.text, "NextPartNumberMarker")).toBe("0");
+    healthy();
+  });
+
+  it("replaces a part that is uploaded twice", async () => {
+    const uploadId = await createUpload();
+    const first = await uploadPart(uploadId, 1, FIRST);
+    const draft = await uploadPart(uploadId, 2, "the first version of the last part");
+    const final = await uploadPart(uploadId, 2, "the second version");
+    expect(final.headers.etag).not.toBe(draft.headers.etag);
+
+    const listed = await call(session, { target: `${TARGET}?uploadId=${uploadId}` });
+    expect(partsOf(listed.text).map((part) => part.partNumber)).toEqual([1, 2]);
+
+    const completed = await complete(uploadId, [
+      { partNumber: 1, etag: first.headers.etag as string },
+      { partNumber: 2, etag: final.headers.etag as string },
+    ]);
+    expect(completed.status).toBe(200);
+    const object = await call(session, { target: TARGET });
+    expect(
+      Buffer.from(object.bytes).equals(Buffer.concat([FIRST, ascii("the second version")])),
+    ).toBe(true);
+    healthy();
+  });
+
+  it("assembles the parts the client listed, and discards the rest", async () => {
+    const uploadId = await createUpload();
+    const first = await uploadPart(uploadId, 1, FIRST);
+    await uploadPart(uploadId, 2, "staged and never named");
+    const last = await uploadPart(uploadId, 3, LAST);
+
+    const completed = await complete(uploadId, [
+      { partNumber: 1, etag: first.headers.etag as string },
+      { partNumber: 3, etag: last.headers.etag as string },
+    ]);
+    expect(completed.status).toBe(200);
+    const object = await call(session, { target: TARGET });
+    expect(Buffer.from(object.bytes).equals(Buffer.concat([FIRST, LAST]))).toBe(true);
+    // The part nobody named went with the staging area.
+    expect(await staged(uploadId)).toBeUndefined();
+    healthy();
+  });
+
+  it("accepts a last part below the minimum, and a single small part alone", async () => {
+    const uploadId = await createUpload();
+    const only = await uploadPart(uploadId, 1, "three bytes is a whole object");
+    const completed = await complete(uploadId, [
+      { partNumber: 1, etag: only.headers.etag as string },
+    ]);
+    expect(completed.status).toBe(200);
+    expect((await call(session, { target: TARGET })).text).toBe("three bytes is a whole object");
+    healthy();
+  });
+
+  it("validates the part list the way S3 does", async () => {
+    const uploadId = await createUpload();
+    const one = await uploadPart(uploadId, 1, "part one");
+    const two = await uploadPart(uploadId, 2, "part two");
+    const etag = (reply: Reply): string => reply.headers.etag as string;
+
+    // A part that was never staged.
+    const missing = await complete(uploadId, [{ partNumber: 7, etag: `"${"0".repeat(32)}-1"` }]);
+    expect(missing.status).toBe(400);
+    expect(errorCodeOf(missing)).toBe("InvalidPart");
+
+    // An ETag that is not the staged part's.
+    const wrong = await complete(uploadId, [{ partNumber: 2, etag: etag(one) }]);
+    expect(wrong.status).toBe(400);
+    expect(errorCodeOf(wrong)).toBe("InvalidPart");
+
+    // Descending, and repeated: both are "not in ascending order".
+    for (const parts of [
+      [
+        { partNumber: 2, etag: etag(two) },
+        { partNumber: 1, etag: etag(one) },
+      ],
+      [
+        { partNumber: 1, etag: etag(one) },
+        { partNumber: 1, etag: etag(one) },
+      ],
+    ]) {
+      const reply = await complete(uploadId, parts);
+      expect(reply.status).toBe(400);
+      expect(errorCodeOf(reply)).toBe("InvalidPartOrder");
+    }
+
+    // A part below the minimum that is not the last one.
+    const small = await complete(uploadId, [
+      { partNumber: 1, etag: etag(one) },
+      { partNumber: 2, etag: etag(two) },
+    ]);
+    expect(small.status).toBe(400);
+    expect(errorCodeOf(small)).toBe("EntityTooSmall");
+
+    // Nothing above touched the staging area, and no object was created.
+    expect(await staged(uploadId)).toEqual(["part-1", "part-2", "upload.json"]);
+    expect((await call(session, { target: TARGET })).status).toBe(404);
+    healthy();
+  });
+
+  it("keeps the upload alive when the assembly fails, so the retry works", async () => {
+    /* A driver whose reads of one named file fail. `Complete` opens the parts
+       in the order it was given, so this fails *after* the first part has been
+       written into the destination. */
+    let broken: string | undefined;
+    const base = createMemoryDriver();
+    const brittle: FsDriver = {
+      ...base,
+      open: async (path, flags, mode) => {
+        if (broken !== undefined && path.endsWith(broken) && flags === "r") {
+          throw fsError("EIO");
+        }
+        return await base.open(path, flags, mode);
+      },
+    };
+    const brittleSession = new S3Session({ [BUCKET]: brittle });
+    const uploadId = await createUpload({ on: brittleSession });
+    const first = await uploadPart(uploadId, 1, FIRST, { on: brittleSession });
+    const last = await uploadPart(uploadId, 2, LAST, { on: brittleSession });
+    const parts = [
+      { partNumber: 1, etag: first.headers.etag as string },
+      { partNumber: 2, etag: last.headers.etag as string },
+    ];
+
+    broken = "part-2";
+    const failed = await complete(uploadId, parts, { on: brittleSession });
+    expect(failed.status).toBe(500);
+    expect(errorCodeOf(failed)).toBe("InternalError");
+    // The staging area survives a failed Complete: S3 keeps the upload alive.
+    expect(await staged(uploadId, brittle)).toEqual(["part-1", "part-2", "upload.json"]);
+
+    broken = undefined;
+    const retried = await complete(uploadId, parts, { on: brittleSession });
+    expect(retried.status).toBe(200);
+    const object = await call(brittleSession, { target: TARGET });
+    expect(Buffer.from(object.bytes).equals(Buffer.concat([FIRST, LAST]))).toBe(true);
+    expect(await staged(uploadId, brittle)).toBeUndefined();
+    healthy(brittleSession);
+  });
+
+  it("aborts an upload, and answers NoSuchUpload for everything afterwards", async () => {
+    const uploadId = await createUpload();
+    const part = await uploadPart(uploadId, 1, "staged bytes");
+    expect(await staged(uploadId)).toEqual(["part-1", "upload.json"]);
+
+    const aborted = await call(session, {
+      method: "DELETE",
+      target: `${TARGET}?uploadId=${uploadId}`,
+    });
+    expect(aborted.status).toBe(204);
+    expect(aborted.bytes.byteLength).toBe(0);
+    expect(await staged(uploadId)).toBeUndefined();
+
+    for (const request of [
+      { method: "PUT", target: `${TARGET}?uploadId=${uploadId}&partNumber=1`, body: "late" },
+      { method: "GET", target: `${TARGET}?uploadId=${uploadId}` },
+      { method: "DELETE", target: `${TARGET}?uploadId=${uploadId}` },
+    ] satisfies Request[]) {
+      const reply = await call(session, request);
+      expect(reply.status, request.method).toBe(404);
+      expect(errorCodeOf(reply), request.method).toBe("NoSuchUpload");
+    }
+    const completed = await complete(uploadId, [
+      { partNumber: 1, etag: part.headers.etag as string },
+    ]);
+    expect(completed.status).toBe(404);
+    expect(errorCodeOf(completed)).toBe("NoSuchUpload");
+    // A part that arrived after the abort created nothing.
+    expect(await staged(uploadId)).toBeUndefined();
+    healthy();
+  });
+
+  it("answers honestly when a Complete and an Abort race", async () => {
+    const uploadId = await createUpload();
+    const only = await uploadPart(uploadId, 1, "the whole object in one part");
+    const [completed, aborted] = await Promise.all([
+      complete(uploadId, [{ partNumber: 1, etag: only.headers.etag as string }]),
+      call(session, { method: "DELETE", target: `${TARGET}?uploadId=${uploadId}` }),
+    ]);
+    /* Whichever won, the loser is told the upload is gone rather than given a
+       half-assembled object, and the staging area is gone either way. */
+    const outcome = `${completed.status}/${aborted.status}`;
+    expect(["200/404", "404/204"]).toContain(outcome);
+    const object = await call(session, { target: TARGET });
+    if (outcome === "200/404") {
+      expect(errorCodeOf(aborted)).toBe("NoSuchUpload");
+      expect(object.text).toBe("the whole object in one part");
+    } else {
+      expect(errorCodeOf(completed)).toBe("NoSuchUpload");
+      expect(object.status).toBe(404);
+    }
+    expect(await staged(uploadId)).toBeUndefined();
+    healthy();
+  });
+
+  it("sweeps every bucket's staging area on close, and keeps answering", async () => {
+    const second = createMemoryDriver();
+    const twoBuckets = new S3Session({ [BUCKET]: driver, other: second });
+    const first = await createUpload({ on: twoBuckets });
+    await uploadPart(first, 1, "in the first bucket", { on: twoBuckets });
+    const other = await createUpload({ on: twoBuckets, target: `/other/${KEY}` });
+    await uploadPart(other, 2, "in the other bucket", {
+      on: twoBuckets,
+      target: `/other/${KEY}`,
+    });
+
+    await twoBuckets.close();
+    for (const store of [driver, second]) {
+      await expect(createLoopback(store).stat(`/${MULTIPART_PREFIX}`)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    }
+    // Idempotent, and the session still answers.
+    await twoBuckets.close();
+    const gone = await call(twoBuckets, { target: `${TARGET}?uploadId=${first}` });
+    expect(gone.status).toBe(404);
+    expect(errorCodeOf(gone)).toBe("NoSuchUpload");
+    expect(
+      (await call(twoBuckets, { method: "PUT", target: TARGET, body: "after close" })).status,
+    ).toBe(200);
+    healthy(twoBuckets);
+  });
+
+  it("refuses a hostile upload id without touching a driver", async () => {
+    const base = createMemoryDriver();
+    const calls: string[] = [];
+    const counted = new Proxy(base, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver) as unknown;
+        if (typeof value !== "function") {
+          return value;
+        }
+        return (...args: unknown[]) => {
+          calls.push(String(property));
+          return (value as (...rest: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    }) as FsDriver;
+    const watched = new S3Session({ [BUCKET]: counted });
+    calls.length = 0;
+
+    for (const uploadId of [
+      "..%2Fx",
+      "a%2Fb",
+      "%2E%2E",
+      "0".repeat(31),
+      "0".repeat(33),
+      "Z".repeat(32),
+      `${"0".repeat(30)}-1`,
+      // Hex, the right width, and upper case: not an id this gateway mints.
+      "abcdef0123456789abcdef0123456789".toUpperCase(),
+    ]) {
+      for (const request of [
+        { method: "GET", target: `${TARGET}?uploadId=${uploadId}` },
+        { method: "DELETE", target: `${TARGET}?uploadId=${uploadId}` },
+        { method: "PUT", target: `${TARGET}?uploadId=${uploadId}&partNumber=1`, body: "x" },
+        { method: "POST", target: `${TARGET}?uploadId=${uploadId}`, body: "<x/>" },
+      ] satisfies Request[]) {
+        const reply = await call(watched, request);
+        expect(reply.status, `${request.method} ${uploadId}`).toBe(404);
+        expect(errorCodeOf(reply), `${request.method} ${uploadId}`).toBe("NoSuchUpload");
+      }
+    }
+    expect(calls).toEqual([]);
+    /* An **empty** `?uploadId=` never reaches the session at all: the router
+       refuses it as `InvalidArgument`, which is where that decision was made
+       (step 4) and where it is tested. */
+    const empty = await call(watched, { target: `${TARGET}?uploadId=` });
+    expect(empty.status).toBe(400);
+    expect(errorCodeOf(empty)).toBe("InvalidArgument");
+    healthy(watched);
+  });
+
+  it("refuses an upload id that belongs to another key", async () => {
+    const uploadId = await createUpload();
+    const elsewhere = `/${BUCKET}/other.bin`;
+    for (const request of [
+      { method: "GET", target: `${elsewhere}?uploadId=${uploadId}` },
+      { method: "PUT", target: `${elsewhere}?uploadId=${uploadId}&partNumber=1`, body: "x" },
+      { method: "DELETE", target: `${elsewhere}?uploadId=${uploadId}` },
+    ] satisfies Request[]) {
+      const reply = await call(session, request);
+      expect(reply.status, request.method).toBe(404);
+      expect(errorCodeOf(reply), request.method).toBe("NoSuchUpload");
+    }
+    // ... and the upload it does belong to is untouched.
+    expect(await staged(uploadId)).toEqual(["upload.json"]);
+    healthy();
+  });
+
+  it("refuses to upload a directory key in parts", async () => {
+    const reply = await call(session, { method: "POST", target: `/${BUCKET}/photos/?uploads` });
+    expect(reply.status).toBe(400);
+    expect(errorCodeOf(reply)).toBe("InvalidRequest");
+    healthy();
+  });
+
+  it("applies the caps and the length rules a PUT is held to", async () => {
+    const uploadId = await createUpload();
+    const capped = new S3Session({ [BUCKET]: driver }, { maxBodyBytes: 8 });
+    const big = await uploadPart(uploadId, 1, "far more than eight bytes", { on: capped });
+    expect(big.status).toBe(400);
+    expect(errorCodeOf(big)).toBe("EntityTooLarge");
+
+    const unmeasured = await call(session, {
+      method: "PUT",
+      target: `${TARGET}?uploadId=${uploadId}&partNumber=1`,
+      body: "no length at all",
+      omitContentLength: true,
+    });
+    expect(unmeasured.status).toBe(411);
+    expect(errorCodeOf(unmeasured)).toBe("MissingContentLength");
+    healthy();
+    healthy(capped);
+  });
+
+  it("carries x-amz-meta-mtime from Create through to the assembled object", async () => {
+    const uploadId = await createUpload({ headers: { "x-amz-meta-mtime": "1700000000" } });
+    const only = await uploadPart(uploadId, 1, "timestamped bytes");
+    expect(
+      (await complete(uploadId, [{ partNumber: 1, etag: only.headers.etag as string }])).status,
+    ).toBe(200);
+    const head = await call(session, { method: "HEAD", target: TARGET });
+    expect(head.headers["x-amz-meta-mtime"]).toBe("1700000000");
+    expect(head.headers["last-modified"]).toBe(formatHttpDate(1_700_000_000_000));
+    healthy();
+  });
+
+  it("picks up an upload another session started, because the manifest is a file", async () => {
+    const uploadId = await createUpload();
+    const first = await uploadPart(uploadId, 1, FIRST);
+    const last = await uploadPart(uploadId, 2, LAST);
+
+    // A new process, over the same store: nothing in memory survived.
+    const restarted = new S3Session({ [BUCKET]: driver });
+    const listed = await call(restarted, { target: `${TARGET}?uploadId=${uploadId}` });
+    expect(listed.status).toBe(200);
+    expect(partsOf(listed.text).map((part) => part.etag)).toEqual([
+      first.headers.etag,
+      last.headers.etag,
+    ]);
+    const completed = await complete(
+      uploadId,
+      [
+        { partNumber: 1, etag: first.headers.etag as string },
+        { partNumber: 2, etag: last.headers.etag as string },
+      ],
+      { on: restarted },
+    );
+    expect(completed.status).toBe(200);
+    const object = await call(restarted, { target: TARGET });
+    expect(Buffer.from(object.bytes).equals(Buffer.concat([FIRST, LAST]))).toBe(true);
+    healthy(restarted);
+  });
+
+  it("stays invisible while an upload is in flight", async () => {
+    await seed(driver, { "visible.txt": "seen" });
+    const uploadId = await createUpload();
+    await uploadPart(uploadId, 1, "staged bytes");
+
+    for (const query of ["list-type=2", "list-type=2&delimiter=/"]) {
+      const listing = await call(session, { target: `/${BUCKET}?${query}` });
+      expect(keysOf(listing.text), query).toEqual(["visible.txt"]);
+      expect(prefixesOf(listing.text).join(" "), query).not.toContain(MULTIPART_PREFIX);
+      expect(listing.text, query).not.toContain(uploadId);
+    }
+
+    // The staged part answers as an absent key does, by method — and survives.
+    const stagedKey = `/${BUCKET}${stagingPath(uploadId, "part-1")}`;
+    expect((await call(session, { target: stagedKey })).status).toBe(404);
+    expect((await call(session, { method: "PUT", target: stagedKey, body: "x" })).status).toBe(404);
+    expect((await call(session, { method: "DELETE", target: stagedKey })).status).toBe(204);
+    expect(await staged(uploadId)).toEqual(["part-1", "upload.json"]);
+    const listed = await call(session, { target: `${TARGET}?uploadId=${uploadId}` });
+    expect(partsOf(listed.text)).toHaveLength(1);
+    healthy();
+  });
+
+  it("treats a manifest it cannot read as an upload that is not there", async () => {
+    const uploadId = await createUpload();
+    const loop = createLoopback(driver);
+    for (const manifest of [
+      "not json at all",
+      "7",
+      "[]",
+      `{"key":"another.bin"}`,
+      `{"mtime":17}`,
+    ]) {
+      await loop.writeFile(stagingPath(uploadId, "upload.json"), manifest);
+      const reply = await call(session, { target: `${TARGET}?uploadId=${uploadId}` });
+      expect(reply.status, manifest).toBe(404);
+      expect(errorCodeOf(reply), manifest).toBe("NoSuchUpload");
+    }
+    healthy();
+  });
+
+  it("lists only well-formed part files, and sweeps everything else away", async () => {
+    const uploadId = await createUpload();
+    const part = await uploadPart(uploadId, 1, "a real part");
+    const loop = createLoopback(driver);
+    /* Nothing here is written by this gateway. It is what a store shared with
+       something else, or interrupted half way, can look like. */
+    await loop.writeFile(stagingPath(uploadId, "part-01"), "a padded number is not a part");
+    await loop.writeFile(stagingPath(uploadId, "part-20000"), "outside 1..10000");
+    await loop.writeFile(stagingPath(uploadId, "notes.txt"), "not a part either");
+    await loop.mkdir(stagingPath(uploadId, "part-2"), { recursive: true });
+
+    const listed = await call(session, { target: `${TARGET}?uploadId=${uploadId}` });
+    expect(partsOf(listed.text)).toEqual([
+      { partNumber: 1, etag: part.headers.etag, size: "a real part".length },
+    ]);
+
+    const aborted = await call(session, {
+      method: "DELETE",
+      target: `${TARGET}?uploadId=${uploadId}`,
+    });
+    expect(aborted.status).toBe(204);
+    // The subtree goes whole, directories and strangers included.
+    expect(await staged(uploadId)).toBeUndefined();
+    healthy();
+  });
+
+  it("answers NoSuchUpload for a part whose staging directory vanished under it", async () => {
+    /* The race the module docs name: the manifest read wins, and the write
+       finds the directory an `Abort` already removed. A part is never allowed
+       to recreate it, so the answer is about the upload, not about a key. */
+    const base = createMemoryDriver();
+    let vanished = false;
+    const racing: FsDriver = {
+      ...base,
+      open: async (path, flags, mode) => {
+        if (vanished && path.startsWith(`/${MULTIPART_PREFIX}/`) && flags === "w") {
+          throw fsError("ENOENT");
+        }
+        return await base.open(path, flags, mode);
+      },
+    };
+    const racy = new S3Session({ [BUCKET]: racing });
+    const uploadId = await createUpload({ on: racy });
+    vanished = true;
+    const late = await uploadPart(uploadId, 1, "too late", { on: racy });
+    expect(late.status).toBe(404);
+    expect(errorCodeOf(late)).toBe("NoSuchUpload");
+    expect(await staged(uploadId, racing)).toEqual(["upload.json"]);
+    healthy(racy);
+  });
+
+  it("reports a sweep it could not finish instead of throwing on the way out", async () => {
+    const seen: unknown[] = [];
+    const base = createMemoryDriver();
+    const hostile: FsDriver = {
+      ...base,
+      readdir: async (path, options) => {
+        if (path === `/${MULTIPART_PREFIX}`) {
+          throw fsError("EACCES");
+        }
+        return await base.readdir(path, options);
+      },
+    };
+    const guarded = new S3Session({ [BUCKET]: hostile }, { onError: (error) => seen.push(error) });
+    const uploadId = await createUpload({ on: guarded });
+    await expect(guarded.close()).resolves.toBeUndefined();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ code: "EACCES" });
+    // Nothing was swept, and the upload is still there to be aborted by hand.
+    expect(await staged(uploadId, hostile)).toEqual(["upload.json"]);
+    healthy(guarded);
+  });
+
+  it("takes a signed aws-chunked part, and stores nothing when a chunk is tampered with", async () => {
+    const secure = new S3Session(
+      { [BUCKET]: driver },
+      { credentials: CREDENTIALS, now: () => NOW },
+    );
+    const created = signHeaders({
+      method: "POST",
+      target: `${TARGET}?uploads`,
+      payloadHash: EMPTY_PAYLOAD_SHA256,
+    });
+    const create = await call(secure, {
+      method: "POST",
+      target: `${TARGET}?uploads`,
+      headerEntries: created.headers,
+    });
+    expect(create.status).toBe(200);
+    const uploadId = field(create.text, "UploadId");
+
+    const payload = ascii("a part sent as signed chunks");
+    const target = `${TARGET}?uploadId=${uploadId}&partNumber=1`;
+    const signedFor = (length: number): Signed =>
+      signHeaders({
+        method: "PUT",
+        target,
+        payloadHash: STREAMING_PAYLOAD,
+        headers: {
+          "content-encoding": "aws-chunked",
+          "x-amz-decoded-content-length": String(payload.byteLength),
+          "content-length": String(length),
+        },
+      });
+    const material = (signed: Signed): ChunkedSignature => ({
+      seed: signed.signature,
+      amzDate: signed.amzDate,
+      scope: signed.scope,
+      secretAccessKey: CREDENTIALS.secretAccessKey,
+    });
+    const draft = signedFor(0);
+    const length = chunkedBody([payload], { signature: material(draft) }).byteLength;
+    const signed = signedFor(length);
+    const body = chunkedBody([payload], { signature: material(signed) });
+
+    const part = await call(secure, {
+      method: "PUT",
+      target,
+      headerEntries: signed.headers,
+      body: oneChunk(body),
+    });
+    expect(part.status).toBe(200);
+    expect(await createLoopback(driver).readFile(stagingPath(uploadId, "part-1"))).toEqual(payload);
+
+    /* A tampered chunk on part 2: the seed is not the request's signature, so
+       the first chunk fails and the destination is never opened — the same
+       buffer-then-verify guarantee `PutObject` gives, and the same limit, that
+       a *later* chunk failing leaves the bytes already written. */
+    const secondTarget = `${TARGET}?uploadId=${uploadId}&partNumber=2`;
+    const secondDraft = signHeaders({
+      method: "PUT",
+      target: secondTarget,
+      payloadHash: STREAMING_PAYLOAD,
+      headers: {
+        "content-encoding": "aws-chunked",
+        "x-amz-decoded-content-length": String(payload.byteLength),
+        "content-length": "0",
+      },
+    });
+    const tampered = await call(secure, {
+      method: "PUT",
+      target: secondTarget,
+      headerEntries: secondDraft.headers,
+      body: oneChunk(
+        chunkedBody([payload], {
+          signature: {
+            seed: "0".repeat(64),
+            amzDate: secondDraft.amzDate,
+            scope: secondDraft.scope,
+            secretAccessKey: CREDENTIALS.secretAccessKey,
+          },
+        }),
+      ),
+    });
+    expect(tampered.status).toBe(403);
+    expect(errorCodeOf(tampered)).toBe("SignatureDoesNotMatch");
+    // Part 2 was never created, and part 1 is intact.
+    expect(await staged(uploadId)).toEqual(["part-1", "upload.json"]);
+    expect(await createLoopback(driver).readFile(stagingPath(uploadId, "part-1"))).toEqual(payload);
+    healthy(secure);
   });
 });
