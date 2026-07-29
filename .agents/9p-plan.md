@@ -20,13 +20,21 @@ is done when its checkbox is checked **and** its commit exists.
   kernel does local POSIX-lock bookkeeping; documented as such where the
   NFS `nolock` decision is documented.
 - **Server scope:** full `createP9Server` — TCP listener, unix-socket
-  listener, and an attach-a-duplex/fd mode used by `mount9p()`'s socketpair.
-- **Local mount path:** `mount -t 9p -o trans=fd,rfdno=N,wfdno=N` with a
-  socketpair, the child's stdio padded so the fd number matches its position
-  (the exact trick `src/fuse/mount.ts`'s root path uses — see
-  `.agents/environment.md` "fd mapping" caveat). No port, no socket path,
-  no exposure to other local users. TCP is for serving external clients
-  (VM guests: `trans=tcp` against the host).
+  listener, and an attach-a-duplex mode for embedders holding a stream.
+- **Local mount path (AMENDED in step 9, was `trans=fd`):** `trans=unix` —
+  the server listens on a 0600 socket in a 0700 `mkdtemp` dir and
+  `mount -t 9p <socketpath> <mnt> -o trans=unix,version=9p2000.L,...`.
+  Why the change: `trans=fd` needs a true socketpair, which Node cannot
+  create without native code (invariant-bound to the FUSE path only), and
+  `trans=unix` is the SAME kernel transport module (`net/9p/trans_fd.c`
+  registers tcp/unix/fd side by side, same maxsize, same machinery) with
+  the kernel's own docs blessing the shape. The no-exposure property the
+  socketpair was chosen for is preserved by the private directory.
+  Verifier round independently validated this against v6.12 sources.
+  `trans=fd` stays deferred (relay/embedder holding a descriptor). TCP is
+  for serving external clients (VM guests: `trans=tcp` against the host);
+  its source must be a dotted-quad IPv4 (`valid_ipaddr4()` — no
+  hostnames, no IPv6).
 - **Root:** mounting needs root on Linux (plain `mount(2)`), and Linux is
   the only platform with a client — Darwin has no v9fs. So 9P never appears
   on macOS, and `mountx/auto`'s Linux preference becomes
@@ -172,7 +180,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       with our field values (`tshark -d tcp.port==<p>,9p -T fields …`). This is
       the libnfs role: an implementation sharing none of our codecs. Record
       findings in the Log. Commit.
-- [ ] **9. Probe + mount + packaging** — `src/9p/probe.ts`:
+- [x] **9. Probe + mount + packaging** — `src/9p/probe.ts`:
       `p9ClientProbe()` — Linux only, root required, `9p` in
       `/proc/filesystems` OR module loadable (as root, `mount(8)` autoloads;
       treat "no module files at all" as unusable with a precise reason — this
@@ -363,3 +371,50 @@ deferred)
   (mutation-checked). tshark has no field for Rlerror's ecode, Tfsync's
   datasync, or Rreaddir entries; covered via message_data bytes and a
   hand-written unpacker.
+- 2026-07-29 step 9: `probe.ts`, `mount.ts`, `index.ts`, the `mountx/9p`
+  subpath export and obuild entry, 24 Tier-0 tests plus a probe-gated Tier-2
+  suite (skips as non-root; `pnpm test:9p:mount`, and added to `pnpm
+test:root`). **The plan's `trans=fd` decision became `trans=unix`.**
+  `net/9p/trans_fd.c` (v6.12) registers `tcp`, `unix` and `fd` off one file;
+  `p9_fd_create_unix()` takes the mount's _source_ argument as a socket path
+  and connects to it itself, and the kernel's own
+  `Documentation/filesystems/9p.rst` mounts exactly that way — so the
+  socketpair Node cannot make without native code buys nothing here: a
+  `mkdtemp` 0700 directory holding a 0600 socket has the same "no other local
+  user can reach it" property, and the code is symmetric with `mountNfs`'s
+  spawn. `trans=fd` deferred to a relay mode that already holds a descriptor
+  (docs note in step 12). `trans=tcp` is reachable by passing `port`/`host`.
+  Option defaults settled against the sources rather than guessed: `msize` is
+  the kernel's own `DEFAULT_MSIZE` (128 KiB + `P9_IOHDRSZ`, so the _payload_ is
+  a round 128 KiB), clamped to `MAX_SOCK_BUF` = 1 MiB — which is also
+  `P9Session`'s ceiling, so the two agree by construction; `access=client`,
+  which is v9fs's own default for 9P2000.L (`v9fs_session_init()`) and the same
+  posture as FUSE's `default_permissions` — `access=user` would mean _no_
+  permission checking anywhere, since this server makes no access decisions;
+  `cache=none`, because 9P has no invalidation channel at all (no
+  `notify_inval_inode` analogue), so any client caching is a bet that nothing
+  else changes the driver; `uname=nobody`/`aname=/` restated rather than left
+  to the kernel. `UNIX_PATH_MAX` (108) is checked before anything binds.
+  Comma hazard resolved the other way from NFS's `exportPath`: the socket path
+  and the mountpoint are separate argv elements, so only the four option
+  _values_ are refused. `umount -f` is real for 9P — v9fs implements
+  `.umount_begin` → `v9fs_session_begin_cancel()`. `src/fuse/exec.ts` gained an
+  optional `timeout` (kill, abandon, report `timedOut`) rather than the repo
+  growing a third copy of `run()`; `/proc/self/mounts` parsing _is_ duplicated,
+  deliberately, because importing `src/nfs/mount.ts` would drag the RFC 1813
+  codec into every 9P mount. Verifier PASS with three defects, closed in the
+  same step: no precondition on a `trans=tcp` source (`valid_ipaddr4()` takes a
+  dotted quad and nothing else — no hostname, no IPv6 — so a `host: "::1"` the
+  _server_ accepts mounted as `wrong fs type`; now `tcpSourceRefusal()`, pure
+  and tested); `p9MountOptions` emitted `target.port` verbatim, and
+  `trans_fd.c`'s `parse_opts()` silently _ignores_ a `port=` it cannot parse and
+  connects to 564, so a bad port is now a refusal (integer in [1, 65535]) rather
+  than a clamp; and connection adoption was an unserialized set-difference over
+  `server.clients`, now a per-server mutex over snapshot→mount→adopt plus a
+  loopback-peer filter when the `trans=tcp` source is loopback, with the
+  residual third-party race — and the fact that teardown closes a
+  caller-supplied server, and that such a server's session does not see
+  `readOnly` — documented on `MountP9Options.server`. In the same pass
+  `src/nfs/mount.ts`'s private `run()`/`describe()`/`errorMessage()` were
+  deleted: `exec.ts`'s `run()` grew stdout capture and is now the only copy, and
+  the NFS suite passes unchanged.

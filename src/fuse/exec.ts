@@ -1,10 +1,16 @@
 /**
  * Running one command to completion.
  *
- * Mounting is the one thing this library cannot do from JS alone, and both
- * ways of doing it end in a child process — `mount(8)` as root, `fusermount3`
- * as anyone. This is the small piece both of them share; `mount.ts` and
- * `fusermount.ts` are where the interesting decisions live.
+ * Mounting is the one thing this library cannot do from JS alone, and every way
+ * of doing it ends in a child process — `mount(8)` as root, `fusermount3` as
+ * anyone, `mount -t 9p` for the 9P transport. This is the small piece they
+ * share; `mount.ts`, `fusermount.ts` and `src/9p/mount.ts` are where the
+ * interesting decisions live.
+ *
+ * It lives under `src/fuse/` because that is where it was first needed and
+ * moving it would churn three files for a rename. `src/9p/mount.ts` imports it
+ * across the transport boundary the way `src/9p/session.ts` imports
+ * `src/fuse/flags.ts`: one implementation of a shared fact beats two.
  */
 
 import { spawn } from "node:child_process";
@@ -12,7 +18,11 @@ import { spawn } from "node:child_process";
 export interface SpawnResult {
   status: number | null;
   signal: NodeJS.Signals | null;
+  /** Whatever the child wrote to stdout, or `""` when stdout was not piped. */
+  stdout: string;
   stderr: string;
+  /** The deadline passed with the child still running. See {@link RunOptions.timeout}. */
+  timedOut?: boolean;
 }
 
 export interface RunOptions {
@@ -27,9 +37,25 @@ export interface RunOptions {
   stdio: Array<"ignore" | "pipe" | number>;
   /** Added to this process's environment, not replacing it. */
   env?: Record<string, string>;
+  /**
+   * Milliseconds before the child is written off. Default: wait forever.
+   *
+   * The deadline **settles** the promise rather than rejecting or waiting for
+   * the child, and that is the part that matters: a `umount(8)` blocked inside
+   * the kernel does not die on `SIGKILL`, so a run that waited for `close`
+   * would never return, and a caller that moved on without one would leave a
+   * child behind still holding the very mount it is about to escalate against.
+   * The kill is sent because usually it works; the result is reported either
+   * way, with {@link SpawnResult.timedOut} saying which happened.
+   *
+   * The FUSE paths do not pass one — their teardown deadline lives one level up,
+   * in `mount.ts` — so the behaviour with no `timeout` is exactly what it was
+   * before this option existed.
+   */
+  timeout?: number;
 }
 
-/** Run a command, resolving when it has exited. */
+/** Run a command, resolving when it has exited (or when its deadline passes). */
 export function run(
   command: string,
   args: readonly string[],
@@ -40,21 +66,57 @@ export function run(
       stdio: options.stdio,
       env: options.env === undefined ? process.env : { ...process.env, ...options.env },
     });
+    let stdout = "";
     let stderr = "";
+    // Both streams exist only when the corresponding `stdio` slot is `"pipe"`,
+    // which is why every reader here is optional: a caller that ignores stdout
+    // gets `""` rather than a listener on nothing.
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
       stderr += chunk;
     });
-    child.once("error", rejectPromise);
+    const timer =
+      options.timeout === undefined
+        ? undefined
+        : setTimeout(() => {
+            child.kill("SIGKILL");
+            // Let go of it completely: an unkillable child must not keep this
+            // process's event loop alive after the caller has given up on it.
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            child.unref();
+            resolvePromise({
+              status: null,
+              signal: null,
+              stdout,
+              stderr: stderr.trim(),
+              timedOut: true,
+            });
+          }, options.timeout);
+    timer?.unref();
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      rejectPromise(error);
+    });
     child.once("close", (status, signal) => {
-      resolvePromise({ status, signal, stderr: stderr.trim() });
+      clearTimeout(timer);
+      resolvePromise({ status, signal, stdout, stderr: stderr.trim(), timedOut: false });
     });
   });
 }
 
 /** How a command ended, for an error message. */
 export function describe(command: string, result: SpawnResult): string {
-  const how = result.signal === null ? `exit ${result.status}` : `signal ${result.signal}`;
+  const how =
+    result.timedOut === true
+      ? "no answer before the deadline, still running"
+      : result.signal === null
+        ? `exit ${result.status}`
+        : `signal ${result.signal}`;
   return result.stderr === "" ? `${command}: ${how}` : `${command}: ${how}: ${result.stderr}`;
 }
 

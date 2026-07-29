@@ -10,6 +10,7 @@ export default defineBuildConfig({
         "./src/cli/index.ts",
         "./src/fuse/index.ts",
         "./src/nfs/index.ts",
+        "./src/9p/index.ts",
         "./src/drivers/memory.ts",
         "./src/drivers/node-fs.ts",
         "./src/drivers/unstorage.ts",
