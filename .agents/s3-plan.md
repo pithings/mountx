@@ -149,7 +149,7 @@ Each step lists deliverables and what its verifier must confirm beyond
       pattern). Tests: `test/s3/server.test.ts` over real sockets with `fetch`.
       Verify: non-loopback bind without credentials refuses with the named
       error; built `dist/s3/*` imports no runtime dep; export map resolves.
-- [ ] **8. Tier-1 conformance column** — `test/s3/client.ts`: a signing JS
+- [x] **8. Tier-1 conformance column** — `test/s3/client.ts`: a signing JS
       client speaking to the session directly (no sockets, `test/nfs/client.ts`
       pattern) plus an `FsDriver`-shaped adapter over it;
       `test/s3/conformance.test.ts` runs `test/conformance.ts` as a column with
