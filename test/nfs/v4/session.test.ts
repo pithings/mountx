@@ -22,7 +22,7 @@
  *   session's own encoder instead.
  */
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../../src/drivers/memory.ts";
 import { fsError } from "../../../src/errors.ts";
 import {
@@ -201,6 +201,18 @@ import {
 } from "../../../src/nfs/v4/protocol.ts";
 import { Nfs4Session } from "../../../src/nfs/v4/session.ts";
 import { XdrWriter } from "../../../src/nfs/xdr.ts";
+import { createLoopback } from "../../../src/harness.ts";
+import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
+import { check as check3, NfsClient as Nfs3Client, nfsDriver } from "../v3/client.ts";
+import {
+  type Compound4reply,
+  fattr,
+  Nfs4Client,
+  type Nfs4ClientOptions,
+  OBJECT_ATTRS,
+  op as argop,
+  resFor as resFor4,
+} from "./client.ts";
 
 // ---------------------------------------------------------------------------
 // harness
@@ -3149,5 +3161,518 @@ describe("OPEN, the awkward paths", () => {
     ]);
     expect(second.compound.status).toBe(NFS4_OK);
     expect(resFor<Lock4res>(second, OP_LOCK).lockStateid!.seqid).toBe(lockStateid.seqid + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the Tier-1 client, over a real socket
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything above drives `Nfs4Session.handleCall` directly with encoded bytes.
+ * This block puts a socket in the middle: `createNfsServer` on one side,
+ * `./client.ts` on the other, and the record marking, the framing and the
+ * connection lifetime between them.
+ *
+ * Three things are only visible from here:
+ *
+ * - **Replay is a transport property.** The in-process test above proves the
+ *   slot cache; this one proves it survives being addressed by a *different
+ *   RPC xid* on a live connection, which is what a retransmission actually is.
+ * - **Both versions share one server.** The router, the `FileHandleTable` and
+ *   the driver are one object each, and the only way to show a v3 and a v4
+ *   conversation do not tread on each other is to hold both at once.
+ * - **Teardown terminates.** A server closed under a connected client, and a
+ *   client whose socket dies, are the two shapes a hang takes.
+ */
+describe("the v4 client over a real socket", () => {
+  const servers: NfsServer[] = [];
+  const clients: { close: () => void }[] = [];
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) {
+      client.close();
+    }
+    for (const server of servers.splice(0)) {
+      await server.close();
+    }
+  });
+
+  /** A listening server over `driver`, closed by the hook above. */
+  async function serve(driver: FsDriver = createMemoryDriver()): Promise<NfsServer> {
+    const server = createNfsServer(driver);
+    await server.listen();
+    servers.push(server);
+    return server;
+  }
+
+  /** A connected, established v4 client, closed by the hook above. */
+  async function connect(
+    server: NfsServer,
+    options: Partial<Nfs4ClientOptions> = {},
+  ): Promise<Nfs4Client> {
+    const client = await Nfs4Client.open({ ...options, port: server.port });
+    clients.push(client);
+    return client;
+  }
+
+  /** A connected v3 client that has mounted `/`, plus that root handle. */
+  async function connect3(server: NfsServer): Promise<{ client: Nfs3Client; root: Uint8Array }> {
+    const client = await Nfs3Client.connect({ port: server.port });
+    clients.push(client);
+    const mounted = check3(await client.mnt("/"), "mount");
+    return { client, root: mounted.fh! };
+  }
+
+  it("walks the handshake to a session, a slot table and a root filehandle", async () => {
+    const server = await serve();
+    const client = await connect(server);
+
+    expect(client.session.clientid).not.toBe(0n);
+    expect(client.session.sessionid).toHaveLength(16);
+    // The slot table is sized by the server's counter-offer, not by the offer:
+    // §18.36.3 makes every returned attribute the binding one.
+    expect(client.slots).toHaveLength(client.session.foreChanAttrs.maxrequests);
+    expect(client.slots.every((slot) => slot.seqid >= 0 && !slot.busy)).toBe(true);
+    expect(server.session.stats.procedures.get("NFS4:COMPOUND")).toBeGreaterThan(0);
+
+    const root = await client.rootFh();
+    expect(root.byteLength).toBeGreaterThan(0);
+    const attrs = await client.getattr(root, bitmapOf([FATTR4_TYPE]));
+    expect(attrs.type).toBe(NF4DIR);
+  });
+
+  it("takes a file through its whole life: create, write, read, size, close", async () => {
+    const driver = createMemoryDriver();
+    const server = await serve(driver);
+    const client = await connect(server);
+    const root = await client.rootFh();
+    await client.mkdir(root, "dir");
+
+    const file = await client.open("/dir/hello", "w+");
+    const written = await file.write(b("hello world"));
+    expect(written.count).toBe(11);
+    expect(written.committed).toBe(FILE_SYNC4);
+
+    file.position = 0n;
+    const read = await file.read(64);
+    expect(new TextDecoder().decode(read.data)).toBe("hello world");
+    expect(read.eof).toBe(true);
+
+    expect((await file.stat(bitmapOf([FATTR4_SIZE]))).size).toBe(11n);
+    const held = file.stateid;
+    await file.close();
+    // §18.2.4's invalid special stateid, and no I/O through the old one after.
+    expect(file.stateid.seqid).toBe(0xff_ff_ff_ff);
+    await expect(client.read(file.fh, 0n, 1, held)).rejects.toMatchObject({
+      status: NFS4ERR_BAD_STATEID,
+    });
+
+    // The bytes are on the driver, not merely in a reply.
+    expect(new TextDecoder().decode(await createLoopback(driver).readFile("/dir/hello"))).toBe(
+      "hello world",
+    );
+  });
+
+  it("resolves a path with PUTROOTFH and a LOOKUP chain, and reports a missing one", async () => {
+    const server = await serve();
+    const client = await connect(server);
+    const root = await client.rootFh();
+    const { fh: a } = await client.mkdir(root, "a");
+    const { fh: bee } = await client.mkdir(a, "b");
+    await client.mkdir(bee, "c");
+
+    const walked = await client.walk("/a/b/c", bitmapOf([FATTR4_TYPE, FATTR4_FILEID]));
+    expect(walked.attrs.type).toBe(NF4DIR);
+    // The same object the component-by-component route reaches.
+    const stepped = await client.lookup(await client.lookup(a, "b"), "c");
+    expect([...walked.fh]).toEqual([...stepped]);
+    expect(walked.attrs.fileid).toBe((await client.getattr(stepped)).fileid);
+
+    await expect(client.walk("/a/b/missing")).rejects.toMatchObject({
+      code: "ENOENT",
+      status: NFS4ERR_NOENT,
+    });
+  });
+
+  it("lists a directory by paging READDIR to eof", async () => {
+    const driver = createMemoryDriver();
+    for (let index = 0; index < 12; index++) {
+      await driver.mkdir(`/entry-${index}`);
+    }
+    const server = await serve(driver);
+    const client = await connect(server);
+    const root = await client.rootFh();
+
+    // A maxcount far below the whole listing, so eof is reached by paging.
+    const entries = await client.readdirAll(root, {
+      maxcount: 512,
+      dircount: 128,
+      attrRequest: bitmapOf([FATTR4_TYPE]),
+    });
+    expect(entries.map((entry) => entry.name).sort()).toEqual(
+      Array.from({ length: 12 }, (_unused, index) => `entry-${index}`).sort(),
+    );
+    expect(new Set(entries.map((entry) => entry.cookie)).size).toBe(12);
+    expect(entries.every((entry) => entry.attrs.values.type === NF4DIR)).toBe(true);
+  });
+
+  it("replays a cached reply byte for byte over the socket, without re-executing", async () => {
+    const { driver, counts } = counting(await populated());
+    const server = await serve(driver);
+    const client = await connect(server);
+
+    const ops = [
+      argop(OP_PUTROOTFH),
+      argop(OP_LOOKUP, { objname: "dir" }),
+      argop(OP_GETATTR, { attrRequest: bitmapOf([FATTR4_TYPE, FATTR4_SIZE]) }),
+    ];
+    const first = await client.compound(ops, { cachethis: true, tag: "replayed" });
+    expect(first.status).toBe(NFS4_OK);
+    const lstats = counts.get("lstat") ?? 0;
+    expect(lstats).toBeGreaterThan(0);
+
+    // The same session, slot and sequence ID under a *different* xid: the
+    // definition of a retransmission, and the only thing the server keys on.
+    const again = await client.resendLast();
+    expect(again.xid).not.toBe(first.xid);
+    expect(again.slot).toBe(first.slot);
+    expect(again.seqid).toBe(first.seqid);
+    expect([...again.body]).toEqual([...first.body]);
+    // Byte-identical alone would also pass for a server that re-ran the
+    // operations and got the same answer; the counter is what rules that out.
+    expect(counts.get("lstat")).toBe(lstats);
+
+    // The other half of the escape hatch: an explicitly named slot and
+    // sequence ID, built from scratch rather than resent.
+    const explicit = await client.compound(ops, {
+      slot: first.slot,
+      seqid: first.seqid,
+      cachethis: true,
+      tag: "replayed",
+    });
+    expect([...explicit.body]).toEqual([...first.body]);
+    expect(counts.get("lstat")).toBe(lstats);
+
+    // And the client's own bookkeeping never moved, so the next request is
+    // still in sequence.
+    expect(client.slots[first.slot!]!.seqid).toBe(first.seqid);
+    expect((await client.compound(ops)).status).toBe(NFS4_OK);
+  });
+
+  it("answers the retry of an uncached reply on the operation after SEQUENCE", async () => {
+    const { driver, counts } = counting(await populated());
+    const server = await serve(driver);
+    const client = await connect(server);
+
+    const first = await client.compound(
+      [argop(OP_PUTROOTFH), argop(OP_LOOKUP, { objname: "dir" })],
+      { cachethis: false },
+    );
+    expect(first.status).toBe(NFS4_OK);
+    const lstats = counts.get("lstat") ?? 0;
+
+    const retry = await client.resendLast();
+    // §2.10.6.1.3: the refusal never lands on the leading SEQUENCE itself.
+    expect((retry.resarray[0]!.res as Sequence4res).status).toBe(NFS4_OK);
+    expect((retry.resarray[1]!.res as Status4res).status).toBe(10_068); // RETRY_UNCACHED_REP
+    expect(retry.resarray).toHaveLength(2);
+    expect(counts.get("lstat")).toBe(lstats);
+  });
+
+  it("takes a byte-range lock that a second client can see and then cannot", async () => {
+    const server = await serve(await populated());
+    const holder = await connect(server);
+    const rival = await connect(server);
+
+    const file = await holder.open("/dir/file", "r+");
+    const locked = await file.lock({ locktype: WRITE_LT, offset: 0n, length: 4n });
+    expect(locked.status).toBe(NFS4_OK);
+
+    const denied = await rival.lockt(file.fh, {
+      owner: new TextEncoder().encode("rival"),
+      locktype: WRITE_LT,
+      offset: 2n,
+      length: 4n,
+    });
+    // §18.11.3 and §18.10.3: the conflict names the holder's real client ID.
+    expect(denied?.owner.clientid).toBe(holder.session.clientid);
+
+    await file.unlock({ locktype: WRITE_LT, offset: 0n, length: 4n });
+    expect(
+      await rival.lockt(file.fh, {
+        owner: new TextEncoder().encode("rival"),
+        locktype: WRITE_LT,
+        offset: 2n,
+        length: 4n,
+      }),
+    ).toBeUndefined();
+    await file.close();
+  });
+
+  it("serves a v3 client and a v4 client on one server, over one driver", async () => {
+    const server = await serve();
+    const v3 = await connect3(server);
+    const v4 = await connect(server);
+    const v3fs = createLoopback(nfsDriver(v3.client, v3.root));
+    const root = await v4.rootFh();
+
+    // One handle table behind both programs: MOUNT's root and PUTROOTFH's are
+    // the same bytes because they name the same driver path.
+    expect([...root]).toEqual([...v3.root]);
+
+    // v3 writes it, v4 reads it back through its own session.
+    await v3fs.writeFile("/shared.txt", "from v3");
+    const shared = await v4.walk("/shared.txt", bitmapOf([FATTR4_SIZE]));
+    expect(shared.attrs.size).toBe(7n);
+    const read = await v4.read(shared.fh, 0n, 32);
+    expect(new TextDecoder().decode(read.data)).toBe("from v3");
+
+    // ...and the other way, through a v4 OPEN this time.
+    const file = await v4.open("/from-v4.txt", "w");
+    await file.write(b("from v4"));
+    await file.close();
+    expect(new TextDecoder().decode(await v3fs.readFile("/from-v4.txt"))).toBe("from v4");
+
+    // Interleaved, on both sockets at once. Each round writes a file per
+    // version and reads the other version's back, so a reply delivered to the
+    // wrong connection could not go unnoticed.
+    for (let round = 0; round < 4; round++) {
+      const [, made] = await Promise.all([
+        v3fs.writeFile(`/v3-${round}.txt`, `three-${round}`),
+        (async () => {
+          const handle = await v4.open(`/v4-${round}.txt`, "w");
+          await handle.write(b(`four-${round}`));
+          await handle.close();
+          return handle;
+        })(),
+      ]);
+      expect(made.closed).toBe(true);
+      const [fromV3, fromV4] = await Promise.all([
+        v4.walk(`/v3-${round}.txt`, bitmapOf([FATTR4_SIZE])),
+        v3fs.readFile(`/v4-${round}.txt`),
+      ]);
+      expect(Number(fromV3.attrs.size)).toBe(`three-${round}`.length);
+      expect(new TextDecoder().decode(fromV4)).toBe(`four-${round}`);
+    }
+
+    // Both programs answered on the one socket pair, and the stats say so.
+    expect(server.session.stats.procedures.get("NFS4:COMPOUND")).toBeGreaterThan(0);
+    expect(server.session.stats.procedures.get("NFS:WRITE")).toBeGreaterThan(0);
+    expect(server.session.stats.procedures.get("MOUNT:MNT")).toBe(1);
+  });
+
+  it("destroys its session and leaves the next request without one", async () => {
+    const server = await serve();
+    const client = await connect(server);
+    const sessionid = client.session.sessionid;
+
+    const destroyed = await client.destroySession();
+    expect(destroyed.status).toBe(NFS4_OK);
+    expect(server.session.stats.dropped).toBe(0);
+
+    // The slot table went with it, so the next SEQUENCE on it has nowhere to
+    // land — §18.37.3 tells the client to expect exactly that.
+    const orphaned = await client.compound(
+      [
+        argop(OP_SEQUENCE, {
+          sessionid,
+          sequenceid: 1,
+          slotid: 0,
+          highestSlotid: 0,
+          cachethis: false,
+        }),
+        argop(OP_PUTROOTFH),
+      ],
+      { sequence: false },
+    );
+    expect(orphaned.status).toBe(10_052); // NFS4ERR_BADSESSION
+
+    // A fresh handshake on the same connection works, which is what a client
+    // that lost its session does next.
+    const again = await Nfs4Client.open({ port: server.port });
+    clients.push(again);
+    expect((await again.renew()).status).toBe(NFS4_OK);
+  });
+
+  it("closes the server under a live client without hanging", async () => {
+    const server = await serve();
+    const client = await connect(server);
+    expect((await client.renew()).status).toBe(NFS4_OK);
+    expect(server.connections).toBe(1);
+
+    // `close()` drops every connection rather than waiting for it: a mounted
+    // client never goes away politely. If that were not true this line would
+    // never return, which is the assertion.
+    await server.close();
+    expect(server.connections).toBe(0);
+
+    // And the client learns, rather than parking a promise forever.
+    await expect(client.renew()).rejects.toThrow();
+  });
+
+  it("keeps one compound's results addressable by opcode, whatever the shape", async () => {
+    const server = await serve(await populated());
+    const client = await connect(server);
+    // A single compound doing the whole of `stat("/dir/file")`, which is the
+    // reason NFSv4 has compounds at all: four operations, one round trip.
+    const reply: Compound4reply = await client.compound(
+      [
+        argop(OP_PUTROOTFH),
+        argop(OP_LOOKUP, { objname: "dir" }),
+        argop(OP_LOOKUP, { objname: "file" }),
+        argop(OP_GETFH),
+        argop(OP_GETATTR, { attrRequest: OBJECT_ATTRS }),
+      ],
+      { tag: "stat" },
+    );
+    expect(reply.status).toBe(NFS4_OK);
+    expect(reply.tag).toBe("stat");
+    // SEQUENCE plus the five above.
+    expect(reply.resarray).toHaveLength(6);
+    const attrs = (reply.resarray[5]!.res as Getattr4res).objAttributes!.values;
+    expect(attrs.size).toBe(5n);
+    expect(attrs.numlinks).toBe(1);
+    expect(server.session.handles.resolve((reply.resarray[4]!.res as Getfh4res).object!)).toBe(
+      "/dir/file",
+    );
+  });
+
+  it("covers the rest of the operation surface the conformance column will need", async () => {
+    const server = await serve(await populated());
+    const client = await connect(server);
+    const root = await client.rootFh();
+    const dir = await client.lookup(root, "dir");
+
+    // ACCESS, LOOKUPP, SECINFO.
+    expect((await client.access(dir)).access & ACCESS4_LOOKUP).toBe(ACCESS4_LOOKUP);
+    expect([...(await client.lookupp(dir))]).toEqual([...root]);
+    expect((await client.secinfo(dir, "file")).flavors.map((entry) => entry.flavor)).toEqual([
+      1, 0,
+    ]);
+
+    // CREATE makes everything that is not an ordinary file, and READLINK reads
+    // one of them back.
+    const { fh: made } = await client.mkdir(dir, "made", 0o750);
+    expect((await client.getattr(made, bitmapOf([FATTR4_MODE]))).mode).toBe(0o750);
+    await client.symlink(dir, "made-link", "./file");
+    expect(await client.readlink(await client.lookup(dir, "made-link"))).toBe("./file");
+
+    // LINK, RENAME, REMOVE — counted on the link count of the file all three
+    // touch, which is the one number that cannot be right by accident.
+    const file = await client.lookup(dir, "file");
+    await client.link(file, root, "hard");
+    expect((await client.getattr(file, bitmapOf([FATTR4_NUMLINKS]))).numlinks).toBe(2);
+    await client.rename(root, "hard", root, "moved");
+    await client.remove(root, "moved");
+    expect((await client.getattr(file, bitmapOf([FATTR4_NUMLINKS]))).numlinks).toBe(1);
+
+    // SETATTR out, GETATTR back, and VERIFY/NVERIFY comparing against both.
+    const set = await client.setattr(file, { mode: 0o640 });
+    expect(bitmapHas(set.attrsset, FATTR4_MODE)).toBe(true);
+    expect((await client.getattr(file, bitmapOf([FATTR4_MODE]))).mode).toBe(0o640);
+    const same = fattr(bitmapOf([FATTR4_MODE]), { mode: 0o640 });
+    const different = fattr(bitmapOf([FATTR4_MODE]), { mode: 0o600 });
+    expect(await client.verify(file, same)).toBe(NFS4_OK);
+    expect(await client.verify(file, different)).toBe(NFS4ERR_NOT_SAME);
+    expect(await client.verify(file, different, true)).toBe(NFS4_OK);
+    expect(await client.verify(file, same, true)).toBe(NFS4ERR_SAME);
+
+    // COMMIT, and the per-filesystem attributes that stand in for FSSTAT/FSINFO.
+    expect((await client.commit(file)).writeverf).toHaveLength(8);
+    const fs = await client.statfs(root);
+    expect(fs.maxread).toBeGreaterThan(0n);
+    expect(fs.maxname).toBeGreaterThan(0);
+    expect(fs.spaceTotal).toBeGreaterThan(0n);
+
+    // TEST_STATEID, OPEN_DOWNGRADE and FREE_STATEID around a real open.
+    const handle = await client.openAt(dir, "file", { access: OPEN4_SHARE_ACCESS_BOTH });
+    expect(await client.testStateid([handle.stateid])).toEqual([NFS4_OK]);
+    await handle.downgrade(OPEN4_SHARE_ACCESS_READ);
+    expect(handle.access).toBe(OPEN4_SHARE_ACCESS_READ);
+    // §18.38.3: the stateid is still held, so there is nothing to free.
+    expect(await client.freeStateid(handle.stateid)).toBe(NFS4ERR_LOCKS_HELD);
+    await handle.close();
+    await handle.close(); // idempotent, so a `finally` need not check
+  });
+
+  it("refuses a second establish() on a live session by name", async () => {
+    const server = await serve();
+    const client = await connect(server);
+    const sessionid = client.session.sessionid;
+
+    // The failure this replaces was silent: the same `client_owner4` reads as a
+    // retry to §18.35.4, so both handshake operations come back from the client
+    // ID's reply cache naming the session that already exists, and the
+    // RECLAIM_COMPLETE behind them lands on a slot table rebuilt from zero —
+    // NFS4ERR_RETRY_UNCACHED_REP, with nothing saying why.
+    await expect(client.establish()).rejects.toThrow(/already established/);
+    // And it is a refusal, not a half-attempt: the session is untouched.
+    expect([...client.session.sessionid]).toEqual([...sessionid]);
+    expect((await client.renew()).status).toBe(NFS4_OK);
+  });
+
+  it("establishes again after losing its session, as a reboot rather than a retry", async () => {
+    const server = await serve(await populated());
+    const client = await connect(server);
+    const first = client.session;
+
+    expect((await client.destroySession()).status).toBe(NFS4_OK);
+    expect(client.hasSession).toBe(false);
+
+    const second = await client.establish();
+    // A fresh `co_verifier` under the same `co_ownerid` is §18.35.4's reboot:
+    // the server discards the old record and mints a session rather than
+    // replaying the one that just went away.
+    expect([...second.sessionid]).not.toEqual([...first.sessionid]);
+    expect(client.hasSession).toBe(true);
+    // And it is a working session, not just a different number: the slot table
+    // was rebuilt, so the only sequence ID spent on it is the new handshake's
+    // RECLAIM_COMPLETE. The old table had spent two — the first handshake's
+    // RECLAIM_COMPLETE and the DESTROY_SESSION — so a table carried over would
+    // ask for 3 here and the server would answer SEQ_MISORDERED.
+    expect(client.slots[0]!.seqid).toBe(1);
+    const reply = await client.compound([argop(OP_PUTROOTFH), argop(OP_GETFH)], { tag: "after" });
+    expect(reply.status).toBe(NFS4_OK);
+    expect((reply.resarray[0]!.res as Sequence4res).sequenceid).toBe(2);
+    expect(server.session.handles.resolve(resFor4<Getfh4res>(reply, OP_GETFH).object!)).toBe("/");
+    expect((await client.walk("/dir", bitmapOf([FATTR4_TYPE]))).attrs.type).toBe(NF4DIR);
+  });
+
+  it("leaves no session behind when the handshake fails past CREATE_SESSION", async () => {
+    const server = await serve();
+    // `ca_maxoperations` 1 is a session that cannot carry SEQUENCE plus
+    // anything — so CREATE_SESSION succeeds and the RECLAIM_COMPLETE behind it
+    // is refused, which is the one failure that happens with `#session` already
+    // set (it needs a SEQUENCE to ride).
+    const client = await Nfs4Client.connect({ port: server.port, channel: { maxoperations: 1 } });
+    clients.push(client);
+    await expect(client.establish()).rejects.toMatchObject({ status: NFS4ERR_TOO_MANY_OPS });
+
+    expect(client.hasSession).toBe(false);
+    expect(() => client.session).toThrow(/no session/);
+    expect(client.slots).toEqual([]);
+    await expect(client.resendLast()).rejects.toThrow(/nothing to resend/);
+
+    // ...and the client is still usable: a retry with a workable offer works,
+    // which it could not if the failed attempt had left state behind.
+    const workable = await connect(server);
+    expect((await workable.renew()).status).toBe(NFS4_OK);
+  });
+
+  it("reads two clients sharing a co_ownerid as a reboot, not a replayed handshake", async () => {
+    const server = await serve();
+    const first = await connect(server, { ownerid: "shared" });
+    const second = await connect(server, { ownerid: "shared" });
+
+    // The default `co_verifier` differs per client, so the pair §18.35.4 reads
+    // as identity does too: the second client is the first having rebooted,
+    // which is a new session — not the reply-cache replay (and unexplained
+    // NFS4ERR_RETRY_UNCACHED_REP) that a shared verifier would have produced.
+    expect([...second.session.sessionid]).not.toEqual([...first.session.sessionid]);
+    expect((await second.renew()).status).toBe(NFS4_OK);
+    // And the first client's state was discarded with its record, which is what
+    // a reboot means and is a status that names the cause.
+    expect((await first.renew()).status).toBe(10_052); // NFS4ERR_BADSESSION
   });
 });
