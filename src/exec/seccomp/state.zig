@@ -31,9 +31,6 @@ pub const File = struct {
     /// The 9P fid, live while `open` is true.
     fid: u32 = 0,
     open: bool = false,
-    /// The supervisor-side `memfd` that was injected, kept so a `dup` of the
-    /// tracee's copy can be injected again. -1 once released.
-    srcfd: i32 = -1,
     /// How many `(pid, fd)` names point here.
     refs: u32 = 0,
     is_dir: bool = false,
@@ -182,14 +179,14 @@ pub const Tables = struct {
         self.orphans.clearRetainingCapacity();
     }
 
-    /// Drop a file entirely. The caller has already clunked its fid and closed
-    /// its placeholder.
-    pub fn destroy(self: *Tables, index: u32) void {
-        const entry = &self.files.items[index];
-        if (!entry.used) return;
-        self.allocator.free(entry.path);
-        entry.* = .{};
-    }
+    // There is deliberately no way to *destroy* a file record. Its 9P fid is
+    // released the moment nothing names it (`release()` in `trace.zig`), which
+    // is the resource that matters — a driver handle held open. The record
+    // itself is kept, because a descriptor this supervisor never saw bound may
+    // still resolve to it through `/proc` and need it re-opened, and answering
+    // that from an empty placeholder instead is exactly the silent wrong answer
+    // this design exists to remove. What it costs is a path and a struct per
+    // distinct open, for the length of one command.
 
     /// Which file is `(pid, fd)`, by name and then by object identity.
     ///

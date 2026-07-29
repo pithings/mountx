@@ -94,37 +94,36 @@ const SYS = linux.SYS;
 /// its filter with the tracee and would have suspended itself. See `notify.zig`.
 const TRAPPED = [_]u32{
     // descriptors
-    SYS.read,      SYS.write,        SYS.close,           SYS.lseek,
-    SYS.pread64,   SYS.pwrite64,     SYS.readv,           SYS.writev,
-    SYS.preadv,    SYS.pwritev,      SYS.preadv2,         SYS.pwritev2,
-    SYS.mmap,      SYS.getdents64,   SYS.fstat,           SYS.fsync,
-    SYS.fdatasync, SYS.ftruncate,    SYS.fchmod,          SYS.fchown,
-    SYS.fstatfs,   SYS.sendfile,     SYS.copy_file_range, SYS.splice,
-    SYS.fallocate,  SYS.dup2,         SYS.dup3,            SYS.close_range,
+    SYS.read,         SYS.write,      SYS.close,           SYS.lseek,
+    SYS.pread64,      SYS.pwrite64,   SYS.readv,           SYS.writev,
+    SYS.preadv,       SYS.pwritev,    SYS.preadv2,         SYS.pwritev2,
+    SYS.mmap,         SYS.getdents64, SYS.fstat,           SYS.fsync,
+    SYS.fdatasync,    SYS.ftruncate,  SYS.fchmod,          SYS.fchown,
+    SYS.fstatfs,      SYS.sendfile,   SYS.copy_file_range, SYS.splice,
+    SYS.fallocate,    SYS.dup2,       SYS.dup3,            SYS.close_range,
     // opening
-     SYS.open,         SYS.openat,          SYS.openat2,
-    SYS.creat,
+    SYS.open,         SYS.openat,     SYS.openat2,         SYS.creat,
     // metadata by path
-     SYS.stat,         SYS.lstat,           SYS.newfstatat,
-    SYS.statx,     SYS.access,       SYS.faccessat,       SYS.faccessat2,
-    SYS.statfs,    SYS.truncate,     SYS.chmod,           SYS.fchmodat,
-    SYS.chown,     SYS.lchown,       SYS.fchownat,        SYS.utime,
-    SYS.utimes,    SYS.futimesat,    SYS.utimensat,
-    // the namespace
-      SYS.mkdir,
-    SYS.mkdirat,   SYS.rmdir,        SYS.unlink,          SYS.unlinkat,
-    SYS.rename,    SYS.renameat,     SYS.renameat2,       SYS.link,
-    SYS.linkat,    SYS.symlink,      SYS.symlinkat,       SYS.readlink,
-    SYS.readlinkat, SYS.mknod,       SYS.mknodat,
-    // where a process thinks it is
-     SYS.getcwd,
-    SYS.chdir,     SYS.fchdir,
-    // extended attributes, refused rather than left to the real filesystem
-     SYS.setxattr,     SYS.lsetxattr,
-    SYS.fsetxattr, SYS.getxattr,     SYS.lgetxattr,       SYS.fgetxattr,
-    SYS.listxattr, SYS.llistxattr,   SYS.flistxattr,      SYS.removexattr,
-    SYS.lremovexattr, SYS.fremovexattr,
-    // lifecycle
+    SYS.stat,         SYS.lstat,      SYS.newfstatat,      SYS.statx,
+    SYS.access,       SYS.faccessat,  SYS.faccessat2,      SYS.statfs,
+    SYS.truncate,     SYS.chmod,      SYS.fchmodat,        SYS.chown,
+    SYS.lchown,       SYS.fchownat,   SYS.utime,           SYS.utimes,
+    SYS.futimesat,    SYS.utimensat,
+        // the namespace
+     SYS.mkdir,           SYS.mkdirat,
+    SYS.rmdir,        SYS.unlink,     SYS.unlinkat,        SYS.rename,
+    SYS.renameat,     SYS.renameat2,  SYS.link,            SYS.linkat,
+    SYS.symlink,      SYS.symlinkat,  SYS.readlink,        SYS.readlinkat,
+    SYS.mknod,        SYS.mknodat,
+        // where a process thinks it is
+       SYS.getcwd,          SYS.chdir,
+    SYS.fchdir,
+        // extended attributes, refused rather than left to the real filesystem
+          SYS.setxattr,   SYS.lsetxattr,       SYS.fsetxattr,
+    SYS.getxattr,     SYS.lgetxattr,  SYS.fgetxattr,       SYS.listxattr,
+    SYS.llistxattr,   SYS.flistxattr, SYS.removexattr,     SYS.lremovexattr,
+    SYS.fremovexattr,
+        // lifecycle
     SYS.exit_group,
 };
 
@@ -1737,17 +1736,14 @@ fn dispatch(call: *const Call, nr: i32) Reply {
         // `RENAME_WHITEOUT`, none of which 9P's `Trenameat` can express.
         // `EINVAL` is the documented "this filesystem does not support that",
         // and it is what makes `mv` fall back to the plain form.
-        SYS.renameat2 => if (call.word(4) != 0)
-            blk: {
-                const raw = call.path(1, &pathbuf) orelse break :blk .cont;
-                break :blk switch (resolveAt(call.pid, call.fd(0), raw, &joinbuf)) {
-                    .outside => .cont,
-                    .err => |e| fail(e),
-                    .inside => fail(linux.EINVAL),
-                };
-            }
-        else
-            handleRename(call, call.fd(0), 1, call.fd(2), 3),
+        SYS.renameat2 => if (call.word(4) != 0) blk: {
+            const raw = call.path(1, &pathbuf) orelse break :blk .cont;
+            break :blk switch (resolveAt(call.pid, call.fd(0), raw, &joinbuf)) {
+                .outside => .cont,
+                .err => |e| fail(e),
+                .inside => fail(linux.EINVAL),
+            };
+        } else handleRename(call, call.fd(0), 1, call.fd(2), 3),
         SYS.link => handleLink(call, linux.AT_FDCWD, 0, linux.AT_FDCWD, 1, 0),
         SYS.linkat => handleLink(call, call.fd(0), 1, call.fd(2), 3, call.word(4)),
         SYS.symlink => handleSymlink(call, 0, linux.AT_FDCWD, 1),

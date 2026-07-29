@@ -81,10 +81,6 @@ pub fn setListener(fd: i32) void {
     listener = fd;
 }
 
-pub fn listenerFd() i32 {
-    return listener;
-}
-
 // ---------------------------------------------------------------------------
 // The filter
 // ---------------------------------------------------------------------------
@@ -170,7 +166,7 @@ const ControlBuffer = extern struct {
     }
 
     fn payload(self: *ControlBuffer) *align(CMSG_ALIGNMENT) i32 {
-        return @alignCast(@ptrCast(&self.bytes[CMSG_DATA_OFFSET]));
+        return @ptrCast(@alignCast(&self.bytes[CMSG_DATA_OFFSET]));
     }
 };
 
