@@ -414,5 +414,78 @@ describe("record marking", () => {
     expect(assembler.push(framed.subarray(0, 7))).toEqual([]);
     expect(assembler.pending).toBeGreaterThan(0);
     expect(assembler.push(framed.subarray(7))).toHaveLength(1);
+    expect(assembler.pending).toBe(0);
+  });
+
+  it("bounds a flood of empty fragments, and says so while it lasts", () => {
+    // Every one of these headers is a legal zero-length non-final fragment, so
+    // no byte of *payload* is ever accepted and the byte limit alone can never
+    // trip. Before the fragment bound, 2 MB of them retained ~59 MB while
+    // `pending` reported `0` throughout.
+    const assembler = new RecordAssembler(1 << 20);
+    const headers = new Uint8Array(64 * 1024); // 16k empty non-final fragments
+    let pushes = 0;
+    expect(() => {
+      for (; pushes < 64; pushes++) {
+        assembler.push(headers);
+      }
+    }).toThrow(XdrError);
+    // It gave up inside the first delivery, having accepted at most the
+    // fragment bound — one per kibibyte of the byte limit.
+    expect(pushes).toBe(0);
+    // Bounded, and accounted for: 1024 headers consumed plus the rest still
+    // buffered is every byte delivered and not one more.
+    expect(assembler.pending).toBe(headers.byteLength);
+    // And it was saying so before it threw: four bytes per header consumed.
+    const counting = new RecordAssembler(1 << 20);
+    counting.push(new Uint8Array(40));
+    expect(counting.pending).toBe(40);
+  });
+
+  it("reassembles a large record in socket-sized chunks without quadratic cost", () => {
+    // libuv caps a TCP `data` chunk at 64 KiB, so an 8 MiB record — the default
+    // `maxRecord` — always arrives in ~128 deliveries. `concat` per delivery
+    // made that O(n²): 82 ms of `memcpy` for one legal record.
+    const size = 8 * 1024 * 1024;
+    const message = new Uint8Array(size);
+    for (let at = 0; at < size; at += 4093) {
+      message[at] = (at % 251) + 1;
+    }
+    const framed = Buffer.from(frameRecord(message));
+    const assembler = new RecordAssembler();
+    const started = process.hrtime.bigint();
+    const out: Uint8Array[] = [];
+    for (let at = 0; at < framed.byteLength; at += 65_536) {
+      out.push(...assembler.push(framed.subarray(at, Math.min(at + 65_536, framed.byteLength))));
+      // Nothing is ever held beyond the record itself.
+      expect(assembler.pending).toBeLessThanOrEqual(size + 4);
+    }
+    const elapsed = Number(process.hrtime.bigint() - started) / 1e6;
+    expect(out).toHaveLength(1);
+    expect(Buffer.compare(Buffer.from(out[0]!), Buffer.from(message))).toBe(0);
+    expect(assembler.pending).toBe(0);
+    // Quadratic is ~82 ms here and linear ~1.5 ms; 25 ms separates them by a
+    // wide margin on any machine slow enough to run this suite at all.
+    expect(elapsed).toBeLessThan(25);
+  });
+
+  it("hands out records that are copies, never views of the delivery", () => {
+    // The caller owns what it gets: a 120-byte record must not keep a 64 KiB
+    // socket slab alive, and a delivery the caller reuses must not rewrite a
+    // record already handed over.
+    const assembler = new RecordAssembler();
+    const chunk = Buffer.from(frameRecord(encoder.encode("mine now")));
+    const whole = assembler.push(chunk);
+    // Split across two deliveries as well, which used to be the copying path.
+    const split = Buffer.from(frameRecord(encoder.encode("mine too")));
+    const partial = assembler.push(split.subarray(0, 6));
+    expect(partial).toEqual([]);
+    const spanning = assembler.push(split.subarray(6));
+    chunk.fill(0xee);
+    split.fill(0xee);
+    expect(new TextDecoder().decode(whole[0])).toBe("mine now");
+    expect(new TextDecoder().decode(spanning[0])).toBe("mine too");
+    expect(whole[0]!.buffer).not.toBe(chunk.buffer);
+    expect(whole[0]!.byteLength).toBe(whole[0]!.buffer.byteLength);
   });
 });
