@@ -125,8 +125,14 @@ export function createLoopback(driver: FsDriver): Loopback {
       const bytes = typeof data === "string" ? encoder.encode(data) : data;
       const handle = await loopback.open(path, "w", 0o666);
       try {
-        if (bytes.byteLength > 0) {
-          await handle.write(bytes, 0, bytes.byteLength, 0);
+        let written = 0;
+        while (written < bytes.byteLength) {
+          const remaining = bytes.byteLength - written;
+          const { bytesWritten } = await handle.write(bytes, written, remaining, written);
+          if (!Number.isInteger(bytesWritten) || bytesWritten <= 0 || bytesWritten > remaining) {
+            throw fsError("EIO", { syscall: "write", path });
+          }
+          written += bytesWritten;
         }
       } finally {
         await handle.close();
