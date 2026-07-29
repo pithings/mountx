@@ -10,7 +10,8 @@ is done when its checkbox is checked **and** its commit exists.
   `test/9p/`. Identifiers use a `P9` prefix (`P9Session`, `createP9Server`,
   `mount9p`, `p9ClientProbe`) — mirrors the kernel's own `p9_*` naming.
   The `mountx/auto` options escape hatch is the quoted key `"9p"`.
-- **Version:** 9P2000.L only, and the wire string is **`"9P2000.L"`** —
+- **Version (AMENDED in step 4, was "`9p2000.L` only" with that spelling on
+  the wire):** 9P2000.L only, and the wire string is **`"9P2000.L"`** —
   capital P, what `p9_client_version()` sends; `9p2000.L` is only the mount
   option spelling (`fs/9p/v9fs.c`). Any other `Tversion` string answers
   `Rversion` with `"unknown"` per spec. Legacy 9P2000 opcodes
@@ -19,8 +20,10 @@ is done when its checkbox is checked **and** its commit exists.
   reports unlocked. Honest for a single-client loopback server — the client
   kernel does local POSIX-lock bookkeeping; documented as such where the
   NFS `nolock` decision is documented.
-- **Server scope:** full `createP9Server` — TCP listener, unix-socket
-  listener, and an attach-a-duplex mode for embedders holding a stream.
+- **Server scope (AMENDED in step 9, was "an attach-a-duplex/fd mode used by
+  `mount9p()`'s socketpair"):** full `createP9Server` — TCP listener,
+  unix-socket listener, and an attach-a-duplex mode for embedders holding a
+  stream; `mount9p()` uses the unix-socket listener, not a socketpair.
 - **Local mount path (AMENDED in step 9, was `trans=fd`):** `trans=unix` —
   the server listens on a 0600 socket in a 0700 `mkdtemp` dir and
   `mount -t 9p <socketpath> <mnt> -o trans=unix,version=9p2000.L,...`.
@@ -130,7 +133,7 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
 - [x] **4. Session core + JS client** — `src/9p/session.ts`: `P9Session
 (driver, options)` with `handleCall(bytes): Promise<Uint8Array | null>`
       shape mirroring `NfsSession`; this step implements version negotiation
-      (msize = min(client, cap 1 MiB); reject non-`9p2000.L`), attach (aname
+      (msize = min(client, cap 1 MiB); reject non-`9P2000.L`), attach (aname
       ""/"/" → root fid; record n_uname for the `#claim`-style ownership
       pattern the other sessions use), walk (MAXWELEM, partial-walk Rwalk
       semantics: error only when the first element fails), clunk, getattr
@@ -180,17 +183,21 @@ tag[2]` header read/write, `framesFrom()` reassembly over a byte stream
       with our field values (`tshark -d tcp.port==<p>,9p -T fields …`). This is
       the libnfs role: an implementation sharing none of our codecs. Record
       findings in the Log. Commit.
-- [x] **9. Probe + mount + packaging** — `src/9p/probe.ts`:
-      `p9ClientProbe()` — Linux only, root required, `9p` in
-      `/proc/filesystems` OR module loadable (as root, `mount(8)` autoloads;
-      treat "no module files at all" as unusable with a precise reason — this
-      host's state). Import-light like `src/nfs/probe.ts` (auto must reach it
-      without pulling the codec). `src/9p/mount.ts`: `mount9p(driver,
-mountpoint, options)` — socketpair, spawn `mount -t 9p -o trans=fd,
-rfdno=N,wfdno=N,version=9p2000.L,msize=…` with stdio-padded fd; no mount
+- [x] **9. Probe + mount + packaging** (body amended post-hoc to match the
+      step-9 amendment) — `src/9p/probe.ts`:
+      `p9ClientProbe()` — Linux only, root required, and `9p` actually listed
+      in `/proc/filesystems`, full stop; a module tree changes nothing about
+      `usable` and only selects the reason sentence printed when `9p` is
+      missing (`modprobe 9p` is a real suggestion with one, a flat "no client
+      at all" without one). Import-light like `src/nfs/probe.ts` (auto must
+      reach it without pulling the codec). `src/9p/mount.ts`: `mount9p(driver,
+mountpoint, options)` — a unix-socket server on a 0600 socket in a 0700
+      `mkdtemp` directory, spawn `mount -i -t 9p -o trans=unix,
+version=9p2000.L,msize=… -- <socketpath> <mnt>`; no mount
       stacking (both directions); teardown deadline + `umount -f` escalation +
       abandoned-child rule; mount-table tri-state (`/proc/self/mounts`);
-      unmount detection = EOF on the socketpair. `src/9p/index.ts` re-exports.
+      unmount detection = `P9Connection.closed` (session destroyed _and_ the
+      stream closed). `src/9p/index.ts` re-exports.
       `package.json` exports + obuild config for `mountx/9p`. Tier-2
       `test/9p/mount.test.ts`, probe-gated (expected to RUN on this host now —
       see step 10), added to `pnpm test:root`'s file list with the skip
@@ -226,7 +233,7 @@ rfdno=N,wfdno=N,version=9p2000.L,msize=…` with stdio-padded fd; no mount
       "Shipped since v1" entry + deferred items (bench column pending a
       mounting host; witnessing status from step 10; multi-client lock table
       if TCP serving grows real users). Commit.
-- [ ] **13. Final sweep** — `pnpm matrix` (9p conformance column present, or
+- [x] **13. Final sweep** — `pnpm matrix` (9p conformance column present, or
       Log why not), `pnpm fmt`, full `pnpm test`, then one independent opus
       review subagent over `git diff main...feat/9p` for invariant violations
       and drift between docs and code. Fix, commit. Then open a PR from
@@ -483,3 +490,15 @@ test:root`). **The plan's `trans=fd` decision became `trans=unix`.**
   genuine undocumented leak, the SIGKILL-orphaned mkdtemp socket dir).
   All fixed and orchestrator-spot-checked. Perf-claim sweep was clean
   both rounds: constants stated as facts, no speeds anywhere.
+- 2026-07-29 step 13: matrix gained the 9P column (185 passed / 4 skipped
+  across three targets — more cases land than NFS's 122, the handles
+  capability at work), full `pnpm matrix` re-run with a real FUSE mount.
+  The whole-branch reviewer HELD on 15 findings — every one prose: the
+  worst was `MountP9Options.aname`'s JSDoc denying the subtree-export
+  feature the session implements (and the docs repeating it); the rest
+  were docs/plan drift (step-9 body still describing trans=fd, the CLI
+  page inventing a fallback, dialect-spelling slips) plus a pre-existing
+  literal NUL byte in test/matrix.ts that made its own diff invisible to
+  git. All fixed, zero code-behavior changes, invariants sweep clean
+  (zero-deps in dist, one errno table, one O_* crossing, NUL-free,
+  no perf claims). All 13 steps done; PR opened from feat/9p to main.

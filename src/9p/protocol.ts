@@ -340,7 +340,7 @@ export function readRauth(reader: P9Reader): Rauth {
  * `Tattach` — introduce a user and bind `fid` to the root of `aname`.
  *
  * The kernel's format is `"ddss?u"`: the `?` means "only in 9P2000.u and
- * 9P2000.L", and since `9p2000.L` is the only dialect served, `n_uname` is
+ * 9P2000.L", and since `9P2000.L` is the only dialect served, `n_uname` is
  * always present. In v9fs's default `access=user` mode one of these arrives per
  * user that touches the mount, which is why `nUname` matters and `uname` mostly
  * does not.

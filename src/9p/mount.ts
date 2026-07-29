@@ -234,10 +234,11 @@ export interface MountP9Options extends P9ServerOptions {
   /**
    * The `aname=` — the tree to attach to. Default `"/"`.
    *
-   * `P9Session` serves its driver's root and nothing else, and accepts `""` (the
-   * kernel's `V9FS_DEFANAME`) or `"/"` for it; any other name is answered
-   * `ENOENT`, so there is no subtree export to be had this way. Mount a driver
-   * rooted where you want it instead.
+   * `""` (the kernel's `V9FS_DEFANAME`) and `"/"` both mean the driver's root.
+   * Any other name attaches at **that subtree**, if it exists and is a
+   * directory: `P9Session` resolves it against the root (`src/path.ts` clamps
+   * `..`, so no `aname` reaches outside), answers `ENOENT` when it is not there
+   * and `ENOTDIR` when it is not a directory.
    */
   aname?: string;
   /** Extra `-o` options, appended verbatim — last, so they win. */

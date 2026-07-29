@@ -15,7 +15,7 @@
  *
  * Nothing is guessed and nothing is borrowed from a host header: this is a
  * server for the Linux client, so the values that matter are the ones that
- * client compiles in. `9p2000.L` is the only dialect served, but the legacy
+ * client compiles in. `9P2000.L` is the only dialect served, but the legacy
  * 9P2000 message types are transcribed too — a session has to *recognize* them
  * to refuse them with `Rlerror ENOTSUP` rather than answer a walk with silence.
  */

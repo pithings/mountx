@@ -32,7 +32,7 @@ landing:
       // A driver is any object with stat(), readdir() and open().
       const driver = createMemoryDriver();
 
-      // FUSE on Linux (no root needed), NFSv3 on macOS.
+      // FUSE (no root needed) then 9P on Linux, NFSv3 on macOS.
       await using mounted = await mount(driver, "/mnt/point");
 
       mounted.transport; // "fuse" | "9p" | "nfs"
