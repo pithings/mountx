@@ -186,6 +186,86 @@ the one `trans=unix`/`tcp`/`fd` live in, and it is pinned by
   `D` state does die), then a plain `umount`. Same class as the `spawn(…, { cwd })`
   hazard already documented, and both are avoided by letting `sh -c` do the exec.
 
+## VM guests (verified 2026-07-29, this Linux host)
+
+QEMU `10.2.2` (`qemu-system-x86-core`, installed via dnf). The guest was the
+stock **Alpine 3.21.3 `virt` ISO**, kernel `6.12.13-0-virt`, booted with
+`-nographic` — it reaches a serial login on `/dev/ttyS0` in under 90 s and needs
+no extraction or custom initramfs, so the whole thing is scriptable by driving
+the console. `test/…` has no VM tier; the harnesses used here live only in the
+session scratchpad, and this section is the record.
+
+- **`/dev/kvm` is not reachable as `dev`** (mode `0660`, group `993`, which this
+  uid is not in), so QEMU was run under `sudo`. Nothing about the demo needs
+  root on a normal desktop, where the user is in the `kvm` group — this is a
+  container artefact, not a property of the recipe.
+- **`/dev/net/tun` does not exist and cannot be created** (`CapEff` is empty and
+  the device node is absent, so even `sudo ip tuntap add` answers
+  `open: No such file or directory`). This is why the QEMU column exists and the
+  Firecracker one does not: QEMU's user-mode networking is pure userspace.
+- **QEMU's slirp routes `10.0.2.2` to the host's loopback**, so a server left on
+  its default `127.0.0.1` bind is reachable from the guest with **no
+  `allowRemote`, no tap, no bridge and no host-side `ip` command**. Verified for
+  both transports below. The guest's own address is `10.0.2.15/24`; the host is
+  on-link, so **no default route is needed for the mount** — `ip addr add
+10.0.2.15/24 dev eth0 && ip link set eth0 up` is the whole client-side network
+  setup, and was verified as the minimal sequence.
+- **9P over `trans=tcp` works with three options and no `modprobe`.**
+  `mount -t 9p -o trans=tcp,port=5640,version=9p2000.L 10.0.2.2 /mnt/x` succeeds
+  — `mount(8)` autoloads `v9fs`/`9pnet_fd` — and leaves
+
+  ```
+  10.0.2.2 /mnt/x 9p rw,relatime,access=client,trans=tcp,port=5640 0 0
+  ```
+
+  in `/proc/self/mounts`. Note the absent `msize=`, the same proof-by-omission as
+  the local mount above; asking for `msize=1048576` makes it appear. Witnessed
+  through the mount: `ls`, read, write, `mkdir -p`, 16 MiB `dd` both directions,
+  `mv` across directories, `rm`, `df -T` (reports type `9p`) and `umount`.
+
+- **NFSv4.1 is verified against a real Linux kernel client for the first time**,
+  which the NFS section of `AGENTS.md` had listed as untested for want of a
+  `mount.nfs` on this host — a VM guest supplies one.
+  `mount -t nfs4 -o vers=4.1,addr=10.0.2.2,clientaddr=10.0.2.15,port=2049,proto=tcp,sec=sys,hard 10.0.2.2:/ /mnt/x`
+  succeeds against `createNfsServer()` on its default loopback bind, and leaves
+
+  ```
+  10.0.2.2:/ /mnt/x nfs4 rw,relatime,vers=4.1,rsize=1047672,wsize=1047532,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=10.0.2.15,local_lock=none,addr=10.0.2.2 0 0
+  ```
+
+  Same workload as above passed: `ls`, read, write, `mkdir -p`, 16 MiB `dd`,
+  rename, unlink, `umount`. No `rpcbind` and no MOUNT program are involved. This
+  is still **not** a test-suite column — no `mount.nfs` exists on the host
+  itself, so a Tier-2 v4.1 file would have to carry a VM, which is a bigger
+  decision than this note.
+
+- **`node src/…` runs the 9P server directly, but not the NFS one.** Node 24's
+  type stripping refuses `src/nfs/v4/state.ts` (`ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`
+  — a TS parameter property). `pnpm build` and importing `dist/nfs/index.mjs` is
+  the way to drive NFS from a scratch script.
+
+### Firecracker — read, not run
+
+Firecracker `v1.16.1` and its published guest kernels were downloaded and
+inspected; **no microVM was booted**, because every Firecracker network is a tap
+device and this container has no `/dev/net/tun`.
+
+- **There is no 9P route into a Firecracker guest, by two independent facts.**
+  It emulates only virtio-net/block/vsock (plus balloon and rng) — there is no
+  `virtio-9p` device — and both the in-repo `resources/guest_configs/*.config`
+  and the config shipped beside the CI kernel binary
+  (`firecracker-ci/v1.10/x86_64/vmlinux-6.1.102.config`) carry
+  `# CONFIG_NET_9P is not set`.
+- **Its kernel does have NFS, and only the v4 half**: `CONFIG_NFS_FS=y`,
+  `CONFIG_NFS_V4=y`, `CONFIG_NFS_V4_1=y`, `CONFIG_ROOT_NFS=y`, and
+  `# CONFIG_NFS_V3 is not set`. So `mountx/nfs` at `version: "4.1"` is the only
+  transport that can reach a stock Firecracker guest, which is what
+  `docs/1.guide/5.vms.md` documents.
+- **QEMU's own `virtio-9p` cannot be pointed at an external server.** Every
+  `-fsdev` backend is directory-based (`-fsdev sock,…` → `fsdriver sock not
+found`), so there is no way to hand a mountx socket to `virtio-9p` and TCP is
+  genuinely the route, not a fallback.
+
 ## rclone, the S3 oracle (installed 2026-07-29)
 
 - **`~/.local/bin/rclone`, rclone v1.74.4** (linux/amd64, go1.26.5, statically
