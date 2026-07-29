@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
 import { exec, probeExec } from "../../src/exec/index.ts";
 import { usernsExecProbe } from "../../src/exec/probe.ts";
-import { cwdRefusal } from "../../src/exec/userns.ts";
+import { cwdRefusal, usernsIdMap } from "../../src/exec/userns.ts";
 
 const here = probeExec();
 
@@ -112,6 +112,41 @@ describe("cwdRefusal", () => {
   it("compares resolved paths, not the strings it was handed", () => {
     expect(cwdRefusal("/mnt/x/../x/sub", "/mnt/x")).toContain("deadlocks");
     expect(cwdRefusal("/mnt/x/..", "/mnt/x")).toBeUndefined();
+  });
+});
+
+describe("usernsIdMap", () => {
+  const map = usernsIdMap(1000, 2000);
+
+  it("answers 0 for every driver-side id, because that is the whole id space", () => {
+    // `unshare -r` maps one uid and one gid, both 0. Anything else on the wire
+    // is `INVALID_UID` to the kernel, and an inode carrying one cannot be
+    // unlinked, renamed, linked or opened for writing — the VFS refuses in
+    // `may_delete()`/`may_linkat()` (`EOVERFLOW`) and `inode_permission()`
+    // (`EACCES`) without ever asking the server. So the invoking user's own id
+    // is not a special case: there is nowhere else for any id to go.
+    expect(map.toMount(1000, false)).toBe(0);
+    expect(map.toMount(2000, true)).toBe(0);
+    expect(map.toMount(0, false)).toBe(0);
+    // Including the one the kernel itself would have picked for an unmapped id:
+    // `nobody` is unmapped in here too, so answering it reinstates the bug.
+    expect(map.toMount(65_534, false)).toBe(0);
+    expect(map.toMount(65_534, true)).toBe(0);
+  });
+
+  it("reads 0 back as the invoking user, uid and gid told apart", () => {
+    // Which is what lets the session see the command as the process it already
+    // is, and leave the files it creates owned by whoever ran mountx.
+    expect(map.fromMount(0, false)).toBe(1000);
+    expect(map.fromMount(0, true)).toBe(2000);
+  });
+
+  it("is total, and leaves an id it does not know alone", () => {
+    // Nothing can produce one — `chown_common()` rejects an unmapped id with
+    // `EINVAL` before FUSE is consulted — but the map still sits on the encode
+    // path of every reply and may not throw.
+    expect(map.fromMount(4242, false)).toBe(4242);
+    expect(map.fromMount(65_534, true)).toBe(65_534);
   });
 });
 

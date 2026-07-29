@@ -44,7 +44,7 @@ import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { FuseSession, type FuseSessionOptions } from "../fuse/session.ts";
+import { FuseSession, type FuseIdMap, type FuseSessionOptions } from "../fuse/session.ts";
 import type { FsDriver } from "../types.ts";
 import { usernsExecProbe } from "./probe.ts";
 
@@ -73,6 +73,55 @@ const LEN_SIZE = 4;
  * only process that can reach it is the one this call created it for.
  */
 const DEFAULT_MOUNT_OPTIONS: readonly string[] = [];
+
+/**
+ * The id map for a mount made inside `unshare -U -r`, whose whole id space is
+ * `{0}`.
+ *
+ * **Why any translation is needed.** `-r` writes exactly one line into
+ * `/proc/self/uid_map` and one into `gid_map`: `0 <invoking id> 1`. So the
+ * namespace knows one uid and one gid, both 0, and every other number in
+ * existence is unmapped in it. The driver, meanwhile, reports host ids — every
+ * driver in this repository owns its files as `process.getuid()`, because that
+ * is who created them.
+ *
+ * Put a host id on the wire unchanged and `make_kuid(fc->user_ns, 1000)` yields
+ * `INVALID_UID`. The mount then looks fine and is not: `stat`, `read` and
+ * `readdir` all work, while the VFS refuses, without ever consulting the
+ * server, to `unlink`, `rmdir`, `rename` or `link` the inode (`-EOVERFLOW`,
+ * from `may_delete()`/`may_linkat()`'s "Inode writeback is not safe when the
+ * uid or gid are invalid") or to open it for writing (`-EACCES`, from
+ * `inode_permission()`'s `HAS_UNMAPPED_ID()`). Witnessed as `rm: cannot remove
+ * '…': Value too large for defined data type` on every entry the driver held
+ * before the mount; entries the *command* created escaped it only because the
+ * session's ownership hand-off had already chowned them to the caller's `0`.
+ *
+ * **Outbound is the constant `0`, and there is no other choice.** `toMount` has
+ * to land in the set of ids the namespace maps, and that set has one element.
+ * Answering `65534`/`nobody` for ids that are not the invoking user's — the
+ * rendering the kernel itself would pick — reintroduces the bug verbatim, since
+ * `nobody` is unmapped in here too. A driver over a tree with mixed ownership
+ * therefore presents as uniformly root-owned inside the namespace, which is the
+ * truthful rendering of a place with exactly one identity in it and no
+ * `allow_other` to let a second one in.
+ *
+ * **Inbound maps `0` back to the invoking user**, so the session's ownership
+ * hand-off sees the caller as the process it already is and skips the chown
+ * entirely, leaving a file the command created owned in the driver by whoever
+ * is running mountx rather than by a uid 0 that means nothing out here. Any
+ * other id is returned unchanged: nothing can produce one — `chown_common()`
+ * rejects an unmapped id with `EINVAL` long before FUSE is asked — and a map
+ * on this path still has to be total.
+ *
+ * Pure, and exported for the Tier-0 test: the alternative way to check it costs
+ * a namespace, a mount and a subprocess.
+ */
+export function usernsIdMap(uid: number, gid: number): FuseIdMap {
+  return {
+    toMount: () => 0,
+    fromMount: (id, group) => (id === 0 ? (group ? gid : uid) : id),
+  };
+}
 
 /**
  * Where the relay is, relative to this module, in each layout it can be in.
@@ -227,7 +276,14 @@ export async function execUserns(
       throw new Error(`mountx: ${refusal}`);
     }
 
-    session = new FuseSession(driver, options);
+    // The id map is this mechanism's, not the caller's business — `-r` is not
+    // negotiable here (see the `unshare` arguments below), so what it maps is a
+    // fact about the mount rather than a preference. A caller who has arranged
+    // a wider mapping some other way can still say so.
+    session = new FuseSession(driver, {
+      ...options,
+      idmap: options.idmap ?? usernsIdMap(process.getuid?.() ?? 0, process.getgid?.() ?? 0),
+    });
     const attachedSession = session;
     server = net.createServer();
     /** Resolves once the relay has connected and the session is wired to it. */
