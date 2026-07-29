@@ -214,7 +214,7 @@ rfdno=N,wfdno=N,version=9p2000.L,msize=…` with stdio-padded fd; no mount
       override answers darwin/win32 from any host). CLI: `-t 9p` accepted,
       stale-mount cleanup recognizes a `9p` entry at the mountpoint (root-only
       route → prints the sudo line, like Linux+NFS). Commit.
-- [ ] **12. Docs + agent docs** — **sonnet subagent(s).** `docs/`
+- [x] **12. Docs + agent docs** — **sonnet subagent(s).** `docs/`
       (standalone project, edit files only — no install needed to write):
       new `docs/2.transports/` 9P page (guide prose + full export surface, the
       NFS page as the template), overview page gains the third transport +
@@ -470,3 +470,16 @@ test:root`). **The plan's `trans=fd` decision became `trans=unix`.**
   orchestrator (gate on `p9ClientProbe().usable`), suite re-run green.
   Carried nit: auto's 9P mount arm has no end-to-end run anywhere (root
   hosts choose fuse); typecheck keeps the dynamic imports honest.
+- 2026-07-29 step 12: docs (sonnet). New `docs/2.transports/3.9p.md`
+  (NFS page renamed to 4.nfs.md — 9P sits between FUSE and NFS to match
+  the preference order), overview/auto/reference/troubleshooting/tuning
+  updates, README bullet, AGENTS.md 9P code-map section + stale-sentence
+  sweep, roadmap Shipped entry + four Future items (9P bench column,
+  trans=fd, multi-client locks, cache tradeoffs). Verifier round 1 FAILED
+  on five textual defects (dead anchor; the Tlcreate race misdescribed as
+  same-name when it is same-fid; AGENTS.md misstating the probe rule as
+  an OR; the AGENTS.md docs paragraph left at three subpaths; the
+  troubleshooting stale-mount recipe missing 9P — including the one
+  genuine undocumented leak, the SIGKILL-orphaned mkdtemp socket dir).
+  All fixed and orchestrator-spot-checked. Perf-claim sweep was clean
+  both rounds: constants stated as facts, no speeds anywhere.
