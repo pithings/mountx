@@ -207,7 +207,7 @@ rfdno=N,wfdno=N,version=9p2000.L,msize=…` with stdio-padded fd; no mount
       disagrees with (likely suspects: Tflush ordering, iounit, readdir
       offsets). Note in the Log that QEMU-TCG became unnecessary. Either
       outcome commits.
-- [ ] **11. `mountx/auto` + CLI** — `src/auto.ts`: `Transport` gains
+- [x] **11. `mountx/auto` + CLI** — `src/auto.ts`: `Transport` gains
       `"9p"`, Linux preference `["fuse", "9p", "nfs"]`, `probe9p()` via
       `p9ClientProbe()` (import-light), `"9p"` options key, tagging;
       `test/auto.test.ts` updated for the new order and reasons (platform
@@ -452,3 +452,21 @@ test:root`). **The plan's `trans=fd` decision became `trans=unix`.**
     regression-guarding: unlink-while-open through the fd, `.`/`..` plus
     `flock`, and 16×256 KiB concurrent round-trips. Suite after: 9 passed,
     2 skipped.
+- 2026-07-29 step 11: `auto.ts` gains the third transport (Linux preference
+  `["fuse", "9p", "nfs"]`, quoted `"9p"` members throughout, dispatch via
+  `await import`), CLI accepts `-t 9p` + stale-cleanup for fstype 9p +
+  awaits `mounted.closed`. Verifier round 1 found a real auto-layer gap:
+  consuming only `p9ClientProbe().usable` let auto pick 9P on a
+  virtio-only guest (no 9pnet_fd, no module tree) where the mount must
+  fail and no-fallback makes it hard — closed with pure exported
+  `p9ModuleRefusal` (refuses exactly `!transport && !modules`; named
+  `-t 9p` untouched), plus doc-truthfulness fixes (the NFS row claimed
+  "no helper, no module" — backwards; mount.nfs is deliberate, 9P is the
+  `-i` one). Round 2 confirmed all fixes end-to-end (synthesized the
+  virtio-only state under sudo: chosen falls to nfs with a reason naming
+  9pnet_fd) but caught one new one-word defect: the named-`-t 9p` test
+  gated on auto's narrower verdict, which on the divergence host would
+  have made a Tier-0 suite spawn a real root mount — fixed inline by the
+  orchestrator (gate on `p9ClientProbe().usable`), suite re-run green.
+  Carried nit: auto's 9P mount arm has no end-to-end run anywhere (root
+  hosts choose fuse); typecheck keeps the dynamic imports honest.

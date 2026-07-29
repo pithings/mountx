@@ -12,7 +12,9 @@
  * copied in — wrapped in the request logger (`watch.ts`) and mounted for real
  * through `mountx/auto`, which picks FUSE on Linux and NFS on macOS and needs
  * no root on either (unprivileged FUSE wants `fusermount3`; macOS NFS wants a
- * mountpoint you own).
+ * mountpoint you own). The other two are there to be asked for by name: `-t 9p`
+ * is Linux and root only, and `-t nfs` needs root on Linux but none on macOS,
+ * where it is what `auto` picks anyway.
  *
  * It is a demonstration and a test bench, not a mount tool: what it serves is
  * always {@link createMemoryDriver}'s tree, which exists for as long as the
@@ -37,7 +39,7 @@ import type { FsDriver } from "../types.ts";
 import { bold, cyan, dim, green, red, yellow } from "./color.ts";
 import { watchDriver } from "./watch.ts";
 
-const TRANSPORTS = new Set<string>(["auto", "fuse", "nfs"]);
+const TRANSPORTS = new Set<string>(["auto", "fuse", "9p", "nfs"]);
 
 /**
  * How long the stale-mount cleanup gets before it gives up on `umount(8)`.
@@ -69,8 +71,8 @@ ${bold("mountx")} ${dim("— mount an in-memory filesystem and watch what the ke
 ${bold("Usage:")}  mountx [mountpoint] [options]
 
 ${bold("Options:")}
-  -m, --mountpoint ${dim("<path>")}  where to mount        ${dim("(default: ~/mountx, $MOUNTX_MOUNTPOINT)")}
-  -t, --transport ${dim("<name>")}   auto | fuse | nfs     ${dim("(default: auto)")}
+  -m, --mountpoint ${dim("<path>")}  where to mount           ${dim("(default: ~/mountx, $MOUNTX_MOUNTPOINT)")}
+  -t, --transport ${dim("<name>")}   auto | fuse | 9p | nfs   ${dim("(default: auto)")}
   -q, --quiet              do not log filesystem requests
   -v, --verbose            log the metadata polls too ${dim("(lstat, stat, statfs)")}
   -r, --read-only          mount read-only
@@ -197,6 +199,18 @@ ${dim(`with ${bold(staleCommand(mountpoint, mounted.transport).join(" "))}`)}
     );
     return;
   }
+  if (mounted.transport === "9p") {
+    // Same shape: the kernel's connection dropping is what a 9P unmount looks
+    // like from here. The session is the connection's — 9P keeps one per
+    // connection — and the only thing left out of its stats is the per-message
+    // `Map`, which `JSON.stringify` renders as `{}`. Every counter is printed,
+    // `assertions` included: it is the errno-discipline check, and a non-zero
+    // one is the whole reason to look.
+    await mounted.closed;
+    const { messages: _messages, ...counters } = mounted.connection.session.stats;
+    console.log(`\n${yellow("○")} ${bold("unmounted")} ${dim(JSON.stringify(counters))}`);
+    return;
+  }
   // NFS has no equivalent: the mount is a client the server never hears from
   // again, so the listening socket is what holds the loop open and the signal
   // handler — which unmounts, then re-raises — is what ends the process.
@@ -262,7 +276,10 @@ function staleCommand(target: string, kind: string): string[] {
   // Lazy, because the thing being cleaned up is usually a dead connection: the
   // kernel tears a FUSE session down when the last `/dev/fuse` reference goes,
   // so a killed server leaves a mountpoint that answers `ENOTCONN` rather than
-  // one that hangs, and `-l` is what clears it (`src/fuse/mount.ts`).
+  // one that hangs, and `-l` is what clears it (`src/fuse/mount.ts`). A 9P
+  // mount whose socket has closed is taken to be in the same state — inferred
+  // from the FUSE and NFS precedent rather than witnessed: what step 10 saw was
+  // a plain `umount` of a mount whose server was still up.
   return ["umount", "-l", target];
 }
 
@@ -273,8 +290,9 @@ function staleCommand(target: string, kind: string): string[] {
  * unrelated reasons: `fusermount3 -u` is setuid, and macOS is a BSD, where the
  * user who mounted a filesystem may unmount it — the same rule that lets the
  * NFS transport mount there without root in the first place
- * (`src/nfs/mount.ts`). Linux's `umount(8)` is neither, so a stale NFS mount
- * there is root's to clear.
+ * (`src/nfs/mount.ts`). Linux's `umount(8)` is neither, so a stale NFS or 9P
+ * mount there is root's to clear — which is no worse than it sounds, since
+ * both needed root to be made in the first place.
  *
  * A macOS mount made by somebody *else* still refuses, and that shows up as the
  * spawn failing rather than as a guess made here.
@@ -325,7 +343,12 @@ async function staleType(target: string): Promise<string | undefined> {
  */
 async function unmountStale(target: string): Promise<void> {
   const type = await staleType(target);
-  if (type === undefined || !(type.startsWith("fuse") || type.startsWith("nfs"))) return;
+  // `fuse.mountx`/`fuseblk`, `nfs`/`nfs4`, and 9P's mount-table type, which is
+  // exactly `9p` — matched whole rather than by prefix, so a future `9p2` is
+  // somebody else's mount and stays untouched.
+  if (type === undefined || !(type.startsWith("fuse") || type.startsWith("nfs") || type === "9p")) {
+    return;
+  }
 
   const [command, ...args] = staleCommand(target, type);
   if (staleNeedsRoot(command!)) {
