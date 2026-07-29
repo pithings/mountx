@@ -30,6 +30,15 @@ export interface NfsClientProbe {
   helper: string | undefined;
   /** Does the kernel have an NFS client? See the weakness note below. */
   kernel: boolean;
+  /**
+   * Can this host mount **NFSv4.1** — the version `mountNfs({ version: "4.1" })`
+   * asks for? Linux only; see the note below.
+   *
+   * Orthogonal to {@link NfsClientProbe.usable}, which is about mounting at all:
+   * an unprivileged Linux process can read `usable: false` and `v4: true`,
+   * because root is a fact about this process and this is one about the host.
+   */
+  v4: boolean;
   /** Are we root? Required on Linux, and deliberately not on macOS — see below. */
   root: boolean;
   /** Everything that is missing, in a sentence. */
@@ -67,6 +76,16 @@ const MOUNT_NFS_PATHS: Record<NfsPlatform, readonly string[]> = {
  * owns. So an unprivileged process there mounts with the same `mount(8)` spawn
  * root uses, and the kernel simply forces `MNT_NOSUID|MNT_NODEV` on the result.
  *
+ * **`v4` is Linux-only, and it is an assumption on macOS** (A1). Linux's client
+ * registers a second filesystem type for version 4 — `nfs4` in
+ * `/proc/filesystems`, distinct from `nfs` — so the same weak-but-honest test
+ * answers for the version too, with the same escape hatch: the helper loads
+ * whichever module a `vers=` asks for, so a host that has `mount.nfs` can mount
+ * v4 whether or not the module is loaded yet. macOS is reported `false` because
+ * this project treats it as 4.0-only until somebody verifies otherwise on a mac
+ * — its client is not known to speak 4.1, and 4.1 is the only minor version
+ * `src/nfs/v4/` serves. Nothing about the macOS v3 path depends on this field.
+ *
  * That leaves a precondition this function cannot answer: *ownership of the
  * mountpoint*, which is a fact about a path nobody has passed yet. It belongs
  * at mount time, and `mountNfs` checks it there (`ownershipRefusal`). Linux has
@@ -88,12 +107,20 @@ export function nfsClientProbe(platform: NodeJS.Platform = process.platform): Nf
     }
   });
   let kernel = helper !== undefined && host === "darwin";
+  // A1: macOS is treated as 4.0-only, so the only host that can answer `true`
+  // is Linux — see the note above.
+  let v4 = false;
   if (host === "linux") {
+    let filesystems = "";
     try {
-      kernel = /\bnfs\b/.test(fs.readFileSync("/proc/filesystems", "utf8"));
+      filesystems = fs.readFileSync("/proc/filesystems", "utf8");
     } catch {
-      kernel = false;
+      filesystems = "";
     }
+    // The word boundaries matter in both: the file lists `nfs` and `nfs4` as
+    // separate types, and a bare `/nfs/` would read the second as the first.
+    kernel = /\bnfs\b/.test(filesystems);
+    v4 = /\bnfs4\b/.test(filesystems) || helper !== undefined;
   }
   const missing: string[] = [];
   if (host === undefined) {
@@ -114,6 +141,7 @@ export function nfsClientProbe(platform: NodeJS.Platform = process.platform): Nf
     platform: host,
     helper,
     kernel,
+    v4,
     root,
     reason: missing.length === 0 ? undefined : missing.join("; "),
   };

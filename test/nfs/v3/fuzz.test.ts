@@ -16,8 +16,8 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { createMemoryDriver } from "../../src/drivers/memory.ts";
-import { MOUNT_PROGRAM, MOUNT_V3, NFS_PROGRAM, NFS_V3 } from "../../src/nfs/constants.ts";
+import { createMemoryDriver } from "../../../src/drivers/memory.ts";
+import { MOUNT_PROGRAM, MOUNT_V3, NFS_PROGRAM, NFS_V3 } from "../../../src/nfs/v3/constants.ts";
 import {
   decodeAuthSys,
   decodeCall,
@@ -25,7 +25,7 @@ import {
   encodeCall,
   frameFragments,
   RecordAssembler,
-} from "../../src/nfs/rpc.ts";
+} from "../../../src/nfs/rpc.ts";
 import {
   readAccessArgs,
   readAccessRes,
@@ -61,10 +61,10 @@ import {
   readWccRes,
   readWriteArgs,
   readWriteRes,
-} from "../../src/nfs/protocol.ts";
-import { NfsSession } from "../../src/nfs/session.ts";
-import { isXdrError, XdrReader } from "../../src/nfs/xdr.ts";
-import { Rng } from "../fuse/random.ts";
+} from "../../../src/nfs/v3/protocol.ts";
+import { NfsSession } from "../../../src/nfs/session.ts";
+import { isXdrError, XdrReader } from "../../../src/nfs/xdr.ts";
+import { Rng } from "../../fuse/random.ts";
 
 const ITERATIONS = 3000;
 

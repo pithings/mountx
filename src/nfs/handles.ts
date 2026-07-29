@@ -31,7 +31,7 @@ import { randomFillSync } from "node:crypto";
 import { fsError } from "../errors.ts";
 import { isPathInside } from "../path.ts";
 import type { StatsLike } from "../types.ts";
-import { NFS3_COOKIEVERFSIZE, NFS3_FHSIZE } from "./constants.ts";
+import { NFS3_COOKIEVERFSIZE, NFS3_FHSIZE } from "./v3/constants.ts";
 
 /** `"UNFS"`, so a handle from something else is rejected rather than misread. */
 const FH_MAGIC = 0x55_4e_46_53;

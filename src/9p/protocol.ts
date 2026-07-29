@@ -1,7 +1,7 @@
 /**
  * 9P2000.L message codecs and framing — every message, both directions.
  *
- * Each message is encoded *and* decoded, the same symmetry `src/nfs/protocol.ts`
+ * Each message is encoded *and* decoded, the same symmetry `src/nfs/v3/protocol.ts`
  * and `src/fuse/protocol.ts` carry: the Tier-1 JS test client is built from the
  * T-encoders and R-decoders here, the session from their inverses, so the whole
  * server can be driven over a socket with no kernel, no mount and no root.
@@ -22,7 +22,7 @@
  * disagreement was found.
  *
  * **Naming.** Types are spelled the way the protocol spells them (`Tlopen`,
- * `Rgetattr`), for the same reason `src/nfs/protocol.ts` uses `Read3args` — a
+ * `Rgetattr`), for the same reason `src/nfs/v3/protocol.ts` uses `Read3args` — a
  * packet trace, the kernel's debug output and this file should all say the same
  * word. The framing layer, which has no protocol name of its own, takes the
  * repository's `P9` prefix.

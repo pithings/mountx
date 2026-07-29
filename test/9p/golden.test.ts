@@ -7,7 +7,7 @@
  * fixtures are written out byte by byte from the layouts in diod's
  * `protocol.md` and the kernel's `net/9p/client.c` format strings, so they fail
  * when the layout drifts even if both halves drift together — the same job
- * `test/nfs/golden.test.ts` and `test/fuse/golden.test.ts` do for the other two
+ * `test/nfs/v3/golden.test.ts` and `test/fuse/golden.test.ts` do for the other two
  * transports.
  *
  * **Every field in every fixture has a distinct value.** A fixture built from

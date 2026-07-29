@@ -21,12 +21,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe } from "vitest";
-import { createMemoryDriver } from "../../src/drivers/memory.ts";
-import { createNodeFsDriver } from "../../src/drivers/node-fs.ts";
-import { createLoopback, type ResolvedCapabilities } from "../../src/harness.ts";
-import { createNfsServer } from "../../src/nfs/server.ts";
-import type { FsDriver } from "../../src/types.ts";
-import { conformance } from "../conformance.ts";
+import { createMemoryDriver } from "../../../src/drivers/memory.ts";
+import { createNodeFsDriver } from "../../../src/drivers/node-fs.ts";
+import { createLoopback, type ResolvedCapabilities } from "../../../src/harness.ts";
+import { createNfsServer } from "../../../src/nfs/server.ts";
+import type { FsDriver } from "../../../src/types.ts";
+import { conformance } from "../../conformance.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
 
 /**

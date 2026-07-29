@@ -8,7 +8,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { ERRNO_CODES } from "../../src/errors.ts";
+import { ERRNO_CODES } from "../../../src/errors.ts";
 import {
   CREATE_EXCLUSIVE,
   CREATE_GUARDED,
@@ -29,7 +29,7 @@ import {
   NFS3ERR_STALE,
   SET_TO_CLIENT_TIME,
   SET_TO_SERVER_TIME,
-} from "../../src/nfs/constants.ts";
+} from "../../../src/nfs/v3/constants.ts";
 import {
   entryPlusSize,
   entrySize,
@@ -111,15 +111,15 @@ import {
   writeWriteRes,
   type Fattr3,
   type WccData,
-} from "../../src/nfs/protocol.ts";
-import { decodeXdr, encodeXdr, XdrError } from "../../src/nfs/xdr.ts";
-import { S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK } from "../../src/types.ts";
-import type { StatsLike } from "../../src/types.ts";
+} from "../../../src/nfs/v3/protocol.ts";
+import { decodeXdr, encodeXdr, XdrError } from "../../../src/nfs/xdr.ts";
+import { S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK } from "../../../src/types.ts";
+import type { StatsLike } from "../../../src/types.ts";
 
 /** Encode with `write`, decode with `read`, and insist nothing was lost. */
 function roundTrip<T>(
-  write: (writer: import("../../src/nfs/xdr.ts").XdrWriter, value: T) => void,
-  read: (reader: import("../../src/nfs/xdr.ts").XdrReader) => T,
+  write: (writer: import("../../../src/nfs/xdr.ts").XdrWriter, value: T) => void,
+  read: (reader: import("../../../src/nfs/xdr.ts").XdrReader) => T,
   value: T,
 ): T {
   const bytes = encodeXdr((writer) => write(writer, value));

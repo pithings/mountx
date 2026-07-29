@@ -340,6 +340,10 @@ async function staleType(target: string): Promise<string | undefined> {
  * **Only mounts this CLI could have made.** Anything else at that path belongs
  * to someone else, and a demo has no business unmounting it — `mount()` will
  * say so.
+ *
+ * Both matches are prefixes because both families spell themselves more than
+ * one way: FUSE is `fuse`, `fuse.mountx` or `fuseblk`, and NFS is `nfs` for a
+ * v3 mount and `nfs4` for a `vers=4.1` one (`src/nfs/mount.ts`).
  */
 async function unmountStale(target: string): Promise<void> {
   const type = await staleType(target);

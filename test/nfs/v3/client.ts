@@ -19,7 +19,7 @@
 
 import * as net from "node:net";
 import { constants } from "node:fs";
-import { fsError, rangeError, type ErrnoCode } from "../../src/errors.ts";
+import { fsError, rangeError, type ErrnoCode } from "../../../src/errors.ts";
 import {
   ACCESS3_ALL,
   AUTH_SYS,
@@ -63,7 +63,7 @@ import {
   NFSPROC3_SYMLINK,
   NFSPROC3_WRITE,
   SET_TO_CLIENT_TIME,
-} from "../../src/nfs/constants.ts";
+} from "../../../src/nfs/v3/constants.ts";
 import {
   authSys,
   decodeReply,
@@ -71,7 +71,7 @@ import {
   frameRecord,
   RecordAssembler,
   type OpaqueAuth,
-} from "../../src/nfs/rpc.ts";
+} from "../../../src/nfs/rpc.ts";
 import {
   errnoCodeOfStatus,
   fromTime,
@@ -123,9 +123,9 @@ import {
   type Read3res,
   type Sattr3,
   type Write3res,
-} from "../../src/nfs/protocol.ts";
-import { XdrReader, XdrWriter, encodeXdr } from "../../src/nfs/xdr.ts";
-import { basename, dirname, joinPath, normalizePath } from "../../src/path.ts";
+} from "../../../src/nfs/v3/protocol.ts";
+import { XdrReader, XdrWriter, encodeXdr } from "../../../src/nfs/xdr.ts";
+import { basename, dirname, joinPath, normalizePath } from "../../../src/path.ts";
 import type {
   DirentLike,
   FileHandleLike,
@@ -136,8 +136,8 @@ import type {
   StatsLike,
   TimeLike,
   WriteResult,
-} from "../../src/types.ts";
-import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../src/types.ts";
+} from "../../../src/types.ts";
+import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../../src/types.ts";
 
 /** An RPC that came back as anything other than an accepted success. */
 export class RpcError extends Error {

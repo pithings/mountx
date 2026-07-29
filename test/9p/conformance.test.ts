@@ -4,7 +4,7 @@
  * IDEA.md's organizing idea again: *one* suite written against the driver
  * interface, run every way the library can carry it. `drivers.test.ts` runs it
  * through the loopback harness, `test/fuse/conformance-mount.test.ts` through a
- * real kernel mount, `test/nfs/conformance.test.ts` through an NFS server — and
+ * real kernel mount, `test/nfs/v3/conformance.test.ts` through an NFS server — and
  * this file runs it through the **whole 9P2000.L stack**, with a JavaScript
  * client on the far end.
  *

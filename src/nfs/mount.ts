@@ -63,6 +63,20 @@
  * instead, is a reasonable thing to add via `mountOptions` if an application
  * on the mount needs `flock` to succeed.)
  *
+ * **Two versions.** `version: "4.1"` mounts the same server's NFSv4.1 side
+ * instead, on Linux only (see {@link versionRefusal}). Nothing above changes
+ * except the two options that were about the protocols v4 folded in: it has no
+ * MOUNT program to point a `mountport=` at and no NLM to keep out, and `nfs(5)`
+ * lists both options as version-2-and-3-only, so both are absent from that
+ * branch. The rest — `soft`, `timeo`, `retrans`, `ro` — is `nfs(5)`'s "options
+ * supported by all versions" and is emitted the same way for both.
+ *
+ * One consequence worth knowing before reading a mount table: Linux registers
+ * its version-4 client as a *separate filesystem type*, so a `vers=4.1` mount
+ * made by `mount -t nfs` is listed in `/proc/self/mounts` with type `nfs4`.
+ * Nothing here matches on the type — teardown asks about the mountpoint — but
+ * anything that grows such a match has to cover both spellings.
+ *
  * **`soft` by default.** A hard mount retries forever, which is right when the
  * server is a machine that may reboot and wrong when the server is a JavaScript
  * object in the process doing the mounting: a bug in the driver would produce
@@ -91,7 +105,24 @@ const TEARDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;
 // import either way.
 export { nfsClientProbe, type NfsClientProbe, type NfsPlatform } from "./probe.ts";
 
+/**
+ * The NFS version to mount with, as `mount(8)`'s `vers=` would spell it.
+ *
+ * `3` is the default and is what both hosts get. `"4.1"` is the only v4 flavour
+ * this server speaks — the minor version is fixed, because `src/nfs/v4/` answers
+ * `NFS4ERR_MINOR_VERS_MISMATCH` to anything else — and it is Linux-only; see
+ * {@link versionRefusal}.
+ */
+export type NfsVersion = 3 | "4.1";
+
 export interface MountNfsOptions extends NfsServerOptions {
+  /**
+   * Which version the client should mount with. Default `3`.
+   *
+   * The server answers both on the one socket whatever this says; the option
+   * decides only what the *client* is told to ask for.
+   */
+  version?: NfsVersion;
   /** Serve an existing server instead of creating one. Its `listen()` is still called. */
   server?: NfsServer;
   /** Directory of the driver to export. Default `"/"`. */
@@ -201,10 +232,14 @@ export function liveNfsMounts(): NfsMount[] {
 }
 
 /**
- * Serve `driver` over NFSv3 and mount it at `mountpoint`.
+ * Serve `driver` over NFS and mount it at `mountpoint`.
+ *
+ * NFSv3 by default, NFSv4.1 with `version: "4.1"` — the server answers both on
+ * the one socket either way, so this decides only what the client asks for.
  *
  * Resolves once `mount(8)` has returned successfully, which for NFS means the
- * client has already completed a MOUNT and an FSINFO — so a resolved
+ * client has already talked to the server — a MOUNT and an FSINFO on v3, an
+ * EXCHANGE_ID/CREATE_SESSION and a first COMPOUND on v4.1 — so a resolved
  * `mountNfs()` means the path is usable.
  */
 export async function mountNfs(
@@ -217,6 +252,19 @@ export async function mountNfs(
     throw new Error(`mountx: cannot mount NFS here — ${probe.reason}`);
   }
   const platform = probe.platform;
+  // Both version refusals, before a socket is opened: one is about the host
+  // (A1, macOS), one about what its client has.
+  const refusedVersion = versionRefusal(platform, options.version);
+  if (refusedVersion !== undefined) {
+    throw new Error(refusedVersion);
+  }
+  if (options.version === "4.1" && !probe.v4) {
+    throw new Error(
+      `mountx: this host has no NFSv4 client — no \`nfs4\` in /proc/filesystems and no ` +
+        `mount.nfs to load it on demand (install nfs-common / nfs-utils). The same driver ` +
+        `mounts over NFSv3 with the default \`version: 3\`.`,
+    );
+  }
   const resolved = resolveNative(mountpoint);
   const targetStat = await statPath(resolved).catch((error: unknown) => {
     throw new Error(`mountx: mountpoint ${resolved} is not usable: ${errorMessage(error)}`);
@@ -443,6 +491,31 @@ export function ownershipRefusal(
   );
 }
 
+/**
+ * Why this host will not be asked for this NFS version, if it will not.
+ *
+ * One case, and it is an assumption rather than an observation: **macOS is
+ * treated as NFSv4.0-only**. Its client is not known to speak 4.1, and 4.1 is
+ * the only minor version this server serves, so asking `mount_nfs` for it would
+ * produce either a 4.0 mount this server refuses op by op
+ * (`NFS4ERR_MINOR_VERS_MISMATCH`) or an unhelpful failure from the helper. macOS
+ * mounts v3, which works there and is the default anyway. If a mac turns out to
+ * speak 4.1, deleting this refusal is the whole change.
+ *
+ * Pure and exported so a Tier-0 test can hold both answers from either host,
+ * the way {@link ownershipRefusal} is.
+ */
+export function versionRefusal(platform: NfsPlatform, version: NfsVersion = 3): string | undefined {
+  if (version === 3 || platform !== "darwin") {
+    return undefined;
+  }
+  return (
+    `mountx: NFSv4.1 mounts are Linux-only — macOS is treated as NFSv4.0-only, and 4.1 is the ` +
+    `only minor version this server speaks. Mount with the default \`version: 3\` here; the ` +
+    `same driver is served over both.`
+  );
+}
+
 /** What to do about a mount macOS will not let this process take down. */
 export function consentAdvice(mountpoint: string): string {
   return (
@@ -474,6 +547,18 @@ function count(value: number | undefined, fallback: number, floor: number): numb
  * - macOS has **no `hard` option**. `soft` has no documented counterpart there,
  *   so a hard mount is what you get by not asking for a soft one, and emitting
  *   `hard` would fail the mount outright on an unknown option.
+ *
+ * `options.version` picks the branch, and the v4.1 one is shorter by exactly
+ * the two options `nfs(5)` documents under "options for NFS versions 2 and 3
+ * only" — `mountport`, which points at a MOUNT program version 4 has no
+ * equivalent of, and `nolock`, which keeps out an NLM version 4 folded into
+ * itself. What it deliberately does *not* add is `clientaddr=`: `nfs(5)` says
+ * the mount command discovers the callback address itself when the option is
+ * absent, this server never originates a callback (no delegations, no pNFS, no
+ * backchannel asked for at CREATE_SESSION), and a hard-coded `127.0.0.1` would
+ * be wrong the moment `host` is not the loopback address. Since it throws for
+ * the one refused combination, it is the same answer {@link mountNfs} would
+ * reach — see {@link versionRefusal}.
  */
 export function nfsMountOptions(
   port: number,
@@ -481,19 +566,38 @@ export function nfsMountOptions(
   platform: NfsPlatform = nfsPlatform(process.platform) ?? "linux",
 ): string {
   const darwin = platform === "darwin";
-  const parts = [
-    "vers=3",
-    // This covers the MOUNT protocol as well as NFS, which matters because the
-    // server is TCP-only: macOS documents `mntudp` as forcing MOUNT to UDP
-    // "even for TCP NFS mounts", so by default MOUNT follows NFS onto TCP.
-    "proto=tcp",
-    // The two that make a portmapper unnecessary: both programs are here.
-    `port=${port}`,
-    `mountport=${port}`,
-    // NLM is a separate protocol this server does not implement; a client
-    // that tried to lock would wait for a service that does not exist.
-    darwin ? "nolocks" : "nolock",
-  ];
+  const refusal = versionRefusal(platform, options.version);
+  if (refusal !== undefined) {
+    throw new Error(refusal);
+  }
+  const parts =
+    options.version === "4.1"
+      ? [
+          // One option, two numbers, and they travel in different places: the
+          // RPC header says version 4 whichever minor version this is, and the
+          // `.1` is what makes the client put `minorversion = 1` inside every
+          // COMPOUND — the field `src/nfs/v4/session.ts` insists on.
+          "vers=4.1",
+          // Redundant (v4 requires a stream transport, and `nfs(5)` defaults to
+          // TCP) and kept anyway, so the option string stays a complete
+          // description of the mount rather than one that relies on defaults.
+          "proto=tcp",
+          `port=${port}`,
+        ]
+      : [
+          "vers=3",
+          // This covers the MOUNT protocol as well as NFS, which matters because
+          // the server is TCP-only: macOS documents `mntudp` as forcing MOUNT to
+          // UDP "even for TCP NFS mounts", so by default MOUNT follows NFS onto
+          // TCP.
+          "proto=tcp",
+          // The two that make a portmapper unnecessary: both programs are here.
+          `port=${port}`,
+          `mountport=${port}`,
+          // NLM is a separate protocol this server does not implement; a client
+          // that tried to lock would wait for a service that does not exist.
+          darwin ? "nolocks" : "nolock",
+        ];
   if (options.hard === true) {
     // See the note above: on macOS this is the default and has no spelling.
     if (!darwin) {
@@ -572,6 +676,11 @@ class NfsMountImpl implements NfsMount {
       // Deliberately *not* `-i`: unlike FUSE, the NFS mount genuinely wants its
       // `mount.nfs`/`mount_nfs` helper, which is what resolves the host into
       // the `addr=` the kernel needs and negotiates the version.
+      //
+      // `-t nfs` for both versions: `nfs(5)` documents `nfs4` as a deprecated
+      // filesystem type and `-t nfs -o nfsvers=4` as how to ask for version 4.
+      // The mount that comes back is still listed as type `nfs4` — see the
+      // module docs.
       result = await run("mount", ["-t", "nfs", "-o", options, this.source, this.mountpoint], {
         stdio: CAPTURE,
       });

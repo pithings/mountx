@@ -1,7 +1,7 @@
 /**
  * A minimal 9P2000.L client, built from the server's own codecs.
  *
- * The same Tier-1 trick `test/nfs/client.ts` plays: the codecs in
+ * The same Tier-1 trick `test/nfs/v3/client.ts` plays: the codecs in
  * `src/9p/protocol.ts` are symmetric, so the client that drives the server can
  * be written in JavaScript — and the whole protocol runs in one process, with
  * no kernel, no mount and no root.

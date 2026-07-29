@@ -16,22 +16,63 @@
  * network means adopting NFSv3's threat model, which is "trust the network".
  */
 
-import {
-  AUTH_NONE,
-  AUTH_SYS,
-  MSG_ACCEPTED,
-  MSG_DENIED,
-  RM_LAST_FRAGMENT,
-  RM_LENGTH_MASK,
-  RPC_AUTH_ERROR,
-  RPC_CALL,
-  RPC_MAX_AUTH_BYTES,
-  RPC_MISMATCH,
-  RPC_REPLY,
-  RPC_SUCCESS,
-  RPC_VERSION,
-} from "./constants.ts";
 import { XdrError, XdrReader, XdrWriter } from "./xdr.ts";
+
+// ---------------------------------------------------------------------------
+// ONC RPC v2 constants (RFC 5531 §9)
+// ---------------------------------------------------------------------------
+//
+// These live here rather than beside a version's own constants because they
+// belong to *no* NFS version: the same `msg_type`, `accept_stat` and auth
+// flavors frame an NFSv3 call, an NFSv4.1 COMPOUND and a MOUNT call alike.
+// `v3/constants.ts` re-exports every name below, so the public `mountx/nfs`
+// surface is unchanged by their having moved.
+
+/** The only RPC version that exists. */
+export const RPC_VERSION = 2;
+
+/** `enum msg_type`. */
+export const RPC_CALL = 0;
+export const RPC_REPLY = 1;
+
+/** `enum reply_stat`. */
+export const MSG_ACCEPTED = 0;
+export const MSG_DENIED = 1;
+
+/** `enum accept_stat`. */
+export const RPC_SUCCESS = 0;
+export const RPC_PROG_UNAVAIL = 1;
+export const RPC_PROG_MISMATCH = 2;
+export const RPC_PROC_UNAVAIL = 3;
+export const RPC_GARBAGE_ARGS = 4;
+export const RPC_SYSTEM_ERR = 5;
+
+/** `enum reject_stat`. */
+export const RPC_MISMATCH = 0;
+export const RPC_AUTH_ERROR = 1;
+
+/** `enum auth_stat`. */
+export const AUTH_OK = 0;
+export const AUTH_BADCRED = 1;
+export const AUTH_REJECTEDCRED = 2;
+export const AUTH_BADVERF = 3;
+export const AUTH_REJECTEDVERF = 4;
+export const AUTH_TOOWEAK = 5;
+export const AUTH_INVALIDRESP = 6;
+export const AUTH_FAILED = 7;
+
+/** `enum auth_flavor`. `AUTH_SYS` is `AUTH_UNIX`'s modern name. */
+export const AUTH_NONE = 0;
+export const AUTH_SYS = 1;
+export const AUTH_SHORT = 2;
+
+/** Longest `opaque_auth` body (RFC 5531: `opaque body<400>`). */
+export const RPC_MAX_AUTH_BYTES = 400;
+
+/** Record-marking fragment header: high bit is "last fragment". */
+export const RM_LAST_FRAGMENT = 0x80_00_00_00;
+/** Low 31 bits of a record-marking header are the fragment length. */
+export const RM_LENGTH_MASK = 0x7f_ff_ff_ff;
 
 // ---------------------------------------------------------------------------
 // auth
@@ -46,7 +87,7 @@ export interface OpaqueAuth {
 /** The `AUTH_NONE` credential, and the verifier on every reply we send. */
 export const AUTH_NULL: OpaqueAuth = { flavor: AUTH_NONE, body: new Uint8Array(0) };
 
-/** `struct authsys_parms` (RFC 5531 §8.2), the body of an `AUTH_SYS` credential. */
+/** `struct authsys_parms` (RFC 5531 Appendix A), the body of an `AUTH_SYS` credential. */
 export interface AuthSysParams {
   stamp: number;
   machineName: string;

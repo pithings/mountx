@@ -18,8 +18,8 @@
  * decoding is total and only throws {@link XdrError}.
  */
 
-import { ERRNO_CODES, type ErrnoCode } from "../errors.ts";
-import type { StatsLike } from "../types.ts";
+import { ERRNO_CODES, type ErrnoCode } from "../../errors.ts";
+import type { StatsLike } from "../../types.ts";
 import {
   S_IFBLK,
   S_IFCHR,
@@ -29,7 +29,7 @@ import {
   S_IFMT,
   S_IFREG,
   S_IFSOCK,
-} from "../types.ts";
+} from "../../types.ts";
 import {
   CREATE_EXCLUSIVE,
   DONT_CHANGE,
@@ -69,7 +69,7 @@ import {
   NFS3ERR_XDEV,
   SET_TO_CLIENT_TIME,
 } from "./constants.ts";
-import { XdrError, XdrReader, XdrWriter, xdrAlign } from "./xdr.ts";
+import { XdrError, XdrReader, XdrWriter, xdrAlign } from "../xdr.ts";
 
 // ---------------------------------------------------------------------------
 // errno mapping

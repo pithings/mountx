@@ -2,7 +2,7 @@
  * A minimal S3 client, built from the gateway's own codecs — and an `FsDriver`
  * over it.
  *
- * The S3 counterpart of `test/nfs/client.ts`, and the same Tier-1 trick: the
+ * The S3 counterpart of `test/nfs/v3/client.ts`, and the same Tier-1 trick: the
  * signing, XML and routing codecs in `src/s3/` are symmetric, so the client
  * that exercises the server can be written in JavaScript. Here it is one step
  * cheaper still — `S3Session.handleRequest()` is a function from a request to a
@@ -68,7 +68,7 @@ import {
   type ByteHolder,
   type OpenFlags,
 } from "../../src/drivers/handle.ts";
-import { joinPath, normalizePath } from "../../src/path.ts";
+import { isPathInside, joinPath, normalizePath } from "../../src/path.ts";
 import { MAX_KEYS } from "../../src/s3/constants.ts";
 import { META_MTIME_HEADER, parseHttpDate, pathToKey } from "../../src/s3/protocol.ts";
 import type { S3RequestHead, S3Session } from "../../src/s3/session.ts";
@@ -797,7 +797,7 @@ export function parseListBucketResult(text: string): ListObjectsV2Page {
  * - **`handles: true`** — an open file is a client-side buffer, so it does
  *   survive `unlink`, which is what the capability means. It is the adapter's
  *   property and not the gateway's: S3 is as stateless as NFSv3, and a
- *   streaming adapter would declare `false` here the way `test/nfs/client.ts`
+ *   streaming adapter would declare `false` here the way `test/nfs/v3/client.ts`
  *   does.
  * - **`atomicRename: false`** — `rename` is `CopyObject` plus `DeleteObject`,
  *   recursively for a tree. Nothing in S3 can make the pair one operation.
@@ -853,10 +853,16 @@ interface Found {
 
 /** A file's bytes while something has it open. Shared by every handle on the path. */
 interface OpenFile {
+  /**
+   * Where the buffer is filed *now*, which a rename moves — so every handle
+   * reads it off the entry rather than closing over the name it was opened
+   * under. Same reason `drivers/unstorage.ts`'s `OpenFile` carries one.
+   */
+  path: string;
   data: Uint8Array;
   refs: number;
   dirty: boolean;
-  /** Deleted or renamed away: still readable, never written back. */
+  /** Deleted or renamed *over*: still readable, never written back. */
   orphan: boolean;
   /** The mtime the object had when it was opened, in milliseconds. */
   mtimeMs: number;
@@ -1073,6 +1079,7 @@ export function s3Driver(
       return raced;
     }
     const entry: OpenFile = {
+      path,
       data: new Uint8Array(data),
       refs: 1,
       dirty: false,
@@ -1083,22 +1090,37 @@ export function s3Driver(
     return entry;
   }
 
-  async function flush(path: string, entry: OpenFile): Promise<void> {
+  async function flush(entry: OpenFile): Promise<void> {
     if (!entry.dirty || entry.orphan) {
       return;
     }
     entry.dirty = false;
-    await writeObject(path, entry.data, "fsync");
+    try {
+      await writeObject(entry.path, entry.data, "fsync");
+    } catch (error) {
+      // The write did not land, so the buffer is still the only copy of it.
+      entry.dirty = true;
+      throw error;
+    }
   }
 
-  async function release(path: string, entry: OpenFile): Promise<void> {
+  /**
+   * Drop a closed entry, but only once there is nothing left in it: a failed
+   * flush leaves `dirty` set, and the buffer is then the only copy of those
+   * bytes. `drivers/unstorage.ts` keeps the same one.
+   */
+  function removeClosed(entry: OpenFile): void {
+    if (entry.refs === 0 && (!entry.dirty || entry.orphan) && openFiles.get(entry.path) === entry) {
+      openFiles.delete(entry.path);
+    }
+  }
+
+  async function release(entry: OpenFile): Promise<void> {
     entry.refs--;
     try {
-      await flush(path, entry);
+      await flush(entry);
     } finally {
-      if (entry.refs === 0 && openFiles.get(path) === entry) {
-        openFiles.delete(path);
-      }
+      removeClosed(entry);
     }
   }
 
@@ -1112,13 +1134,37 @@ export function s3Driver(
     }
   }
 
-  function createFileHandle(path: string, entry: OpenFile, flags: OpenFlags): FileHandleLike {
+  /**
+   * File every open buffer for `from` and its subtree under `to` instead.
+   *
+   * A rename does not disturb what a handle is holding — the object moved, and
+   * the buffer *is* that object while it is open — so the entry follows the
+   * path rather than being orphaned at the old one. `drivers/unstorage.ts`'s
+   * `movePaths` is the same function for the same reason, down to scanning the
+   * map in full before rewriting any of it: what changes is the key a record is
+   * filed under, and rewriting those while iterating would visit some twice.
+   */
+  function movePaths(from: string, to: string): void {
+    const affected: OpenFile[] = [];
+    for (const [path, entry] of openFiles) {
+      if (isPathInside(path, from)) {
+        affected.push(entry);
+      }
+    }
+    for (const entry of affected) {
+      openFiles.delete(entry.path);
+      entry.path = normalizePath(to + entry.path.slice(from.length));
+      openFiles.set(entry.path, entry);
+    }
+  }
+
+  function createFileHandle(entry: OpenFile, flags: OpenFlags): FileHandleLike {
     let position = 0;
     let closed = false;
 
     function begin(syscall: string, write: boolean): void {
       if (closed || (write ? !flags.write : !flags.read)) {
-        throw fsError("EBADF", { syscall, path });
+        throw fsError("EBADF", { syscall, path: entry.path });
       }
     }
 
@@ -1156,11 +1202,11 @@ export function s3Driver(
 
       async stat(): Promise<StatsLike> {
         if (closed) {
-          throw fsError("EBADF", { syscall: "fstat", path });
+          throw fsError("EBADF", { syscall: "fstat", path: entry.path });
         }
         // The buffer is the file while it is open, unflushed writes included —
         // and for an orphan it is all that is left of it.
-        return fileStats(path, entry.data.byteLength, entry.mtimeMs);
+        return fileStats(entry.path, entry.data.byteLength, entry.mtimeMs);
       },
 
       async truncate(length = 0): Promise<void> {
@@ -1170,11 +1216,11 @@ export function s3Driver(
       },
 
       async sync(): Promise<void> {
-        await flush(path, entry);
+        await flush(entry);
       },
 
       async datasync(): Promise<void> {
-        await flush(path, entry);
+        await flush(entry);
       },
 
       async close(): Promise<void> {
@@ -1182,7 +1228,7 @@ export function s3Driver(
           return;
         }
         closed = true;
-        await release(path, entry);
+        await release(entry);
       },
     };
   }
@@ -1255,7 +1301,15 @@ export function s3Driver(
     }
   }
 
-  /** Remove a directory and everything under it, depth first. */
+  /**
+   * Remove a directory and everything under it, depth first.
+   *
+   * It touches no open buffer, and its one caller is why: `rename` copies the
+   * tree before removing it, so a file open under `path` has *moved* rather
+   * than gone, and {@link movePaths} refiles it under the destination once the
+   * removal is done. Orphaning here would throw away the very entry that is
+   * about to be renamed.
+   */
   async function removeTree(path: string): Promise<void> {
     const level = await listLevel(path);
     if (level.files.length > 0) {
@@ -1268,9 +1322,6 @@ export function s3Driver(
         "rename",
         path,
       );
-      for (const name of level.files) {
-        orphan(joinPath(path, name));
-      }
     }
     for (const name of level.directories) {
       await removeTree(joinPath(path, name));
@@ -1347,7 +1398,7 @@ export function s3Driver(
         resizeBytes(entry, 0);
         entry.dirty = false;
       }
-      return createFileHandle(normalized, entry, parsed);
+      return createFileHandle(entry, parsed);
     },
 
     /**
@@ -1442,6 +1493,10 @@ export function s3Driver(
         if (existing.kind === "directory") {
           throw fsError("EISDIR", { syscall: "rename", path: destination });
         }
+        // The displaced file's bytes stay readable to whoever had it open, and
+        // must not be written back over what is arriving. The *source*'s open
+        // buffer is not orphaned: that object moved, so its entry moves too.
+        orphan(destination);
         check(
           await client.copyObject(
             bucket,
@@ -1453,8 +1508,7 @@ export function s3Driver(
           source,
         );
         check(await client.deleteObject(bucket, keyOf(source)), "rename", source);
-        orphan(source);
-        orphan(destination);
+        movePaths(source, destination);
         return;
       }
 
@@ -1471,6 +1525,10 @@ export function s3Driver(
       }
       await copyTree(source, destination);
       await removeTree(source);
+      // Same rule one level up: every buffer open anywhere under the old tree
+      // is refiled under the new one, so an ancestor rename is as invisible to
+      // an open handle as a rename of the file itself.
+      movePaths(source, destination);
     },
 
     /**
@@ -1487,7 +1545,12 @@ export function s3Driver(
       if (entry !== undefined) {
         resizeBytes(entry, length);
         entry.dirty = true;
-        await flush(normalized, entry);
+        await flush(entry);
+        // A closed-but-dirty entry is one a failed flush left behind; now that
+        // its bytes have landed there is nothing left in it to keep.
+        if (entry.refs === 0) {
+          removeClosed(entry);
+        }
         return;
       }
       const holder: ByteHolder = { data: await readObject(normalized, "truncate") };
