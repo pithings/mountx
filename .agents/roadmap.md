@@ -63,6 +63,47 @@ results.
   It buys exactly one thing, `/Volumes` mountpoints, and costs FFI; see
   "Future / deferred".
 
+- **S3 gateway transport, `mountx/s3`** (commits `3d582b7..4cd9d64`, 2026-07-28/29,
+  plan in `.agents/s3-plan.md`). A transport over the same `FsDriver`,
+  and the first that is not a mount: `createS3Server(driver, opts?)` — or
+  `createS3Server({ buckets: { name: driver, ... } })` for several — serves it
+  to any S3 client (`rclone`, the AWS CLI, an SDK, a presigned URL) over
+  path-style HTTP. Layered the way FUSE and NFS are (`sigv4.ts`, `xml.ts`,
+  `chunked.ts`, `protocol.ts`, `session.ts`, `server.ts`), every constant and
+  error code transcribed from Amazon's own docs since there is no RFC for S3.
+  SigV4 is signed _and_ verified, both the header and presigned-query forms,
+  against the official `aws-sig-v4-test-suite` goldens. Ships with a Tier-1
+  conformance column (`test/s3/conformance.test.ts`: a signing JS client plus an
+  `FsDriver` adapter over it, no sockets, folded into `pnpm matrix`) and a
+  no-root oracle (`test/s3/oracle.test.ts`) that drives real `rclone` and `curl`
+  binaries — gated on both being on `PATH`, needing no root — through
+  copy/sync/check/multipart/presigned-URL round trips against a real `node-fs`
+  driver.
+
+  Design decisions worth restating, each a place a client could see a
+  difference from Amazon's own service:
+  - **Gateway, not mount** — kept out of `mountx/auto` on purpose: auto's
+    whole contract is a mountpoint, and this transport never produces one.
+  - **Derived ETags** — first 32 hex characters of sha256 over
+    `dev:ino:size:mtimeMs`, suffixed `-1` so the shape itself says "not an
+    MD5"; `rclone check` reads it exactly that way and falls back to
+    size/modtime instead of reporting a mismatch.
+  - **Multipart staging is invisible** — parts live under
+    `.mountx-multipart/<uploadId>/`, a 404 to every other operation and absent
+    from every listing, swept on abort and on `close()`.
+  - **Write-in-place, first-byte atomic only** — the driver interface has no
+    primitive to stage a whole object elsewhere first; a rejection at or
+    before the first byte leaves the bucket untouched, one after leaves a
+    partial object where a whole one used to be.
+
+  What was _not_ done, deliberately: `mountx/drivers/s3` (mounting a real
+  bucket as a driver, reusing `test/s3/client.ts`'s signing client rather than
+  writing a second one) is a named follow-up, not part of this effort; no
+  bench column (perf claims come only from `.agents/benchmarks.md`, so the
+  docs for this transport make none); `ListObjects` (V1), bucket ACLs/policies
+  and versioning all answer a well-formed `NotImplemented` rather than being
+  faked.
+
 - **The 9P2000.L transport, `mountx/9p`** (2026-07-29). A third transport
   beside FUSE and NFS, over the same `FsDriver`: wire primitives and the whole
   `.L` message set both directions (`src/9p/wire.ts`/`constants.ts`/
@@ -221,6 +262,11 @@ rather than by accident.
   the numbers — but it is the best-supported open question in the repo.
 - **unstorage driver adapter** — deferred per the drivers-in-v1 decision
   above; would make 30+ storage backends mountable with no new code.
+- **`mountx/drivers/s3`** — an `FsDriver` over a real S3-compatible bucket,
+  mounting one rather than serving one. Named as the natural follow-up to the
+  S3 gateway transport (see "Shipped since v1"); it would reuse
+  `test/s3/client.ts`'s signing client instead of writing a second one. Not
+  started.
 - **Negative-entry caching.** Nothing currently populates FUSE's negative
   dentry cache for lookups that miss, so a repeated failed `LOOKUP` always
   reaches the driver.

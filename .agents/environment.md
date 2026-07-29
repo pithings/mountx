@@ -186,6 +186,77 @@ the one `trans=unix`/`tcp`/`fd` live in, and it is pinned by
   `D` state does die), then a plain `umount`. Same class as the `spawn(…, { cwd })`
   hazard already documented, and both are avoided by letting `sh -c` do the exec.
 
+## rclone, the S3 oracle (installed 2026-07-29)
+
+- **`~/.local/bin/rclone`, rclone v1.74.4** (linux/amd64, go1.26.5, statically
+  linked). Installed **user-level, no root and no package manager**: the
+  official static zip, one binary extracted out of it. `~/.local/bin` is already
+  on this host's `PATH`, so `command -v rclone` answers without any further
+  setup. Reinstall in one line:
+
+  ```sh
+  curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+    && unzip -qo /tmp/rclone.zip -d /tmp && install -m 755 /tmp/rclone-v*-linux-amd64/rclone ~/.local/bin/rclone
+  ```
+
+- **It exists for exactly one thing:** `test/s3/oracle.test.ts`, the S3
+  gateway's foreign-client column. Everything else under `test/s3/` is written
+  from this repository's own codecs (`test/s3/client.ts` signs with
+  `src/s3/sigv4.ts` and parses with `src/s3/xml.ts`), so a symmetric
+  encoder/decoder mistake is invisible to it; rclone shares none of that code
+  and is the client whose `x-amz-meta-mtime` convention the gateway was built
+  against. `curl` (already present) plays the same role for presigned URLs.
+  The file skips itself cleanly when either binary is absent, the way
+  `test/nfs/mount.test.ts` skips on `nfsClientProbe()` — **verified both ways**:
+  15 passed with it on `PATH`, 15 skipped with `PATH` stripped of
+  `~/.local/bin`.
+
+- **Nothing is written to `~/.config/rclone`.** The test runs rclone with
+  `RCLONE_CONFIG=""` (no config file at all) and defines the remote entirely in
+  `RCLONE_CONFIG_MX_*` environment variables, so a developer's own remotes are
+  neither read nor touched. The connection-string form
+  (`:s3,provider=Other,endpoint=…:bucket`) is the wrong tool here: it splits on
+  `,` and `:`, so an unquoted endpoint URL is parsed as the scheme alone
+  (`Custom endpoint 'http' was not a valid URI`).
+
+- **Two settings rclone needs against this gateway, both real limitations:**
+  - `list_version=2` — rclone uses ListObjects **V1** for every provider except
+    `AWS`, including `Other`, and the gateway implements V2 only. Without it the
+    first listing is `501 NotImplemented: ListObjects (V1) …`.
+  - `no_check_bucket=true` — rclone sends `CreateBucket` before an upload unless
+    a _successful listing earlier in the same process_ has marked the bucket as
+    existing. There is no `HeadBucket` probe (verified with `--dump headers`),
+    so `copy`/`sync` never send it and `copyto`, `rcat` and directory-marker
+    `Mkdir` always do. The gateway's buckets are the drivers it was constructed
+    with, so it answers `501 NotImplemented`.
+
+  A third is informational: `rclone purge` asks `GET /bucket?versioning`, is
+  refused, logs `Failed to read versioning status, assuming unversioned`, and
+  then purges correctly.
+
+- **Empty directories need two flags, not one.** `--create-empty-src-dirs`
+  alone is not enough (rclone's S3 backend has no way to represent one) and
+  `--s3-directory-markers` alone is not enough (rclone's _local_ backend does
+  not offer empty directories to a sync). With both, rclone sends
+  `PUT prefix/emptydir/` — the gateway's own directory-marker convention — and
+  the directory round-trips.
+
+- **mtime survives to the millisecond and no further.** `x-amz-meta-mtime`
+  carries epoch seconds — a bare integer when whole, three decimal places when
+  fractional (`formatMetaMtime`) — so a local file's sub-millisecond mtime
+  quantises on the way through. rclone's default tolerance between a
+  local and an S3 remote is 1 ns, so a tree whose mtimes are not on whole
+  milliseconds re-transfers in full on the second `sync`
+  (`Modification times differ by -478.92µs`). `--modify-window 1ms` is the fix
+  in practice; the test stamps its fixtures on whole milliseconds and asserts
+  the drift case separately.
+
+- **`rclone check` cannot compare hashes here.** The gateway's ETag is the
+  first 32 hex of sha256 over `dev:ino:size:mtimeMs` with a `-1` suffix, which
+  rclone reads as "not a plain MD5": it reports `N hashes could not be checked`
+  and falls back to **size plus modification time**. `--size-only` is the
+  comparison with no hash in it at all.
+
 ## macOS host (verified 2026-07-28)
 
 macOS 26.6 (build 25G72), arm64 (`VirtualMac2,1`), Node v24.18.0, passwordless

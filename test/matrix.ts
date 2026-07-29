@@ -8,7 +8,7 @@
  * IDEA.md's organizing idea is that there is **one** conformance suite written
  * against the driver interface, run every way the library can carry it — and
  * that the matrix "reports honestly which capabilities each transport actually
- * loses, instead of a README table written from guesses". The four columns
+ * loses, instead of a README table written from guesses". The five columns
  * already exist as ordinary vitest files; this script is only the thing that
  * runs them and lays the results side by side:
  *
@@ -21,9 +21,12 @@
  *   its codecs, no socket needed. Tier 1: no root, no mount.
  * - **NFS** — `test/nfs/conformance.test.ts`, the whole NFSv3 stack over a real
  *   TCP socket. Tier 1: no root, no mount.
+ * - **S3** — `test/s3/conformance.test.ts`, the gateway with a JS client in
+ *   front of it. Tier 1, and one step cheaper still: the session is a function
+ *   from a request to a reply, so there is not even a socket.
  *
  * Deliberately dumb: it shells out to vitest's JSON reporter and parses the
- * result, because a custom reporter would have to be loaded into four separate
+ * result, because a custom reporter would have to be loaded into five separate
  * vitest processes (one of them under `sudo`) and then invent its own way of
  * getting the pieces back together. Nothing here knows anything about the
  * suite's contents.
@@ -80,6 +83,13 @@ const COLUMNS: Column[] = [
     file: "test/nfs/conformance.test.ts",
     root: false,
     description: "NFSv3 over a TCP socket, the JS client from `test/nfs/client.ts`",
+  },
+  {
+    key: "s3",
+    label: "S3",
+    file: "test/s3/conformance.test.ts",
+    root: false,
+    description: "an S3 gateway in process, the JS client from `test/s3/client.ts`",
   },
 ];
 
@@ -355,7 +365,7 @@ function main(): void {
   push();
   push(
     "**What this direction of derivation cannot check.** A column declares its own capabilities " +
-      "(`THROUGH_FUSE`, `THROUGH_9P`/`THROUGH_9P_REOPENED`, `THROUGH_NFS`), and declaring one " +
+      "(`THROUGH_FUSE`, `THROUGH_9P`/`THROUGH_9P_REOPENED`, `THROUGH_NFS`, `THROUGH_S3`), and declaring one " +
       "`false` skips every case that needs it " +
       "— which is exactly what a real loss looks like from here. So a capability the transport " +
       "*does* carry, wrongly declared lost, is reported as a loss with nothing to contradict it; " +

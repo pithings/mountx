@@ -40,6 +40,10 @@
       "types": "./dist/9p/index.d.mts",
       "default": "./dist/9p/index.mjs"
     },
+    "./s3": {
+      "types": "./dist/s3/index.d.mts",
+      "default": "./dist/s3/index.mjs"
+    },
     "./drivers/memory": {
       "types": "./dist/drivers/memory.d.mts",
       "default": "./dist/drivers/memory.mjs"
