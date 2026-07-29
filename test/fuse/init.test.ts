@@ -241,20 +241,54 @@ describe("preferences", () => {
     expect(session.flags & FUSE_WRITEBACK_CACHE).toBe(0n);
   });
 
-  it("exposes the opt-in flags", () => {
-    const { session } = ok(kernelInit(), {
-      posixLocks: true,
-      flockLocks: true,
-      cacheSymlinks: true,
-      exportSupport: true,
+  it("never asks for the three flags the session cannot serve", () => {
+    // `posixLocks`/`flockLocks`/`exportSupport` used to be booleans on
+    // `InitPreferences`. They were deleted: the session answers the lock
+    // opcodes `ENOSYS` and `checkName` rejects `.` and `..`, so their only
+    // reachable effect was to break a mount. The defaults must not ask for
+    // them, whatever this kernel happens to offer.
+    expect(DEFAULT_WANTED_FLAGS & FUSE_POSIX_LOCKS).toBe(0n);
+    expect(DEFAULT_WANTED_FLAGS & FUSE_FLOCK_LOCKS).toBe(0n);
+    expect(DEFAULT_WANTED_FLAGS & FUSE_EXPORT_SUPPORT).toBe(0n);
+
+    const kernel = kernelInit({
+      flags: splitInitFlags(
+        joinInitFlags(kernelInit().flags, kernelInit().flags2) |
+          FUSE_POSIX_LOCKS |
+          FUSE_FLOCK_LOCKS |
+          FUSE_EXPORT_SUPPORT,
+      ).flags,
     });
-    // Only the ones this kernel offered come back true.
-    expect(session.posixLocks).toBe(
-      (joinInitFlags(kernelInit().flags, kernelInit().flags2) & FUSE_POSIX_LOCKS) !== 0n,
-    );
-    expect(session.flockLocks).toBe(
-      (joinInitFlags(kernelInit().flags, kernelInit().flags2) & FUSE_FLOCK_LOCKS) !== 0n,
-    );
+    const { session } = ok(kernel);
+    expect(session.posixLocks).toBe(false);
+    expect(session.flockLocks).toBe(false);
+    expect(session.exportSupport).toBe(false);
+    expect(session.flags & (FUSE_POSIX_LOCKS | FUSE_FLOCK_LOCKS | FUSE_EXPORT_SUPPORT)).toBe(0n);
+  });
+
+  it("still reports the three as a readback when extraFlags asks for them", () => {
+    // The readback fields stayed: they say what the kernel *agreed to*, which
+    // is what the deliberate `extraFlags` escape hatch needs in order to be
+    // usable at all. A readback cannot fake a capability.
+    const kernel = kernelInit({
+      flags: splitInitFlags(
+        joinInitFlags(kernelInit().flags, kernelInit().flags2) | FUSE_POSIX_LOCKS,
+      ).flags,
+    });
+    const { session } = ok(kernel, { extraFlags: FUSE_POSIX_LOCKS | FUSE_FLOCK_LOCKS });
+    expect(session.posixLocks).toBe(true);
+    // Asked for, but this kernel did not offer it — so it is not claimed.
+    expect(session.flockLocks).toBe(false);
+  });
+
+  it("exposes cacheSymlinks, the one opt-in the session can serve", () => {
+    const kernel = kernelInit({
+      flags: splitInitFlags(
+        joinInitFlags(kernelInit().flags, kernelInit().flags2) | FUSE_CACHE_SYMLINKS,
+      ).flags,
+    });
+    expect(ok(kernel, { cacheSymlinks: true }).session.cacheSymlinks).toBe(true);
+    expect(ok(kernel).session.cacheSymlinks).toBe(false);
   });
 
   it("accepts a wholesale flag replacement", () => {

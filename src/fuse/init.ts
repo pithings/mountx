@@ -105,15 +105,23 @@ export interface InitPreferences {
   readdirplus?: boolean;
   /** Kernel-side write buffering. Default **off** — see the note above. */
   writebackCache?: boolean;
-  /** Remote POSIX locks. Default off. */
-  posixLocks?: boolean;
-  /** Remote BSD (`flock`) locks. Default off. */
-  flockLocks?: boolean;
   /** Let the kernel cache `READLINK` results. Default off. */
   cacheSymlinks?: boolean;
-  /** Answer lookups of `.` and `..` (needed by NFS export). Default off. */
-  exportSupport?: boolean;
-  /** Replaces {@link DEFAULT_WANTED_FLAGS} wholesale. */
+  /**
+   * Replaces {@link DEFAULT_WANTED_FLAGS} wholesale.
+   *
+   * **There are deliberately no booleans for `FUSE_POSIX_LOCKS`,
+   * `FUSE_FLOCK_LOCKS` or `FUSE_EXPORT_SUPPORT`.** All three negotiate work the
+   * session cannot do — it answers `GETLK`/`SETLK`/`SETLKW` with `ENOSYS`, and
+   * `checkName` rejects the two names (`.` and `..`) that `FUSE_EXPORT_SUPPORT`
+   * requires a server to resolve — so their only reachable effect was to break
+   * a mount. `posixLocks: true` was the worst of them: it stops the kernel
+   * doing local `fcntl` locking and routes every lock to a server that refuses,
+   * which is "capabilities are declared-or-inferred, never faked" defeated
+   * through a public option. This field and {@link extraFlags} remain as the
+   * deliberate escape hatch for anyone who knows better; nothing here will hand
+   * out a footgun by name.
+   */
   flags?: bigint;
   /** OR-ed onto the wanted set, after every other option. */
   extraFlags?: bigint;
@@ -139,6 +147,15 @@ export interface NegotiatedSession {
   writebackCache: boolean;
   atomicOTrunc: boolean;
   parallelDirops: boolean;
+  /**
+   * These three report what the kernel **agreed to**, and are kept even though
+   * {@link InitPreferences} no longer offers a boolean to ask for any of them.
+   * They are a different thing from an opt-in: a readback cannot fake a
+   * capability, and it is exactly what someone reaching for the `flags` /
+   * `extraFlags` escape hatch needs in order to find out whether their kernel
+   * went along with it. At the defaults all three are `false`, because
+   * {@link DEFAULT_WANTED_FLAGS} never asks.
+   */
   posixLocks: boolean;
   flockLocks: boolean;
   cacheSymlinks: boolean;
@@ -201,10 +218,10 @@ function wantedFlags(preferences: InitPreferences): bigint {
     wanted &= ~(FUSE_DO_READDIRPLUS | FUSE_READDIRPLUS_AUTO);
   }
   toggle(FUSE_WRITEBACK_CACHE, preferences.writebackCache);
-  toggle(FUSE_POSIX_LOCKS, preferences.posixLocks);
-  toggle(FUSE_FLOCK_LOCKS, preferences.flockLocks);
   toggle(FUSE_CACHE_SYMLINKS, preferences.cacheSymlinks);
-  toggle(FUSE_EXPORT_SUPPORT, preferences.exportSupport);
+  // No toggles for FUSE_POSIX_LOCKS / FUSE_FLOCK_LOCKS / FUSE_EXPORT_SUPPORT —
+  // see `InitPreferences.flags`. `extraFlags` is the way in for someone who
+  // means it.
   wanted |= preferences.extraFlags ?? 0n;
   wanted &= ~(preferences.withoutFlags ?? 0n);
   return BigInt.asUintN(64, wanted);
