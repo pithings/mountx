@@ -487,6 +487,14 @@ export const DATA_SYNC4 = 1;
 export const FILE_SYNC4 = 2;
 
 // ---------------------------------------------------------------------------
+// secinfo_style4 (RFC 8881 §18.45.1)
+// ---------------------------------------------------------------------------
+
+/** `enum secinfo_style4` — which object SECINFO_NO_NAME is asking about. */
+export const SECINFO_STYLE4_CURRENT_FH = 0;
+export const SECINFO_STYLE4_PARENT = 1;
+
+// ---------------------------------------------------------------------------
 // OPEN (RFC 8881 §18.16.1 arguments, §18.16.2 results)
 // ---------------------------------------------------------------------------
 
