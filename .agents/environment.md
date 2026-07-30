@@ -310,6 +310,33 @@ The read-only facts below were established before the run and still hold.
 found`), so there is no way to hand a mountx socket to `virtio-9p` and TCP is
   genuinely the route, not a fallback.
 
+## pjdfstest's build prerequisite (verified 2026-07-30, this Linux host)
+
+`pnpm test:pjdfstest` clones a project that ships **`configure.ac`, not
+`configure`**, so the first run needs autotools — and this image has none of it
+until something asks:
+
+- `autoreconf` and `aclocal` are absent from a fresh container; `/usr/local/sbin`
+  holds **shims** for `autoconf` and `automake` that install the real package on
+  first invocation (Fedora `dnf`: autoconf 2.72, automake 1.18.1). `autoreconf`
+  and `autoheader` arrive with autoconf, `aclocal` with automake, both in
+  `/usr/sbin`.
+- So the whole prerequisite is **invoking the two shims once**, in this order,
+  before the harness:
+
+  ```sh
+  autoconf --version >/dev/null; automake --version >/dev/null
+  ```
+
+  Without them `run.sh` stops at `autoreconf: command not found`, having already
+  cloned into `test/pjdfstest/pjdfstest` — which is fine to leave: the clone is
+  pinned and gitignored, and a second run picks it up and only builds.
+
+- Everything after the build is already root's (`run.sh` runs `run.ts` under
+  `sudo`, because pjdfstest changes uid and mounting needs it), and that is also
+  why the suite's numbers are for a **privileged** mount: no `nodev`, so device
+  nodes are openable there and would not be under `fusermount3`.
+
 ## rclone, the S3 oracle (installed 2026-07-29)
 
 - **`~/.local/bin/rclone`, rclone v1.74.4** (linux/amd64, go1.26.5, statically
