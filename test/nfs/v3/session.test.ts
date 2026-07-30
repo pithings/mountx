@@ -35,6 +35,7 @@ import {
   MSG_DENIED,
   NF3CHR,
   NF3DIR,
+  NF3FIFO,
   NF3REG,
   NFS3_OK,
   NFS3ERR_BAD_COOKIE,
@@ -60,6 +61,7 @@ import { decodeReply, encodeCall, frameFragments } from "../../../src/nfs/rpc.ts
 import { encodeXdr } from "../../../src/nfs/xdr.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
 import type { FsDriver } from "../../../src/types.ts";
+import { withoutExtensions } from "../../no-extensions.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
 import { createLoopback, type Loopback } from "../../../src/harness.ts";
 
@@ -750,11 +752,35 @@ describe("individual procedures", () => {
     expect((await client.lookup(root, "excl")).status).toBe(NFS3ERR_NOENT);
   });
 
-  it("answers MKNOD with NOTSUPP, because the driver interface cannot express it", async () => {
-    const { client, root } = await serve();
+  it("answers MKNOD with NOTSUPP when the driver has no mknod extension", async () => {
+    const { client, root } = await serve(withoutExtensions(createMemoryDriver()));
     const made = await client.mknod(root, "dev", NF3CHR, { mode: 0o666 }, { major: 1, minor: 3 });
     expect(made.status).toBe(NFS3ERR_NOTSUPP);
     expect(made.dirWcc.after).toBeDefined();
+  });
+
+  it("creates a device node and a FIFO through the mknod extension", async () => {
+    const { client, root, fs } = await serve();
+
+    const device = await client.mknod(root, "dev", NF3CHR, { mode: 0o666 }, { major: 1, minor: 3 });
+    expect(device.status).toBe(NFS3_OK);
+    // `ftype3` and `specdata3` both come back on the wire, from the driver's
+    // `mode` and `rdev` — the two fields a special file *is*.
+    expect(device.objAttributes?.type).toBe(NF3CHR);
+    expect(device.objAttributes?.rdev).toEqual({ major: 1, minor: 3 });
+
+    const fifo = await client.mknod(root, "fifo", NF3FIFO, { mode: 0o644 });
+    expect(fifo.status).toBe(NFS3_OK);
+    expect(fifo.objAttributes?.type).toBe(NF3FIFO);
+
+    // ...and the same two files seen through GETATTR a second time, from the
+    // driver over this client rather than from the create reply.
+    const stats = await fs.lstat("/dev");
+    expect(stats.isCharacterDevice()).toBe(true);
+    expect(stats.rdev).toBe((1 << 8) | 3);
+    expect((await fs.lstat("/fifo")).isFIFO()).toBe(true);
+    const entries = await fs.readdir("/", { withFileTypes: true });
+    expect(entries.find((entry) => entry.name === "fifo")?.isFIFO()).toBe(true);
   });
 
   it("reports EOF on a READ that reaches the end, and not before", async () => {

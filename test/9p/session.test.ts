@@ -86,6 +86,7 @@ import {
   type FileHandleLike,
   type FsDriver,
 } from "../../src/types.ts";
+import { withoutExtensions } from "../no-extensions.ts";
 import { P9Client } from "./client.ts";
 
 /** `DT_*`, which is `(mode & S_IFMT) >> 12`. */
@@ -1767,7 +1768,9 @@ describe("Tmkdir, Tsymlink, Treadlink, Tlink and Tmknod", () => {
   });
 
   it("mknod: a regular file through the fallback, ENOSYS for a device", async () => {
-    const { client, fs } = await serve();
+    // The fallback is for a driver with no extension; the memory driver has
+    // one, and the case below covers that path.
+    const { client, fs } = await serve(withoutExtensions(createMemoryDriver()));
     const qid = await client.mknod(0, "plain", { mode: S_IFREG | 0o600 });
     expect(qid.type).toBe(P9_QTFILE);
     expect((await fs.lstat("/plain")).mode & 0o777).toBe(0o600);

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
 import { createLoopback } from "../src/harness.ts";
+import { S_IFCHR, S_IFIFO, S_IFSOCK } from "../src/types.ts";
 
 describe("memory driver", () => {
   it("applies umask and ownership options", async () => {
@@ -223,5 +224,46 @@ describe("memory driver", () => {
     await fs.rename("/c", "/b");
     expect((await fs.stat("/a")).nlink).toBe(1);
     expect((await fs.stat("/b")).nlink).toBe(1);
+  });
+
+  it("refuses to open or truncate a special file, which holds no bytes", async () => {
+    // The shared conformance suite does not ask this: over a mount no client
+    // ever gets here — the FUSE, 9P and NFS clients all supply pipe, socket and
+    // device semantics locally and never send the open across — so the only
+    // caller who can is a loopback one, and handing it a byte buffer would be a
+    // filesystem no mount has. `ENXIO` is `open(2)`'s answer for a device with
+    // nothing behind it, which is the situation exactly.
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mountx!.mknod!("/fifo", S_IFIFO | 0o644, 0);
+    await fs.mountx!.mknod!("/null", S_IFCHR | 0o666, (1 << 8) | 3);
+    await expect(fs.open("/fifo", "r")).rejects.toMatchObject({ code: "ENXIO" });
+    await expect(fs.open("/null", "w")).rejects.toMatchObject({ code: "ENXIO" });
+    // `truncate(2)`'s own answer for anything that is not a regular file.
+    await expect(fs.truncate("/fifo", 0)).rejects.toMatchObject({ code: "EINVAL" });
+    // ...and neither refusal costs the node its identity.
+    expect((await fs.stat("/fifo")).isFIFO()).toBe(true);
+    expect((await fs.stat("/null")).rdev).toBe((1 << 8) | 3);
+  });
+
+  it("gives a FIFO and a socket no device number to carry", async () => {
+    // POSIX leaves `dev` unused for these two, so a caller passing one anyway
+    // must not end up with a FIFO that stats like a device.
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mountx!.mknod!("/fifo", S_IFIFO | 0o644, (1 << 8) | 3);
+    await fs.mountx!.mknod!("/sock", S_IFSOCK | 0o600, 42);
+    expect((await fs.stat("/fifo")).rdev).toBe(0);
+    expect((await fs.stat("/sock")).rdev).toBe(0);
+  });
+
+  it("counts a special file in statfs and lets go of it on unlink", async () => {
+    const fs = createLoopback(createMemoryDriver());
+    const before = await fs.statfs("/");
+    await fs.mountx!.mknod!("/fifo", S_IFIFO | 0o644, 0);
+    const after = await fs.statfs("/");
+    // One more inode, and no blocks: the node holds nothing.
+    expect(before.ffree - after.ffree).toBe(1);
+    expect(after.bfree).toBe(before.bfree);
+    await fs.unlink("/fifo");
+    expect((await fs.statfs("/")).ffree).toBe(before.ffree);
   });
 });

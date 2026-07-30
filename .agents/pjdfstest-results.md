@@ -1,8 +1,8 @@
 # pjdfstest against a mountx FUSE mount
 
-Measured 2026-07-28 on the dev host (Linux 6.12, FUSE protocol 7.41, Node
-v24.18.0). Reproduce with `pnpm test:pjdfstest`; the harness is
-`test/pjdfstest/run.sh` + `run.ts` and writes `results.txt` / `results.json`
+Measured 2026-07-28 and again 2026-07-30 on the dev host (Linux 6.12, FUSE
+protocol 7.41, Node v24.18.0). Reproduce with `pnpm test:pjdfstest`; the harness
+is `test/pjdfstest/run.sh` + `run.ts` and writes `results.txt` / `results.json`
 next to itself (both gitignored — this file is the committed part).
 
 - **Suite:** <https://github.com/pjd/pjdfstest>, pinned at
@@ -19,37 +19,48 @@ next to itself (both gitignored — this file is the committed part).
 
 ## Headline
 
-|             | files | files failing | pass | fail | pass rate |
-| ----------- | ----: | ------------: | ---: | ---: | --------: |
-| first run   |   238 |            72 | 4952 | 3819 |     56.5% |
-| after fixes |   238 |        **45** | 5179 | 3591 | **59.1%** |
+|                     | files | files failing |     pass | fail |  pass rate |
+| ------------------- | ----: | ------------: | -------: | ---: | ---------: |
+| first run           |   238 |            72 |     4952 | 3819 |      56.5% |
+| after fixes         |   238 |            45 |     5179 | 3591 |      59.1% |
+| with `mountx.mknod` |   238 |         **0** | **8770** |    0 | **100.0%** |
 
-The pass _rate_ is the least interesting number here and is dominated by one
-missing feature — see "Everything that still fails". The number that moved is
-**72 → 45 failing files**, and four categories going to 100%.
+**The whole suite passes.** The first two rows are the state before special files
+existed; the pass _rate_ there was dominated by one missing feature and is kept
+because what it measured is still worth reading (see "Everything that used to
+fail"). The third row is `mountx.mknod` plus its implementation in the memory
+driver — the same instrument, the same 8770 assertions, none of them failing.
 
-## Per category (final run)
+**It is a root run, and that is not incidental.** pjdfstest needs root to test
+permission enforcement, so the mount is `mount(8)`'s and carries no `nodev`. An
+unprivileged mount goes through `fusermount3`, which adds `nodev` itself, and
+device-node _opens_ under one would fail — so this 100% is the number for a
+privileged mount. FIFOs and sockets are unaffected either way.
 
-| category        | files | files failing | pass | fail | todo | pass rate | first run |
-| --------------- | ----: | ------------: | ---: | ---: | ---: | --------: | --------: |
-| chflags         |    14 |             0 |   14 |    0 |    0 |    100.0% |    100.0% |
-| chmod           |    13 |             3 |  199 |  128 |    0 |     60.9% |     55.0% |
-| chown           |    11 |             3 |  650 |  820 |   27 |     44.2% |     39.4% |
-| ftruncate       |    15 |             0 |   89 |    0 |    0 |    100.0% |     92.1% |
-| granular        |     7 |             0 |    7 |    0 |    0 |    100.0% |    100.0% |
-| link            |    18 |             3 |  199 |  160 |    0 |     55.4% |     53.2% |
-| mkdir           |    13 |             2 |   95 |   23 |    0 |     80.5% |     77.1% |
-| mkfifo          |    13 |             7 |   51 |   69 |    0 |     42.5% |     41.7% |
-| mknod           |    12 |             8 |   65 |  121 |    0 |     34.9% |     33.3% |
-| open            |    27 |             5 |  258 |   79 |    0 |     76.6% |     54.6% |
-| posix_fallocate |     1 |             0 |    1 |    0 |    0 |    100.0% |    100.0% |
-| rename          |    25 |             8 | 2905 | 1952 |    0 |     59.8% |     59.2% |
-| rmdir           |    16 |             2 |  126 |   19 |    0 |     86.9% |     85.5% |
-| symlink         |    13 |             1 |   87 |    8 |    0 |     91.6% |     90.5% |
-| truncate        |    15 |             0 |   84 |    0 |    0 |    100.0% |     91.7% |
-| unlink          |    15 |             2 |  247 |  192 |    1 |     56.3% |     56.0% |
-| utimensat       |    10 |             1 |  102 |   20 |    0 |     83.6% |     83.6% |
-| **total**       |   238 |            45 | 5179 | 3591 |   28 |     59.1% |     56.5% |
+## Per category
+
+Two prior-run columns, since the point of the table is what moved.
+
+| category        | files | files failing | pass | fail | todo | pass rate | 07-28 | first |
+| --------------- | ----: | ------------: | ---: | ---: | ---: | --------: | ----: | ----: |
+| chflags         |    14 |             0 |   14 |    0 |    0 |    100.0% |  100% |  100% |
+| chmod           |    13 |             0 |  327 |    0 |    0 |    100.0% | 60.9% | 55.0% |
+| chown           |    11 |             0 | 1470 |    0 |   27 |    100.0% | 44.2% | 39.4% |
+| ftruncate       |    15 |             0 |   89 |    0 |    0 |    100.0% |  100% | 92.1% |
+| granular        |     7 |             0 |    7 |    0 |    0 |    100.0% |  100% |  100% |
+| link            |    18 |             0 |  359 |    0 |    0 |    100.0% | 55.4% | 53.2% |
+| mkdir           |    13 |             0 |  118 |    0 |    0 |    100.0% | 80.5% | 77.1% |
+| mkfifo          |    13 |             0 |  120 |    0 |    0 |    100.0% | 42.5% | 41.7% |
+| mknod           |    12 |             0 |  186 |    0 |    0 |    100.0% | 34.9% | 33.3% |
+| open            |    27 |             0 |  337 |    0 |    0 |    100.0% | 76.6% | 54.6% |
+| posix_fallocate |     1 |             0 |    1 |    0 |    0 |    100.0% |  100% |  100% |
+| rename          |    25 |             0 | 4857 |    0 |    0 |    100.0% | 59.8% | 59.2% |
+| rmdir           |    16 |             0 |  145 |    0 |    0 |    100.0% | 86.9% | 85.5% |
+| symlink         |    13 |             0 |   95 |    0 |    0 |    100.0% | 91.6% | 90.5% |
+| truncate        |    15 |             0 |   84 |    0 |    0 |    100.0% |  100% | 91.7% |
+| unlink          |    15 |             0 |  439 |    0 |    1 |    100.0% | 56.3% | 56.0% |
+| utimensat       |    10 |             0 |  122 |    0 |    0 |    100.0% | 83.6% | 83.6% |
+| **total**       |   238 |             0 | 8770 |    0 |   28 |    100.0% | 59.1% | 56.5% |
 
 `chflags` is 14/14 because every one of its tests is "this system does not have
 `chflags`, skip" — Linux, not us. The 28 `# TODO` results are assertions the
@@ -98,11 +109,14 @@ hand. Each is documented at the code that fixes it.
    milestone-5 oracles — record/replay and the differential suite — rather than
    here, but both show up in these numbers.
 
-## Everything that still fails
+## Everything that used to fail
 
-**All 3591 remaining failures are one missing feature.** Every one of the 45
-failing files exercises FIFOs, UNIX-domain sockets or device nodes, and the
-failures decompose as:
+Kept because it is the record of what one missing feature costs a POSIX suite,
+and of the prediction the third run tested.
+
+**All 3591 failures as of 2026-07-28 were one missing feature.** Every one of the
+45 failing files exercised FIFOs, UNIX-domain sockets or device nodes, and they
+decomposed as:
 
 | what                                                                                       | count |
 | ------------------------------------------------------------------------------------------ | ----: |
@@ -110,31 +124,33 @@ failures decompose as:
 | the same, where pjdfstest prints a bare `not ok` (its socket helper)                       |   104 |
 | downstream of those: `ENOENT`/`EISDIR`/unexpected success on a name that was never created |  2796 |
 
-The cascade is what makes the raw percentages misleading. `mkdir/10.t` is
-typical: it loops over seven file types, and for `fifo` the `mkfifo` fails, the
-following `mkdir` therefore _succeeds_ where `EEXIST` was expected, and the
-`unlink` after it hits the directory that mkdir just made — one missing feature,
-three failed assertions, in every iteration of every loop. `rename/09.t` and
-`rename/10.t` alone are 1772 of the 3591, and they are a nested loop over the
-same seven types.
+The cascade is what made the raw percentages misleading. `mkdir/10.t` is
+typical: it loops over seven file types, and for `fifo` the `mkfifo` failed, the
+following `mkdir` therefore _succeeded_ where `EEXIST` was expected, and the
+`unlink` after it hit the directory that mkdir had just made — one missing
+feature, three failed assertions, in every iteration of every loop.
+`rename/09.t` and `rename/10.t` alone were 1772 of the 3591, and they are a
+nested loop over the same seven types. That is also why the fix is worth more
+than its own two categories: `rename` went 2905 → 4857 passing assertions
+without a line of rename code changing.
 
 ### Classification
 
-- **Driver limitation (expected, and the accepted answer for v1).** `FsDriver`
-  has no `mknod`: the interface is a subset of `node:fs/promises`, which has no
-  way to create a FIFO, a socket or a device node either. `FUSE_MKNOD` for a
-  regular file is handled (the kernel uses it when `CREATE` is unavailable);
-  everything else answers `-ENOSYS`, which is how a FUSE server says "not
-  implemented" and is what the milestone brief names as acceptable.
-  Worth noting for whenever it _is_ implemented: there is no kernel obstacle.
-  A FUSE server creates a special file by inventing an inode with the right
-  `S_IF*` in `mode` (and `rdev` for devices) and reporting it in `getattr` —
-  the VFS supplies the pipe, socket and device semantics itself. It needs an
-  `FsDriver.mknod` (or an `mountx.mknod` extension) and matching storage in
-  the in-memory driver, and it would take the suite from 45 failing files to
-  a handful. It is a milestone-1 interface change, so it is not one this
-  milestone made.
-- **Session bugs.** None left. The five above were fixed and re-measured.
+- **Driver limitation — closed.** `FsDriver` has no `mknod`, because the
+  interface is a subset of `node:fs/promises`, which cannot create a FIFO, a
+  socket or a device node either. That is why it is `mountx.mknod`, an
+  extension, and why the 2026-07-28 run answered `-ENOSYS` to everything but a
+  regular file (which `FUSE_MKNOD` also carries, since the kernel uses it when
+  `CREATE` is unavailable). There was never a kernel obstacle: a FUSE server
+  makes a special file by inventing an inode with the right `S_IF*` in `mode`
+  (and `rdev` for the two device types) and reporting it in `getattr` — the VFS
+  supplies the pipe, socket and device semantics itself. `src/drivers/memory.ts`
+  now implements the extension on exactly those terms, and this suite is what
+  says it is enough: **45 failing files → 0**, which beats the "a handful" this
+  file predicted.
+- **Session bugs.** None left. The five above were fixed and re-measured, and
+  the third run found no new ones — the special-file paths in `#mknod` and
+  `#claim` were exercised for the first time here and needed no change.
 - **Kernel/FUSE semantics deliberately not supported.** None are load-bearing
   in the remaining numbers, but two are worth stating because they would be the
   next things to trip over:

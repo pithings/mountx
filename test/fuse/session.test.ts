@@ -45,6 +45,7 @@ import {
 } from "../../src/fuse/protocol.ts";
 import { createFuseSession, FuseSession, type FuseSessionOptions } from "../../src/fuse/session.ts";
 import { S_IFDIR, S_IFMT, S_IFREG, type FsDriver, type StatsLike } from "../../src/types.ts";
+import { withoutExtensions } from "../no-extensions.ts";
 import { KernelError, SyntheticKernel } from "./synthetic-kernel.ts";
 
 /**
@@ -233,7 +234,9 @@ describe("the full mount sequence", () => {
   });
 
   it("synthesizes MKNOD for regular files", async () => {
-    const { session, kernel } = await mount();
+    // Without the extension, which is what this fallback is for — the memory
+    // driver has one, and the case below is where that path is tested.
+    const { session, kernel } = await mount(withoutExtensions(createMemoryDriver()));
     const entry = await kernel.mknod(FUSE_ROOT_ID, "node", S_IFREG | 0o600);
     expect(entry.attr.mode & S_IFMT).toBe(S_IFREG);
     // A FIFO needs the `mountx.mknod` extension, and says so.
