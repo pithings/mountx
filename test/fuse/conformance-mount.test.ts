@@ -25,10 +25,12 @@
  * their only client; see the threadpool note at the top of `src/fuse/mount.ts`.
  */
 
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe } from "vitest";
+import { promisify } from "node:util";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
 import { createNodeFsDriver } from "../../src/drivers/node-fs.ts";
 import { mount, type Mount } from "../../src/fuse/mount.ts";
@@ -41,6 +43,8 @@ import { removeAll } from "./differential.ts";
 // (macFUSE is a different protocol), so the suite skips rather than errors.
 const isRoot = (process.getuid?.() ?? -1) === 0 && process.platform === "linux";
 
+const exec = promisify(execFile);
+
 /**
  * What survives the trip through FUSE.
  *
@@ -52,8 +56,11 @@ const isRoot = (process.getuid?.() ?? -1) === 0 && process.platform === "linux";
  * capabilities each transport actually loses").
  *
  * `extensions` is empty on purpose: the `mountx.*` namespace is a
- * driver-to-session channel and has no wire representation, so nothing that
- * uses it can cross a mount. Nothing in the suite needs it.
+ * driver-to-session channel, and the suite's extension cases call it *by name*
+ * through `fs.mountx` — which a client on the far side of a mount does not
+ * have, whatever the session does with `MKNOD` when one arrives. What crosses
+ * the wire is checked by the case at the bottom of this file instead, in the
+ * only terms a mounted client has: `mkfifo`, `mknod` and `bind`.
  */
 const THROUGH_FUSE: ResolvedCapabilities = {
   handles: true,
@@ -144,4 +151,58 @@ describe.skipIf(!isRoot)("over a real FUSE mount", () => {
     capabilities: THROUGH_FUSE,
     setup: column("node-fs"),
   });
+
+  /**
+   * The one thing the shared suite cannot ask a mounted client for.
+   *
+   * `mountx.mknod` is reached by name through `fs.mountx` in the loopback
+   * column, and a client on the far side of a mount has no such handle — it has
+   * `mkfifo(3)`, `mknod(2)` and `bind(2)`, all of which arrive as `FUSE_MKNOD`.
+   * What is being checked is not that the driver stored something: it is that
+   * the *kernel* gives a node the driver invented the semantics of the type it
+   * claims. Data really flows through the FIFO, and the character device really
+   * reads as `/dev/null` does, neither of which the driver implements.
+   *
+   * Every command runs in a child process: this one serves the mount, so a
+   * synchronous call against it is an instant deadlock (see the file header).
+   * The node driver's column is not run here — `node:fs/promises` cannot create
+   * a special file, so `createNodeFsDriver` has no `mountx.mknod` to test.
+   */
+  it("carries FIFOs, sockets and device nodes across the wire", async () => {
+    const root = join(at["memory"]!, `case-${cases++}`);
+    await mkdir(root);
+    const fs = createLoopback(rootedNodeFs(root));
+    const path = (name: string): string => join(root, name);
+    try {
+      await exec("mkfifo", [path("pipe")]);
+      expect((await fs.lstat("/pipe")).isFIFO()).toBe(true);
+      // The kernel's pipe, over an inode this server invented: one process
+      // writes, another reads, and neither touches the driver to do it.
+      const piped = await exec("sh", [
+        "-c",
+        `(echo hello > ${path("pipe")} &) ; cat ${path("pipe")}`,
+      ]);
+      expect(piped.stdout).toBe("hello\n");
+
+      // `bind(2)`, which is the only way to make a socket and is `FUSE_MKNOD`
+      // on the wire like the rest.
+      await exec(process.execPath, [
+        "-e",
+        `require("net").createServer().listen(${JSON.stringify(path("sock"))}, () => process.exit(0))`,
+      ]);
+      expect((await fs.lstat("/sock")).isSocket()).toBe(true);
+
+      // A device node — root only, and root is what this file already needs.
+      // `mount(8)` adds no `nodev` here, unlike `fusermount3`, so the node is
+      // openable and reads as the device it names rather than as a file.
+      await exec("mknod", [path("null"), "c", "1", "3"]);
+      const device = await fs.lstat("/null");
+      expect(device.isCharacterDevice()).toBe(true);
+      expect(device.rdev).toBe((1 << 8) | 3);
+      const read = await exec("sh", ["-c", `head -c 8 ${path("null")} | wc -c`]);
+      expect(read.stdout.trim()).toBe("0");
+    } finally {
+      await removeAll(root);
+    }
+  }, 60_000);
 });

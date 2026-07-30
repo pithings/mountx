@@ -15,7 +15,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ErrnoCode } from "../src/errors.ts";
 import { ERRNO_CODES } from "../src/errors.ts";
 import type { Loopback, ResolvedCapabilities } from "../src/harness.ts";
-import { S_IFMT } from "../src/types.ts";
+import type { MountxExtensions } from "../src/types.ts";
+import { S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK } from "../src/types.ts";
 
 export interface ConformanceTarget {
   /** Name of the driver under test. */
@@ -62,8 +63,21 @@ async function rejectsRange(promise: Promise<unknown>): Promise<void> {
   await expect(promise).rejects.toMatchObject({ code: "ERR_OUT_OF_RANGE" });
 }
 
-/** Something a case needs before it can mean anything: a capability, or root. */
-export type Requirement = keyof ResolvedCapabilities | "root";
+/**
+ * Something a case needs before it can mean anything: a capability, root, or
+ * one named member of the `mountx.*` extension namespace.
+ *
+ * The extensions are spelled `mountx.<name>` rather than folded into
+ * `capabilities`, because `extensions` is a *list* — `capabilities.extensions`
+ * is never `true`, so a case gated on it alone would skip everywhere and say
+ * nothing about which extension it wanted.
+ */
+export type Requirement =
+  | Exclude<keyof ResolvedCapabilities, "extensions">
+  | "root"
+  | `mountx.${keyof MountxExtensions}`;
+
+const EXTENSION_PREFIX = "mountx.";
 
 /** The `[needs …]` marker appended to every gated case name. */
 export const REQUIREMENT_TAG = /\s\[needs ([^\]]+)]$/;
@@ -111,8 +125,16 @@ export function conformance(target: ConformanceTarget): void {
    * `.agents/conformance-matrix.md`). Declaring the requirement and the skip in
    * one call is what keeps the two from drifting apart.
    */
-  const met = (requirement: Requirement): boolean =>
-    requirement === "root" ? isRoot : capabilities[requirement] === true;
+  const met = (requirement: Requirement): boolean => {
+    if (requirement === "root") {
+      return isRoot;
+    }
+    if (requirement.startsWith(EXTENSION_PREFIX)) {
+      const name = requirement.slice(EXTENSION_PREFIX.length) as keyof MountxExtensions;
+      return capabilities.extensions.includes(name);
+    }
+    return capabilities[requirement as Exclude<keyof ResolvedCapabilities, "extensions">] === true;
+  };
   const tag = (requirements: readonly Requirement[]): string =>
     ` [needs ${requirements.join(" + ")}]`;
   const itNeeds =
@@ -636,6 +658,92 @@ export function conformance(target: ConformanceTarget): void {
       it("rejects creating a symlink over an existing name with EEXIST", async () => {
         await fs.writeFile("/taken", "x");
         await rejects(fs.symlink("whatever", "/taken"), "EEXIST");
+      });
+    });
+
+    describeNeeds("mountx.mknod")("special files", () => {
+      /**
+       * The extension, which the gate above has established this target has.
+       *
+       * It is reached through `fs.mountx` rather than through a method of its
+       * own: `FsDriver` is a subset of `node:fs/promises`, which cannot create
+       * a FIFO, a socket or a device node, so this is the one thing a driver
+       * says in the extension namespace instead.
+       */
+      const mknod = (path: string, mode: number, dev = 0): Promise<void> =>
+        fs.mountx!.mknod!(path, mode, dev);
+
+      it("creates a FIFO and a socket that stat and readdir both name", async () => {
+        await mknod("/fifo", S_IFIFO | 0o644);
+        await mknod("/sock", S_IFSOCK | 0o600);
+
+        const fifo = await fs.stat("/fifo");
+        expect(fifo.isFIFO()).toBe(true);
+        expect(fifo.isFile()).toBe(false);
+        expect(fifo.mode & S_IFMT).toBe(S_IFIFO);
+        expect(fifo.mode & 0o7777).toBe(0o644);
+        expect(fifo.size).toBe(0);
+
+        const sock = await fs.stat("/sock");
+        expect(sock.isSocket()).toBe(true);
+        expect(sock.mode & S_IFMT).toBe(S_IFSOCK);
+
+        // A dirent decides the same seven predicates off the same one field,
+        // and a client that only ever reads the directory must see it too.
+        const entries = new Map(
+          (await fs.readdir("/", { withFileTypes: true })).map((entry) => [entry.name, entry]),
+        );
+        expect(entries.get("fifo")?.isFIFO()).toBe(true);
+        expect(entries.get("sock")?.isSocket()).toBe(true);
+        expect(entries.get("sock")?.isFile()).toBe(false);
+      });
+
+      it("carries the device number of a character and a block device", async () => {
+        // `/dev/null` and `/dev/loop0`, as good a pair of numbers as any: the
+        // point is that `dev` survives, not that these two mean anything here.
+        const nullDev = (1 << 8) | 3;
+        const loopDev = (7 << 8) | 0;
+        await mknod("/char", S_IFCHR | 0o666, nullDev);
+        await mknod("/block", S_IFBLK | 0o660, loopDev);
+
+        const character = await fs.stat("/char");
+        expect(character.isCharacterDevice()).toBe(true);
+        expect(character.rdev).toBe(nullDev);
+
+        const block = await fs.stat("/block");
+        expect(block.isBlockDevice()).toBe(true);
+        expect(block.rdev).toBe(loopDev);
+      });
+
+      it("creates a regular file from a mode naming one, or naming no type", async () => {
+        // The fallback every session already has when no driver implements the
+        // extension, and which a driver that does implement it must not lose:
+        // `mknod(path, S_IFREG)` — and `mknod(path, 0)`, which POSIX reads the
+        // same way — is how a few tools still create an empty file.
+        await mknod("/plain", 0o644);
+        await mknod("/regular", S_IFREG | 0o600);
+        expect((await fs.stat("/plain")).isFile()).toBe(true);
+        expect((await fs.stat("/regular")).isFile()).toBe(true);
+        expect((await fs.stat("/regular")).size).toBe(0);
+        expect(await read("/regular")).toBe("");
+      });
+
+      it("is an ordinary name once it exists: rename, unlink, stat again", async () => {
+        await mknod("/fifo", S_IFIFO | 0o644);
+        await fs.rename("/fifo", "/moved");
+        await rejects(fs.stat("/fifo"), "ENOENT");
+        expect((await fs.stat("/moved")).isFIFO()).toBe(true);
+        await fs.unlink("/moved");
+        await rejects(fs.stat("/moved"), "ENOENT");
+      });
+
+      it("refuses an existing name, a missing directory and a type with its own call", async () => {
+        await fs.writeFile("/taken", "x");
+        await rejects(mknod("/taken", S_IFIFO | 0o644), "EEXIST");
+        await rejects(mknod("/nowhere/fifo", S_IFIFO | 0o644), "ENOENT");
+        // `mknod(2)` answers `EPERM` for a directory: `mkdir` is that call, and
+        // this one must not become a second way in.
+        await rejects(mknod("/dir", S_IFDIR | 0o755), "EPERM");
       });
     });
 

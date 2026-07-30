@@ -373,7 +373,11 @@ function main(): void {
     "Derived from the run, not declared here: a requirement counts as unmet in a column when no " +
       "case that names it passed there. `root` is an environment fact rather than a transport " +
       "one — it gates the one case that hands a file away, which only root may do — so it is " +
-      "reported in its own column.",
+      "reported in its own column. A `mountx.*` requirement is left out of this table entirely: " +
+      "the suite calls an extension by name through `fs.mountx`, which only the loopback column " +
+      "has, so a skip everywhere else is a fact about how the case is written and not about what " +
+      "the transport carries (all four sessions do carry `mknod` — see the per-case rows below, " +
+      "and the FUSE column's own `mkfifo`/`mknod`/`bind` case over a real mount).",
   );
   push();
   push(
@@ -393,7 +397,15 @@ function main(): void {
   for (const column of COLUMNS) {
     const result = results.get(column.key)!;
     const missing = [...(unmet.get(column.key) ?? [])];
-    const lost = missing.filter((name) => name !== "root");
+    // `root` is an environment fact, reported in its own cell. A `mountx.*`
+    // requirement is neither a capability nor a loss: the suite reaches an
+    // extension by name through `fs.mountx`, which only the loopback column
+    // has — every other column is a client on the far side of a wire, and the
+    // wire has no such handle. A skip there says nothing about whether the
+    // transport carries the *operation* (all four sessions carry `mknod`), so
+    // calling it a loss would be a claim the run cannot make in either
+    // direction. The per-case rows below still show the skips.
+    const lost = missing.filter((name) => name !== "root" && !name.startsWith("mountx."));
     const environment = missing.includes("root") ? "not root: `root` cases skipped" : "complete";
     push(
       result.unavailable === undefined

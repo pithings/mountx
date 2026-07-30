@@ -15,12 +15,22 @@ import type {
   FileHandleLike,
   FullFsDriver,
   MkdirOptions,
+  MountxExtensions,
   ReaddirOptions,
   StatsFsLike,
   StatsLike,
   TimeLike,
 } from "../types.ts";
-import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../types.ts";
+import {
+  S_IFBLK,
+  S_IFCHR,
+  S_IFDIR,
+  S_IFIFO,
+  S_IFLNK,
+  S_IFMT,
+  S_IFREG,
+  S_IFSOCK,
+} from "../types.ts";
 
 const BLOCK_SIZE = 4096;
 const MAX_SYMLINK_DEPTH = 40;
@@ -78,12 +88,50 @@ export interface MemoryDriverOptions {
 const isDirectory = (node: MemNode): boolean => (node.mode & S_IFMT) === S_IFDIR;
 const isSymlink = (node: MemNode): boolean => (node.mode & S_IFMT) === S_IFLNK;
 
+/** The four types only `mountx.mknod` can make, and which hold no bytes. */
+const SPECIAL_TYPES: ReadonlySet<number> = new Set([S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK]);
+const isSpecial = (node: MemNode): boolean => SPECIAL_TYPES.has(node.mode & S_IFMT);
+
+/** Type predicates for `StatsLike` and `DirentLike` alike: one field decides all seven. */
+type TypePredicates = Pick<
+  StatsLike,
+  | "isFile"
+  | "isDirectory"
+  | "isSymbolicLink"
+  | "isBlockDevice"
+  | "isCharacterDevice"
+  | "isFIFO"
+  | "isSocket"
+>;
+
+function typePredicates(mode: number): TypePredicates {
+  const type = mode & S_IFMT;
+  return {
+    isFile: () => type === S_IFREG,
+    isDirectory: () => type === S_IFDIR,
+    isSymbolicLink: () => type === S_IFLNK,
+    isBlockDevice: () => type === S_IFBLK,
+    isCharacterDevice: () => type === S_IFCHR,
+    isFIFO: () => type === S_IFIFO,
+    isSocket: () => type === S_IFSOCK,
+  };
+}
+
 function toMs(time: TimeLike): number {
   return typeof time === "number" ? time * 1000 : time.getTime();
 }
 
+/**
+ * What {@link createMemoryDriver} returns: every optional method, and a
+ * `mountx.mknod` that is not optional either — so a caller can write
+ * `driver.mountx.mknod(...)` without asking whether it is there.
+ */
+export type MemoryDriver = FullFsDriver & {
+  readonly mountx: Required<Pick<MountxExtensions, "mknod">>;
+};
+
 /** Create an in-memory filesystem driver, initially holding an empty root. */
-export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDriver {
+export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDriver {
   const uid = options.uid ?? process.getuid?.() ?? 0;
   const gid = options.gid ?? process.getgid?.() ?? 0;
   const umask = options.umask ?? 0;
@@ -249,7 +297,6 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
 
   function toStats(node: MemNode): StatsLike {
     const size = sizeOf(node);
-    const type = node.mode & S_IFMT;
     return {
       dev: 0,
       ino: node.ino,
@@ -265,13 +312,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
       mtimeMs: node.mtimeMs,
       ctimeMs: node.ctimeMs,
       birthtimeMs: node.birthtimeMs,
-      isFile: () => type === S_IFREG,
-      isDirectory: () => type === S_IFDIR,
-      isSymbolicLink: () => type === S_IFLNK,
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isFIFO: () => false,
-      isSocket: () => false,
+      ...typePredicates(node.mode),
     };
   }
 
@@ -354,13 +395,64 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
 
   // --- driver ---
 
-  const driver: FullFsDriver = {
+  const driver: MemoryDriver = {
     // Only what `resolveCapabilities` cannot infer from the methods below.
+    // `extensions` is inferred from the keys of `mountx`, so it is not here.
     capabilities: {
       handles: true,
       atomicRename: true,
       caseSensitive: true,
       readOnly: false,
+    },
+
+    mountx: {
+      /**
+       * FIFOs, sockets and device nodes — the one thing every transport can
+       * carry and `node:fs/promises` cannot express, which is why it is an
+       * extension rather than a method.
+       *
+       * There is no kernel obstacle to any of it: a node with the right `S_IF*`
+       * in `mode` (and an `rdev` for the two device types) reported by `stat`
+       * is all a FUSE, 9P or NFS client needs, and the VFS supplies the pipe,
+       * socket and device semantics itself. What that leaves this driver is
+       * storage and nothing else — the node holds no bytes, so `open` and
+       * `truncate` refuse it (see both).
+       *
+       * Device *nodes* are not device *access*: `fusermount3` mounts `nodev`,
+       * so a `mknod` of one over an unprivileged mount produces a node that
+       * stats correctly and cannot be opened. That is the mount's rule, not
+       * this driver's, and refusing to store one here would only hide it.
+       */
+      async mknod(path, mode, dev) {
+        const type = mode & S_IFMT;
+        const entry = walk(path, false, "mknod");
+        if (entry.node !== undefined) {
+          throw fsError("EEXIST", { syscall: "mknod", path: entry.path });
+        }
+        const permissions = mode & ~umask & 0o7777;
+        if (type === S_IFREG || type === 0) {
+          // `mknod(2)`'s regular-file case, which POSIX spells as a type of
+          // zero and which the FUSE and 9P sessions fall back to `open` for
+          // when no driver implements this. Reached here from `MKNOD` when the
+          // kernel has no `CREATE`, and from tools that still create an empty
+          // file this way.
+          link(entry, createNode(S_IFREG | permissions, { data: EMPTY }));
+          return;
+        }
+        if (!SPECIAL_TYPES.has(type)) {
+          // A directory or a symlink is `EPERM` from `mknod(2)` too: those have
+          // their own calls, and this one must not become a second way in.
+          throw fsError("EPERM", { syscall: "mknod", path: entry.path });
+        }
+        link(
+          entry,
+          createNode(type | permissions, {
+            // `rdev` means something for the two device types and nothing for
+            // a FIFO or a socket, where POSIX leaves the argument unused.
+            rdev: type === S_IFCHR || type === S_IFBLK ? dev : 0,
+          }),
+        );
+      },
     },
 
     async stat(path) {
@@ -394,20 +486,11 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
       // per entry is all waste — and `nlinkOf` makes it worse than waste, by
       // rescanning every subdirectory's children to count links nobody reads.
       // The file type is one field of `mode`.
-      return [...node.children!].map(([name, child]) => {
-        const type = child.mode & S_IFMT;
-        return {
-          name,
-          parentPath,
-          isFile: () => type === S_IFREG,
-          isDirectory: () => type === S_IFDIR,
-          isSymbolicLink: () => type === S_IFLNK,
-          isBlockDevice: () => false,
-          isCharacterDevice: () => false,
-          isFIFO: () => false,
-          isSocket: () => false,
-        };
-      });
+      return [...node.children!].map(([name, child]) => ({
+        name,
+        parentPath,
+        ...typePredicates(child.mode),
+      }));
     },
 
     async open(path, flags = "r", mode = 0o666) {
@@ -428,6 +511,18 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
         }
         if (isDirectory(node) && parsed.write) {
           throw fsError("EISDIR", { syscall: "open", path: entry.path });
+        }
+        if (isSpecial(node)) {
+          // A special file is a *name* here and nothing more: the node carries
+          // the type and the `rdev`, and every client that reaches one over a
+          // mount gets its pipe, socket or device semantics from its own kernel
+          // rather than from this driver — the FUSE, 9P and NFS clients all
+          // handle these types locally and never send the open across. So the
+          // only caller that can arrive here is a loopback one, and answering
+          // it with a byte buffer would invent a filesystem no mount has.
+          // `ENXIO` is what `open(2)` says for a device with no driver behind
+          // it, which is exactly the situation.
+          throw fsError("ENXIO", { syscall: "open", path: entry.path });
         }
         if (parsed.truncate && !isDirectory(node)) {
           resize(node, 0);
@@ -587,6 +682,10 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): FullFsDri
       const node = resolve(path, true, "truncate");
       if (isDirectory(node)) {
         throw fsError("EISDIR", { syscall: "open", path: normalizePath(path) });
+      }
+      if (isSpecial(node)) {
+        // `truncate(2)`'s own answer for anything that is not a regular file.
+        throw fsError("EINVAL", { syscall: "open", path: normalizePath(path) });
       }
       resize(node, length);
       node.mtimeMs = node.ctimeMs = now();

@@ -239,11 +239,21 @@ rather than by accident.
   unprivileged, zero-native-code path for macOS/Windows per `IDEA.md`.
   Windows also has no `mount(8)`, so it stays out of the NFS transport's
   platform switch.
-- **`mknod` / FIFOs / device nodes / UNIX sockets.** `FsDriver` has no way
-  to create a special file (neither does `node:fs/promises`). This is the
-  entire remaining pjdfstest gap (45 failing files, all one missing
-  feature) — see `.agents/pjdfstest-results.md`. Needs an `FsDriver.mknod`
-  or `mountx.mknod` extension plus matching storage in the memory driver.
+- ~~**`mknod` / FIFOs / device nodes / UNIX sockets.**~~ **Done**, and it was
+  the entire remaining pjdfstest gap: `mountx.mknod` plus storage in the
+  memory driver took the suite from 45 failing files to 0 (238 files, 8770
+  assertions, `.agents/pjdfstest-results.md`). What is left of this item is
+  the part that is _not_ done and is deferred on purpose: **a polyfill for
+  drivers that cannot store a special file themselves.** The shape that
+  works is an overlay holding the node in memory only, writing nothing
+  through to the backing store — a small union filesystem, because it has to
+  win on every creating call (`mkdir`/`symlink`/`link`/`open(O_CREAT)`/a
+  `rename` destination must answer `EEXIST` against an overlaid name) and
+  not merely on the three that read types. Opt-in if it is built, not
+  default: making `resolveCapabilities(node:fs/promises)` report
+  `extensions: ["mknod"]` would claim an extension whose nodes live in one
+  process's heap, and on a shared backing store the FIFO would be real to
+  the mounting process and absent to every other one.
 - **xattr and the rest of the `mountx.*` extension namespace** (byte-range
   locks, `fallocate`/`lseek`, cache-invalidation `notify`) — `ENOTSUP` until
   a real user needs one.

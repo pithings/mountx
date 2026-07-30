@@ -1180,11 +1180,12 @@ export class Nfs3Session {
 
   /**
    * `MKNOD` — `NFS3ERR_NOTSUPP` unless the driver has the `mountx.mknod`
-   * extension, which nothing implements yet.
+   * extension.
    *
    * Device nodes, FIFOs and sockets are outside what `node:fs/promises` can
-   * express, so the driver interface has no way to ask for one. Saying so is
-   * the whole implementation.
+   * express, which is why they are an extension rather than a driver method;
+   * the bundled memory driver implements it, and a driver that does not gets
+   * the refusal above rather than a regular file wearing the wrong type.
    */
   async #mknod(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readMknodArgs(args);

@@ -35,6 +35,7 @@ import {
 } from "../../../src/nfs/rpc.ts";
 import { NfsSession } from "../../../src/nfs/session.ts";
 import type { FileHandleLike, FsDriver, FullFsDriver } from "../../../src/types.ts";
+import { S_IFIFO } from "../../../src/types.ts";
 import {
   bitmapHas,
   bitmapOf,
@@ -62,6 +63,7 @@ import {
   FATTR4_MODE,
   FATTR4_NUMLINKS,
   FATTR4_OWNER,
+  FATTR4_RAWDEV,
   FATTR4_RDATTR_ERROR,
   FATTR4_SIZE,
   FATTR4_SPACE_TOTAL,
@@ -73,7 +75,9 @@ import {
   FATTR4_TIME_MODIFY,
   FATTR4_TIME_MODIFY_SET,
   FATTR4_TYPE,
+  NF4CHR,
   NF4DIR,
+  NF4FIFO,
   NF4LNK,
   NF4REG,
   NFS4_OK,
@@ -174,6 +178,7 @@ import {
   type ChannelAttrs4,
   type Compound4res,
   type Create4res,
+  type CreateType4,
   type CreateSession4res,
   type ExchangeId4res,
   type Getattr4res,
@@ -203,6 +208,7 @@ import { Nfs4Session } from "../../../src/nfs/v4/session.ts";
 import { XdrWriter } from "../../../src/nfs/xdr.ts";
 import { createLoopback } from "../../../src/harness.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
+import { withoutExtensions } from "../../no-extensions.ts";
 import { check as check3, NfsClient as Nfs3Client, nfsDriver } from "../v3/client.ts";
 import {
   type Compound4reply,
@@ -1324,7 +1330,9 @@ describe("CREATE", () => {
   });
 
   it("refuses a device node without the mknod extension", async () => {
-    const session = new Nfs4Session(await populated());
+    // The memory driver has the extension, so the refusal is tested against one
+    // with it taken off — the case below is the other half.
+    const session = new Nfs4Session(withoutExtensions(await populated()));
     const client = await Client.open(session);
     const reply = await client.run([
       ...TO_DIR,
@@ -1340,6 +1348,47 @@ describe("CREATE", () => {
     // §15.1.4.1: NFS4ERR_BADTYPE covers "because the type is not supported by
     // the server", and §15.2's CREATE row does not list NFS4ERR_NOTSUPP.
     expect(reply.compound.status).toBe(NFS4ERR_BADTYPE);
+  });
+
+  it("creates a FIFO and a character device through the mknod extension", async () => {
+    const driver = await populated();
+    const session = new Nfs4Session(driver);
+    const client = await Client.open(session);
+    const create = (objtype: CreateType4, objname: string, mode: number): Op => ({
+      op: OP_CREATE,
+      args: {
+        objtype,
+        objname,
+        createattrs: { attrmask: bitmapOf([FATTR4_MODE]), values: { mode }, unsupported: [] },
+      },
+    });
+
+    const fifo = await client.run([...TO_DIR, create({ type: NF4FIFO }, "fifo", 0o644)]);
+    expect(fifo.compound.status).toBe(NFS4_OK);
+    const device = await client.run([
+      ...TO_DIR,
+      create({ type: NF4CHR, devdata: { major: 1, minor: 3 } }, "null", 0o666),
+    ]);
+    expect(device.compound.status).toBe(NFS4_OK);
+
+    // What the driver holds: the type in `mode`, the device number in `rdev`.
+    const made = await driver.lstat("/dir/fifo");
+    expect(made.isFIFO()).toBe(true);
+    expect(made.mode & 0o7777).toBe(0o644);
+    const special = await driver.lstat("/dir/null");
+    expect(special.isCharacterDevice()).toBe(true);
+    expect(special.rdev).toBe((1 << 8) | 3);
+
+    // ...and what a client reads back, which is where `rawdev` is assembled.
+    const attrs = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "null" } },
+      GETATTR([FATTR4_TYPE, FATTR4_RAWDEV]),
+    ]);
+    expect(attrs.compound.status).toBe(NFS4_OK);
+    const values = attrsFor(attrs);
+    expect(values.type).toBe(NF4CHR);
+    expect(values.rawdev).toEqual({ major: 1, minor: 3 });
   });
 
   it("refuses a symlink when the driver has none", async () => {
@@ -2432,30 +2481,14 @@ describe("READ and WRITE", () => {
   });
 
   it("answers NFS4ERR_WRONG_TYPE for I/O on something that is neither of those", async () => {
-    // No driver here can make a FIFO — `mountx.mknod` is what CREATE would need
-    // and the memory driver has none — so the type is put on the stat instead.
-    // The rule has three arms and the third would otherwise never be reached.
-    const base = await populated();
-    const driver = new Proxy(base, {
-      get(target, property, receiver) {
-        const value = Reflect.get(target, property, receiver) as unknown;
-        if (property === "lstat") {
-          return async (path: string) => {
-            const stats = await base.lstat(path);
-            return path === "/dir/file"
-              ? { ...stats, mode: (stats.mode & 0o7777) | 0o010_000 }
-              : stats;
-          };
-        }
-        return typeof value === "function"
-          ? (value as (...args: unknown[]) => unknown).bind(target)
-          : value;
-      },
-    }) as FsDriver;
-    const session = new Nfs4Session(driver);
-    const client = await ready(session);
+    // The rule has three arms — directory, symlink, and everything else — and
+    // a real FIFO is what reaches the third.
+    const driver = await populated();
+    await driver.mountx!.mknod!("/dir/fifo", S_IFIFO | 0o644, 0);
+    const client = await ready(new Nfs4Session(driver));
     const reply = await client.run([
-      ...TO_FILE,
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "fifo" } },
       { op: OP_READ, args: { stateid: ANONYMOUS, offset: 0n, count: 1 } },
     ]);
     expect(reply.compound.status).toBe(NFS4ERR_WRONG_TYPE);
