@@ -53,6 +53,7 @@ import {
   ACCESS4_ALL,
   CLAIM_NULL,
   errnoCodeOfStatus4,
+  EXCLUSIVE4_1,
   FATTR4_CHANGE,
   FATTR4_FILEID,
   FATTR4_FILES_AVAIL,
@@ -1248,6 +1249,16 @@ export class Nfs4Client {
       mode?: number;
       owner?: Uint8Array;
       path?: string;
+      /**
+       * A `createverf4`, which makes the create *exclusive* — the retry of a
+       * create whose reply was lost is answered with the file it made rather
+       * than `NFS4ERR_EXIST` (§18.16.3).
+       *
+       * Sent as `EXCLUSIVE4_1`, carrying the same attributes the other create
+       * modes send: a 4.1 client has no reason to use `EXCLUSIVE4` and lose
+       * them. Outranks `exclusive`, which is only `O_EXCL`'s `GUARDED4`.
+       */
+      verifier?: Uint8Array;
     } = {},
   ): Promise<Nfs4File> {
     const access = options.access ?? OPEN4_SHARE_ACCESS_READ;
@@ -1259,15 +1270,24 @@ export class Nfs4Client {
       }
     }
     const openhow =
-      options.create === true
-        ? {
+      options.create !== true
+        ? { opentype: OPEN4_NOCREATE }
+        : {
             opentype: OPEN4_CREATE,
-            how: {
-              mode: options.exclusive === true ? GUARDED4 : UNCHECKED4,
-              createattrs: fattr(settableMask(values), values),
-            },
-          }
-        : { opentype: OPEN4_NOCREATE };
+            how:
+              options.verifier === undefined
+                ? {
+                    mode: options.exclusive === true ? GUARDED4 : UNCHECKED4,
+                    createattrs: fattr(settableMask(values), values),
+                  }
+                : {
+                    mode: EXCLUSIVE4_1,
+                    createboth: {
+                      verf: options.verifier,
+                      attrs: fattr(settableMask(values), values),
+                    },
+                  },
+          };
     const owner = options.owner ?? encoder.encode(`open-owner-${this.#owners++}`);
     const reply = checkCompound(
       await this.compound(

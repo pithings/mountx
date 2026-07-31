@@ -68,6 +68,7 @@ import {
   type RpcCall,
 } from "./rpc.ts";
 import {
+  ExclusiveCreates,
   newSessionStats,
   type NfsRequestContext,
   type NfsSessionOptions,
@@ -160,6 +161,7 @@ export class NfsSession {
       }),
       lock: new PathLock(),
       stats: newSessionStats(),
+      exclusiveCreates: new ExclusiveCreates(),
     };
     this.#v3 = new Nfs3Session(driver, options, this.#shared);
     this.#v4 = new Nfs4Session(driver, options, this.#shared);

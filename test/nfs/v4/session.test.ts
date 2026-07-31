@@ -209,6 +209,7 @@ import { XdrWriter } from "../../../src/nfs/xdr.ts";
 import { createLoopback } from "../../../src/harness.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
 import { withoutExtensions } from "../../no-extensions.ts";
+import { CREATE_EXCLUSIVE, NFS3ERR_EXIST } from "../../../src/nfs/v3/constants.ts";
 import { check as check3, NfsClient as Nfs3Client, nfsDriver } from "../v3/client.ts";
 import {
   type Compound4reply,
@@ -2014,6 +2015,40 @@ function createHow(mode: number, attrs: { bits?: number[]; values?: Fattr4Values
   };
 }
 
+/**
+ * `createhow4` for the two exclusive modes: `EXCLUSIVE4` carries the verifier
+ * alone, `EXCLUSIVE4_1` carries it beside a `cva_attrs` the other modes would
+ * have sent as `createattrs`.
+ */
+function exclusiveHow(
+  mode: number,
+  verf: Uint8Array,
+  attrs?: { bits?: number[]; values?: Fattr4Values },
+): unknown {
+  return {
+    opentype: OPEN4_CREATE,
+    how:
+      mode === EXCLUSIVE4
+        ? { mode, createverf: verf }
+        : {
+            mode,
+            createboth: {
+              verf,
+              attrs: {
+                attrmask: bitmapOf(attrs?.bits ?? []),
+                values: attrs?.values ?? {},
+                unsupported: [],
+              },
+            },
+          },
+  };
+}
+
+/** One client's verifier: eight bytes it made up, and keeps resending. */
+const VERIFIER = Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]);
+/** A second client's, for the same name. */
+const OTHER_VERIFIER = Uint8Array.from([9, 9, 9, 9, 9, 9, 9, 9]);
+
 /** Open `/dir/file` and hand back the stateid, with the file as the current FH. */
 async function opened(client: Client, options: OpenOptions = {}): Promise<Stateid4> {
   const reply = await client.run([...TO_DIR, OPEN(options)]);
@@ -2204,36 +2239,142 @@ describe("OPEN", () => {
     expect(reply.compound.status).toBe(NFS4ERR_INVAL);
   });
 
-  it("refuses both exclusive create modes with NFS4ERR_INVAL", async () => {
+  /**
+   * §18.16.3's exclusive create, in both its shapes. The point of the mode is
+   * that a client cannot make a create idempotent by itself: a lost reply
+   * leaves it unable to tell "I created it" from "someone else did", so it
+   * sends a verifier and the server remembers which verifier made which file.
+   * `ExclusiveCreates` in `src/nfs/util.ts` states what that memory does and
+   * does not cover — a retransmission, not a restart.
+   */
+  it("creates with either exclusive mode and answers the retry with the same file", async () => {
+    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
+      const session = new Nfs4Session(await populated());
+      const client = await ready(session);
+      const first = await client.run([
+        ...TO_DIR,
+        OPEN({ name: "exclusive", openhow: exclusiveHow(mode, VERIFIER) }),
+        { op: OP_GETFH },
+      ]);
+      expect(first.compound.status).toBe(NFS4_OK);
+      const created = resFor<Getfh4res>(first, OP_GETFH).object!;
+      expect(session.handles.resolve(created)).toBe("/dir/exclusive");
+
+      // The duplicate of a request whose reply never arrived: `NFS4_OK` and
+      // the same file, where `GUARDED4` would now say NFS4ERR_EXIST.
+      const retry = await client.run([
+        ...TO_DIR,
+        OPEN({ name: "exclusive", owner: 2, openhow: exclusiveHow(mode, VERIFIER) }),
+        { op: OP_GETFH },
+      ]);
+      expect(retry.compound.status).toBe(NFS4_OK);
+      expect([...resFor<Getfh4res>(retry, OP_GETFH).object!]).toEqual([...created]);
+
+      // A different verifier on the same name is a *second client*, which is
+      // the one case that really is NFS4ERR_EXIST.
+      const rival = await client.run([
+        ...TO_DIR,
+        OPEN({ name: "exclusive", owner: 3, openhow: exclusiveHow(mode, OTHER_VERIFIER) }),
+      ]);
+      expect(rival.compound.status).toBe(NFS4ERR_EXIST);
+    }
+  });
+
+  it("applies EXCLUSIVE4_1's cva_attrs and replays the same attrset", async () => {
     const session = new Nfs4Session(await populated());
     const client = await ready(session);
-    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
-      const reply = await client.run([
-        ...TO_DIR,
-        OPEN({
-          name: "exclusive",
-          openhow: {
-            opentype: OPEN4_CREATE,
-            how:
-              mode === EXCLUSIVE4
-                ? { mode, createverf: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]) }
-                : {
-                    mode,
-                    createboth: {
-                      verf: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]),
-                      attrs: { attrmask: [], values: {}, unsupported: [] },
-                    },
-                  },
-          },
+    const how = exclusiveHow(EXCLUSIVE4_1, VERIFIER, {
+      bits: [FATTR4_MODE, FATTR4_SIZE],
+      values: { mode: 0o640, size: 0n },
+    });
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "both", access: OPEN4_SHARE_ACCESS_BOTH, openhow: how }),
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(attrsFor(reply).mode).toBe(0o640);
+    // The same "which attributes were successfully set" answer the other two
+    // create modes give — `creatverfattr` is the only difference on the wire.
+    const attrset = resFor<Open4res>(reply, OP_OPEN).attrset;
+    expect(attrset).toEqual(bitmapOf([FATTR4_MODE, FATTR4_SIZE]));
+
+    // And the replay carries the set the lost reply carried, not an empty one.
+    const retry = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "both", owner: 2, access: OPEN4_SHARE_ACCESS_BOTH, openhow: how }),
+    ]);
+    expect(retry.compound.status).toBe(NFS4_OK);
+    expect(resFor<Open4res>(retry, OP_OPEN).attrset).toEqual(attrset);
+
+    // `EXCLUSIVE4` has no attributes to report, and reports none.
+    const bare = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "bare", openhow: exclusiveHow(EXCLUSIVE4, VERIFIER) }),
+    ]);
+    expect(bare.compound.status).toBe(NFS4_OK);
+    expect(resFor<Open4res>(bare, OP_OPEN).attrset).toEqual(bitmapOf([]));
+  });
+
+  it("refuses an unsettable cva_attrs the way createattrs is refused", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    // Nothing is reserved to hold the verifier, so what may be named here is
+    // exactly what SETATTR may name — and `fileid` is read-only in both.
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({
+        name: "readonly-attr",
+        openhow: exclusiveHow(EXCLUSIVE4_1, VERIFIER, {
+          bits: [FATTR4_FILEID],
+          values: { fileid: 7n },
         }),
-      ]);
-      // There is nowhere to commit a verifier to. §18.16.4 would have this be
-      // NFS4ERR_NOTSUPP, but §15.2's OPEN row and §15.4's NFS4ERR_NOTSUPP row
-      // both exclude that status for OPEN, and NFS4ERR_INVAL is what §18.16.3
-      // itself gives the neighbouring "this form must not be used here" cases.
-      expect(reply.compound.status).toBe(NFS4ERR_INVAL);
-    }
-    await expect(session.driver.stat("/dir/exclusive")).rejects.toThrow();
+      }),
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_INVAL);
+    await expect(session.driver.stat("/dir/readonly-attr")).rejects.toThrow();
+  });
+
+  it("forgets the verifier once SETATTR commits it, or the name stops meaning that file", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const create = (name: string, owner: number): Op[] => [
+      ...TO_DIR,
+      OPEN({ name, owner, openhow: exclusiveHow(EXCLUSIVE4, VERIFIER) }),
+    ];
+
+    // The follow-up §18.16.4 sends the client back for. After it, the client
+    // is not retrying the OPEN, and the entry has nothing left to protect.
+    expect((await client.run(create("committed", 1))).compound.status).toBe(NFS4_OK);
+    const set = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "committed" } },
+      {
+        op: OP_SETATTR,
+        args: {
+          stateid: ANONYMOUS,
+          objAttributes: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o600 },
+            unsupported: [],
+          },
+        },
+      },
+    ]);
+    expect(set.compound.status).toBe(NFS4_OK);
+    expect((await client.run(create("committed", 2))).compound.status).toBe(NFS4ERR_EXIST);
+
+    // Removed and re-created by somebody else: the name is a different file
+    // now, and the promise made about the first one must not cover it.
+    expect((await client.run(create("recycled", 3))).compound.status).toBe(NFS4_OK);
+    const removed = await client.run([...TO_DIR, { op: OP_REMOVE, args: { target: "recycled" } }]);
+    expect(removed.compound.status).toBe(NFS4_OK);
+    const replaced = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "recycled", owner: 4, openhow: createHow(UNCHECKED4) }),
+    ]);
+    expect(replaced.compound.status).toBe(NFS4_OK);
+    expect((await client.run(create("recycled", 5))).compound.status).toBe(NFS4ERR_EXIST);
   });
 
   it("answers a reclaim with NFS4ERR_NO_GRACE, whichever claim asks", async () => {
@@ -3693,6 +3834,42 @@ describe("the v4 client over a real socket", () => {
     expect(server.session.stats.procedures.get("NFS4:COMPOUND")).toBeGreaterThan(0);
     expect(server.session.stats.procedures.get("NFS:WRITE")).toBeGreaterThan(0);
     expect(server.session.stats.procedures.get("MOUNT:MNT")).toBe(1);
+  });
+
+  /**
+   * The exclusive-create verifiers are the router's, like the handle table:
+   * one server on one port, so the same request must get the same answer
+   * whichever version carried it. A client that created over v3 and retries
+   * over v4 has not changed its mind about anything.
+   */
+  it("recognises a v3 exclusive create retried over v4, from one table", async () => {
+    const server = await serve();
+    const v3 = await connect3(server);
+    const v4 = await connect(server);
+    const root = await v4.rootFh();
+
+    const created = check3(
+      await v3.client.create(v3.root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    const retried = await v4.openAt(root, "excl", {
+      create: true,
+      verifier: VERIFIER,
+      access: OPEN4_SHARE_ACCESS_BOTH,
+    });
+    expect([...retried.fh]).toEqual([...created.obj!]);
+    // v3's `EXCLUSIVE` carried no attributes, so none were applied and the
+    // replay says so rather than claiming this OPEN's `cva_attrs` landed.
+    await retried.close();
+
+    // And a second client's verifier is refused on the same name, again
+    // whichever version asks.
+    await expect(
+      v4.openAt(root, "excl", { create: true, verifier: OTHER_VERIFIER }),
+    ).rejects.toThrow();
+    expect(
+      (await v3.client.create(v3.root, "excl", CREATE_EXCLUSIVE, {}, OTHER_VERIFIER)).status,
+    ).toBe(NFS3ERR_EXIST);
   });
 
   it("destroys its session and leaves the next request without one", async () => {

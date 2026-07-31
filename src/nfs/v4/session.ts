@@ -105,6 +105,7 @@ import {
 import {
   type AccessRights,
   allowedAccess,
+  ExclusiveCreates,
   MAX_OFFSET,
   modeBitsOfFtype,
   NAME_MAX,
@@ -297,6 +298,7 @@ import {
   type Compound4res,
   type Create4args,
   type Create4res,
+  type CreateHow4,
   type CreateSession4args,
   type CreateSession4res,
   type DestroyClientid4args,
@@ -911,11 +913,14 @@ export class Nfs4Session {
    * encoded.
    */
   readonly #released: string[] = [];
+  /** The verifiers of OPEN with `EXCLUSIVE4`/`EXCLUSIVE4_1` — see `../util.ts`. */
+  readonly #exclusives: ExclusiveCreates;
   #destroyed = false;
 
   /**
    * `shared` is the router's — see `../util.ts`. Left out, this session makes
-   * its own handle table, lock and counters, which is what its own tests do.
+   * its own handle table, lock, counters and exclusive-create table, which is
+   * what its own tests do.
    */
   constructor(driver: FsDriver, options: NfsSessionOptions = {}, shared: NfsSharedState = {}) {
     this.driver = createLoopback(driver);
@@ -930,6 +935,7 @@ export class Nfs4Session {
       });
     this.writeVerifier = this.handles.verifier.slice(0, NFS4_VERIFIER_SIZE);
     this.#snapshots = new DirectorySnapshots(options.snapshotCache);
+    this.#exclusives = shared.exclusiveCreates ?? new ExclusiveCreates();
     // The ID map is this file's, not the state table's — see `../util.ts`.
     const { idmap, ...knobs } = options.nfs4 ?? {};
     this.#idmap = idmap;
@@ -1002,6 +1008,7 @@ export class Nfs4Session {
   async destroy(): Promise<void> {
     this.#destroyed = true;
     this.#snapshots.clear();
+    this.#exclusives.clear();
     this.#maxOpsBySession.clear();
     const open = [...this.#openHandles.keys(), ...this.#released];
     this.#released.length = 0;
@@ -1993,6 +2000,12 @@ export class Nfs4Session {
       return { status: statusOf(error), attrsset: [] };
     }
     const applied = await this.#applyAttrs(path, args.objAttributes);
+    if (applied.status === NFS4_OK) {
+      // §18.16.4's commit: this is the SETATTR an exclusive create sends the
+      // client back for, and once it has landed the client is not going to
+      // retry the OPEN. See `ExclusiveCreates` in `../util.ts`.
+      this.#exclusives.forget(path);
+    }
     return { status: applied.status, attrsset: bitmapOf(applied.bits) };
   }
 
@@ -2457,6 +2470,9 @@ export class Nfs4Session {
     if (entry !== undefined && directory) {
       this.#snapshots.delete(entry.id);
     }
+    // Whatever appears at this name next is a different object, and must not
+    // inherit the promise made about this one.
+    this.#exclusives.forget(path);
     return { status: NFS4_OK, cinfo: this.#cinfo(before, await this.#changeOf(dir)) };
   }
 
@@ -2478,6 +2494,11 @@ export class Nfs4Session {
     // client goes on using the handle it already has, for the object and for
     // everything below it if this was a directory.
     this.handles.remap(from, to);
+    // The verifiers are keyed by *path*, and both of these paths now name
+    // something else: `from` nothing, `to` the object that moved onto it (over
+    // whatever was there). Neither promise survives the move.
+    this.#exclusives.forget(from);
+    this.#exclusives.forget(to);
     // Exactly two directories changed their names: the one that lost `from` and
     // the one that gained `to`. A directory that *moved* keeps its own snapshot
     // — same contents, and `remap` kept it the same entry — and no unrelated
@@ -2944,20 +2965,15 @@ export class Nfs4Session {
    *   "valid in general but ... not appropriate to the context in which the
    *   stateid is used".
    *
-   * Exclusive create is the one place this file knowingly departs from a
-   * sentence of the RFC, and it is a contradiction inside the RFC: §18.16.4
-   * says "if the server cannot support exclusive create semantics, possibly
-   * because of the requirement to commit the verifier to stable storage, it
-   * should fail the OPEN request with the error NFS4ERR_NOTSUPP", while
-   * §15.2's OPEN row and §15.4's `NFS4ERR_NOTSUPP` row — the two normative
-   * error tables, agreeing from both directions — do not admit that status for
-   * OPEN. `NFS4ERR_INVAL` is what they do admit, and it is the status §18.16.3
-   * itself gives to the two neighbouring cases of "this exclusive-create form
-   * must not be used here" (a named attribute directory: "the server will
-   * return EINVAL"; a persistent session or a pNFS client ID: "the server MUST
-   * return NFS4ERR_INVAL"). There is nowhere in the driver interface to commit
-   * a verifier to, and a side table a restart loses would be a worse answer
-   * than a refusal — the same call `../v3/session.ts` makes about `EXCLUSIVE`.
+   * Exclusive create is served, out of a table in memory that covers a retry
+   * and not a restart — {@link Nfs4Session.#openCreateExclusive} below, and
+   * `ExclusiveCreates` in `../util.ts` for what that does and does not promise.
+   * §18.16.4 offers the other answer ("if the server cannot support exclusive
+   * create semantics, possibly because of the requirement to commit the
+   * verifier to stable storage, it should fail the OPEN request with the error
+   * NFS4ERR_NOTSUPP") and this file would not have been able to give it: §15.2's
+   * OPEN row and §15.4's `NFS4ERR_NOTSUPP` row — the two normative error
+   * tables, agreeing from both directions — do not admit that status for OPEN.
    *
    * On success the opened file becomes the current filehandle ("upon success
    * ... the current filehandle is replaced by that of the created or existing
@@ -3101,7 +3117,9 @@ export class Nfs4Session {
   }
 
   /**
-   * The create half of an OPEN: `UNCHECKED4` and `GUARDED4` (§18.16.3).
+   * The create half of an OPEN: `UNCHECKED4` and `GUARDED4` (§18.16.3), with
+   * the two exclusive modes handed on to
+   * {@link Nfs4Session.#openCreateExclusive}.
    *
    * Answers `undefined` when the file is there to be opened, or the status that
    * refuses the whole OPEN. `attrset` is filled with what was actually applied,
@@ -3124,7 +3142,7 @@ export class Nfs4Session {
   ): Promise<number | undefined> {
     const how = args.openhow.how!;
     if (how.mode === EXCLUSIVE4 || how.mode === EXCLUSIVE4_1) {
-      return NFS4ERR_INVAL;
+      return this.#openCreateExclusive(how, path, cursor, attrset);
     }
     const attrs = how.createattrs!;
     this.#settableOrRefuse(attrs);
@@ -3161,6 +3179,92 @@ export class Nfs4Session {
     }
     attrset.push(...applied.bits);
     return undefined;
+  }
+
+  /**
+   * The other create half: `EXCLUSIVE4` and `EXCLUSIVE4_1` (§18.16.3).
+   *
+   * Both exist for one reason — a client cannot make a create idempotent by
+   * itself, because a lost reply leaves it unable to tell "I created it" from
+   * "someone else did". So it sends a verifier it made up, the server remembers
+   * which verifier created which file, and the resend carrying that same
+   * verifier is answered with the file it already made. A *different* verifier
+   * on the same name is a second client, and that is the case that really is
+   * `NFS4ERR_EXIST`.
+   *
+   * What "remembers" means — a bounded table in memory, so a retransmission is
+   * covered and a restart is not — is stated in full on `ExclusiveCreates` in
+   * `../util.ts`.
+   *
+   * The two modes differ only in what travels beside the verifier. `EXCLUSIVE4`
+   * carries nothing else, so the file is created with the mode `UNCHECKED4`
+   * uses when the client names none and §18.16.4's follow-up SETATTR sets the
+   * rest. `EXCLUSIVE4_1` carries `creatverfattr`, whose `cva_attrs` are applied
+   * and reported in `attrset` exactly as `createattrs` are on the other path —
+   * and are checked against the same supported/settable sets, which is the
+   * answer this server would give for `suppattr_exclcreat` (75) if it
+   * advertised it: the verifier lives beside the file rather than *in* one of
+   * its attributes, so no attribute is reserved and every settable one may be
+   * named here. That attribute stays out of `SUPPORTED_ATTRS` (`./attr.ts`
+   * says why), so a client sees the omission and sends what it would have sent
+   * anyway.
+   *
+   * The `attrset` is remembered with the verifier, so the reply to a resend
+   * carries the same set the lost one did rather than an empty one.
+   *
+   * §18.16.3's one refusal of `EXCLUSIVE4` — "if the client ID is
+   * pNFS-enabled, or the session is persistent, the server MUST return
+   * NFS4ERR_INVAL" — cannot arise: this server grants no `csa_flags` at all
+   * (`./state.ts` on CREATE_SESSION), so no session is persistent, and there
+   * is no pNFS here to enable. A check for it would be unreachable code
+   * describing a state the server cannot enter.
+   */
+  async #openCreateExclusive(
+    how: CreateHow4,
+    path: string,
+    cursor: Cursor,
+    attrset: number[],
+  ): Promise<number | undefined> {
+    const exclusive4 = how.mode === EXCLUSIVE4;
+    const verifier = exclusive4 ? how.createverf! : how.createboth!.verf;
+    const attrs = exclusive4 ? undefined : how.createboth!.attrs;
+    if (attrs !== undefined) {
+      this.#settableOrRefuse(attrs);
+    }
+    const created = await this.#createFile(path, (attrs?.values.mode ?? 0o666) & 0o7777);
+    if (!created) {
+      const remembered = this.#exclusives.match(path, verifier);
+      if (remembered === undefined) {
+        return NFS4ERR_EXIST;
+      }
+      // The duplicate of a request whose reply never arrived: same file, same
+      // answer. The OPEN below it proceeds as it did the first time.
+      attrset.push(...remembered.attrset);
+      return undefined;
+    }
+    await this.#claim(path, cursor.creds);
+    const bits: number[] = [];
+    let status = NFS4_OK;
+    if (attrs !== undefined) {
+      // The mode went in as `open`'s third argument, so `#applyAttrs` must not
+      // see it — and must see everything else, size included.
+      const applied = await this.#applyAttrs(path, {
+        ...attrs,
+        values: { ...attrs.values, mode: undefined },
+      });
+      if (attrs.values.mode !== undefined) {
+        bits.push(FATTR4_MODE);
+      }
+      bits.push(...applied.bits);
+      status = applied.status;
+    }
+    // Recorded even when an attribute failed to land: the file exists and this
+    // verifier is what made it, so a resend must still be recognised — and it
+    // is answered with the bits that *did* land, which is the partial `attrset`
+    // §18.16.4 tells client implementors to check for.
+    this.#exclusives.set(path, verifier, bits);
+    attrset.push(...bits);
+    return status === NFS4_OK ? undefined : status;
   }
 
   /** Create a file, answering whether it was this call that created it. */

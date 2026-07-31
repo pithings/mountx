@@ -67,6 +67,9 @@ import { createLoopback, type Loopback } from "../../../src/harness.ts";
 
 const encoder = new TextEncoder();
 
+/** One client's `createverf3`: eight bytes it made up, and keeps resending. */
+const VERIFIER = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+
 interface Harness {
   server: NfsServer;
   client: NfsClient;
@@ -732,24 +735,90 @@ describe("individual procedures", () => {
     );
   });
 
-  it("implements all three CREATE modes, EXCLUSIVE as NOTSUPP", async () => {
+  it("implements all three CREATE modes", async () => {
     const { client, root } = await serve();
     expect(check(await client.create(root, "f", CREATE_UNCHECKED), "create").obj).toBeDefined();
     // UNCHECKED over an existing file succeeds and applies the attributes.
     const again = check(await client.create(root, "f", CREATE_UNCHECKED, { size: 0n }), "create");
     expect(again.objAttributes!.size).toBe(0n);
     expect((await client.create(root, "f", CREATE_GUARDED)).status).toBe(NFS3ERR_EXIST);
-    // EXCLUSIVE wants the verifier stored somewhere that survives a retry, and
-    // there is nowhere in the driver interface to put it. Linux falls back.
-    const exclusive = await client.create(
-      root,
-      "excl",
-      CREATE_EXCLUSIVE,
-      {},
-      new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+    // EXCLUSIVE creates like GUARDED, and carries a verifier instead of an
+    // `sattr3` — so there are no attributes to apply and none are.
+    const created = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
     );
-    expect(exclusive.status).toBe(NFS3ERR_NOTSUPP);
-    expect((await client.lookup(root, "excl")).status).toBe(NFS3ERR_NOENT);
+    expect(created.obj).toBeDefined();
+    expect(created.objAttributes!.type).toBe(NF3REG);
+    expect(check(await client.lookup(root, "excl"), "lookup").object).toEqual(created.obj);
+  });
+
+  /**
+   * §3.3.8's whole point: a client cannot make a create idempotent by itself,
+   * because a lost reply leaves it unable to tell "I created it" from "someone
+   * else did". The verifier is how it tells the difference, and the table
+   * behind it is `ExclusiveCreates` in `src/nfs/util.ts` — a retry, not a
+   * restart.
+   */
+  it("answers the retry of an EXCLUSIVE create with the file it already made", async () => {
+    const { client, root, fs } = await serve();
+    const first = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    await fs.writeFile("/excl", "written after the create");
+
+    // The duplicate of a request whose reply never arrived: the same file
+    // handle back, `NFS3_OK` rather than `EXIST`, and nothing truncated.
+    const retry = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    expect([...retry.obj!]).toEqual([...first.obj!]);
+    expect(retry.objAttributes!.size).toBe(24n);
+    expect(new TextDecoder().decode(await fs.readFile("/excl"))).toBe("written after the create");
+
+    // A different verifier on the same name is a *second client*, which is the
+    // one case that really is `NFS3ERR_EXIST`.
+    const other = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9]);
+    expect((await client.create(root, "excl", CREATE_EXCLUSIVE, {}, other)).status).toBe(
+      NFS3ERR_EXIST,
+    );
+  });
+
+  it("forgets the verifier once the client commits with SETATTR", async () => {
+    const { client, root } = await serve();
+    const created = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    // The follow-up §3.3.8 sends the client back for, since EXCLUSIVE had
+    // nowhere to carry the mode. After it, the client is not retrying.
+    expect((await client.setattr(created.obj!, { mode: 0o600 })).status).toBe(NFS3_OK);
+    expect((await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER)).status).toBe(
+      NFS3ERR_EXIST,
+    );
+  });
+
+  it("forgets the verifier when the name stops meaning that file", async () => {
+    const { client, root } = await serve();
+    // Removed, then re-created by somebody else: the name is a different file
+    // now, and the promise made about the first one must not cover it.
+    check(await client.create(root, "gone", CREATE_EXCLUSIVE, {}, VERIFIER), "create");
+    expect((await client.remove(root, "gone")).status).toBe(NFS3_OK);
+    check(await client.create(root, "gone", CREATE_UNCHECKED), "create");
+    expect((await client.create(root, "gone", CREATE_EXCLUSIVE, {}, VERIFIER)).status).toBe(
+      NFS3ERR_EXIST,
+    );
+
+    // Same again through a rename, which moves the file out from under the
+    // name rather than deleting it.
+    check(await client.create(root, "moved", CREATE_EXCLUSIVE, {}, VERIFIER), "create");
+    expect((await client.rename(root, "moved", root, "elsewhere")).status).toBe(NFS3_OK);
+    check(await client.create(root, "moved", CREATE_UNCHECKED), "create");
+    expect((await client.create(root, "moved", CREATE_EXCLUSIVE, {}, VERIFIER)).status).toBe(
+      NFS3ERR_EXIST,
+    );
   });
 
   it("answers MKNOD with NOTSUPP when the driver has no mknod extension", async () => {
