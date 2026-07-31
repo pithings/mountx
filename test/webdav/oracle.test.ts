@@ -309,6 +309,78 @@ describe.skipIf(curl === undefined)("curl against mountx/webdav", () => {
   );
 
   it(
+    "takes a lock, refuses an untokened write, and lets the token through",
+    async () => {
+      /* The class-2 round trip as a client that shares none of this code sends
+         it: a LOCK body, a Lock-Token header back, a PUT that is refused
+         because it carries no token, the same PUT with an If header, and an
+         UNLOCK. curl is the right oracle here — it sends each method exactly as
+         written, with no backend deciding what a lock is for. */
+      const target = `${server.url}/locked-by-curl.txt`;
+      const lock = await curlRun(
+        "-i",
+        "-o",
+        "-",
+        "-X",
+        "LOCK",
+        "-H",
+        `Content-Type: application/xml; charset="utf-8"`,
+        "--data-binary",
+        `<?xml version="1.0" encoding="utf-8" ?>` +
+          `<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope>` +
+          `<D:locktype><D:write/></D:locktype><D:owner>curl</D:owner></D:lockinfo>`,
+        target,
+      );
+      // §7.3: a LOCK on an unmapped URL creates the resource and answers 201.
+      expect(lock).toContain("201 Created");
+      expect(lock.toLowerCase()).toContain("lock-token: <urn:uuid:");
+      expect(lock).toContain("<owner>curl</owner>");
+      const token = /<locktoken><href>([^<]+)<\/href>/.exec(lock)?.[1] as string;
+      expect(token).toMatch(/^urn:uuid:/);
+      await stat(join(root, "locked-by-curl.txt"));
+
+      const upload = join(await scratchDir("mountx-webdav-lock-"), "payload.txt");
+      await writeFile(upload, "the locked bytes");
+      expect(await curlRun("-o", "/dev/null", "-w", "%{http_code}", "-T", upload, target)).toBe(
+        "423",
+      );
+      expect(
+        await curlRun(
+          "-o",
+          "/dev/null",
+          "-w",
+          "%{http_code}",
+          "-H",
+          `If: (<${token}>)`,
+          "-T",
+          upload,
+          target,
+        ),
+      ).toBe("204");
+      expect(await readFile(join(root, "locked-by-curl.txt"), "utf8")).toBe("the locked bytes");
+
+      expect(
+        await curlRun(
+          "-o",
+          "/dev/null",
+          "-w",
+          "%{http_code}",
+          "-X",
+          "UNLOCK",
+          "-H",
+          `Lock-Token: <${token}>`,
+          target,
+        ),
+      ).toBe("204");
+      // Unlocked, so the same write goes through with no token at all.
+      expect(await curlRun("-o", "/dev/null", "-w", "%{http_code}", "-T", upload, target)).toBe(
+        "204",
+      );
+    },
+    CASE_TIMEOUT,
+  );
+
+  it(
     "advertises classes 1, 2 and 3, and says so to an unauthenticated client too",
     async () => {
       /* Field names go out lowercase — RFC 9110 §5.1 makes them

@@ -34,8 +34,9 @@
  *   `403 cannot-modify-protected-property` for everything, which is the
  *   truthful answer for a server whose properties are all live and all derived.
  * - **No conditional requests.** `If-Match`, `If-None-Match` and the two date
- *   forms are ignored rather than half-honoured. `mountx/s3` implements
- *   RFC 9110's four over the same derived ETag; they arrive here next.
+ *   forms are ignored rather than half-honoured — RFC 4918's own `If` (§10.4)
+ *   is answered, and RFC 9110's four are not. `mountx/s3` implements them over
+ *   the same derived ETag; they arrive here next.
  * - **`GET` of a collection is `405`.** A collection has no body in RFC 4918;
  *   the HTML index other servers answer with is a user interface, and
  *   `PROPFIND` is the protocol's own way to list one.
@@ -59,6 +60,36 @@
  *   most (`credentials`), so §6.4's "check that the authenticated principal
  *   matches the lock creator" reduces to holding the token — which is why
  *   `UNLOCK` needs nothing else, and why a token in an `If` header is proof.
+ *
+ * ## The `If` header, and the three refusals
+ *
+ * `If` (§10.4) is the other half of locking: it is how a request proves it
+ * holds a lock, and §10.4.1 insists its two purposes stay separate — it is a
+ * *precondition* that can fail, and it is a *submission* of every token in it
+ * whether or not the condition that carried them was true. `#guard` does both,
+ * once per request, and hands the mutating methods what was submitted.
+ *
+ * Which refusal a client gets says which of the two failed, and getting that
+ * pair the wrong way round is the classic way to make a WebDAV client retry
+ * forever:
+ *
+ * - **`412`** — the header was there and every state list evaluated false
+ *   (§10.4.1). The client's state is stale; re-reading the resource is what
+ *   fixes it.
+ * - **`423` with `lock-token-submitted`** — the request would change a
+ *   write-locked resource and did not carry that lock's token (§7.5.2). The
+ *   `href`s name the lock roots in the way, which §16 requires and which saves
+ *   the client a `PROPFIND` for `lockdiscovery`.
+ * - **`207` with a `423` inside it** — the lock in the way is on a *member* of
+ *   the tree the request named, not on the resource it named. §9.6.1 wants a
+ *   multistatus for a failure on some other resource, and its own example is
+ *   this one; nothing is deleted or moved when that happens.
+ *
+ * `GET`, `HEAD`, `PROPFIND` and `OPTIONS` are not lock-protected at all — §7 is
+ * explicit that "all other HTTP/WebDAV methods defined so far — GET in
+ * particular — function independently of a write lock" — but an `If` header on
+ * one of them is still a precondition, because §10.4 puts no method restriction
+ * on it.
  *
  * ## Symbolic links: followed for bytes, never walked
  *
@@ -111,7 +142,14 @@
 
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createLoopback, type Loopback } from "../harness.ts";
-import { formatETag, formatHttpDate, formatIsoDate, parseRange } from "../http.ts";
+import {
+  etagMatchesWeakly,
+  formatETag,
+  formatHttpDate,
+  formatIsoDate,
+  parseETagList,
+  parseRange,
+} from "../http.ts";
 import { basename, dirname, isPathInside, joinPath } from "../path.ts";
 import type { FileHandleLike, FsDriver, StatsLike } from "../types.ts";
 import type { XmlNode } from "../s3/xml.ts";
@@ -151,6 +189,7 @@ import {
   xmlBody,
   type DavFault,
   type Depth,
+  type IfCondition,
   type IfList,
   type MultistatusEntry,
   type Propstat,
@@ -278,6 +317,70 @@ interface Failure {
   status: number;
 }
 
+/**
+ * What one request knows before it touches the driver: when it is being
+ * answered, and which lock tokens its `If` header submitted (§10.4.1).
+ *
+ * Built once per request in `#guard` and threaded through the mutating methods
+ * rather than recomputed, so that a `MOVE` weighing a lock at its source and
+ * another at its destination reads both against one moment — a lease that
+ * lapsed between the two checks would otherwise make the same request answer
+ * two different things about itself.
+ */
+interface Guard {
+  now: number;
+  submitted: Set<string>;
+  /**
+   * The lists themselves, kept only for the one method that evaluates them
+   * itself: `LOCK` has a `412` of its own with a §16 condition on it
+   * (`lock-token-matches-request-uri`), and it is a better answer than the bare
+   * one §10.4 gives, so a refresh decides the order — is there a lock here at
+   * all, and only then, is the header true.
+   */
+  lists: readonly IfList[] | undefined;
+}
+
+/** The state an `If` condition is matched against (§10.4.4). */
+interface ResourceState {
+  /** Every lock token whose scope covers the resource. */
+  tokens: readonly string[];
+  /** Its entity tag, or `undefined` for a collection and for nothing at all. */
+  etag: string | undefined;
+}
+
+/**
+ * A resource this server cannot say anything about: an unmapped URL, or a
+ * tagged list naming another origin.
+ *
+ * §10.4.4 makes both the same case — "treat as if the URL identified a resource
+ * that exists but does not have the specified state" — so every plain condition
+ * against it is false and every negated one is true.
+ */
+const UNKNOWN_RESOURCE: ResourceState = { tokens: [], etag: undefined };
+
+/**
+ * Does the resource have the state this condition describes, `Not` aside?
+ *
+ * A **state token** matches when it is one of the resource's, which for a lock
+ * token means "the resource is anywhere in the scope of the lock" (§10.4.4).
+ * An **entity tag** matches under RFC 9110 §8.8.3.2's *weak* comparison, which
+ * §10.4.4 explicitly leaves to the server ("servers MUST use either the weak or
+ * the strong comparison function"): §10.4.9's own example carries `[W/"A weak
+ * ETag"]` and expects it to match, and every tag this server mints is strong,
+ * so the weak function is the one that reads the RFC's examples the way they
+ * are written.
+ */
+function matchesCondition(condition: IfCondition, state: ResourceState): boolean {
+  if (condition.token !== undefined) {
+    return state.tokens.includes(condition.token);
+  }
+  return (
+    state.etag !== undefined &&
+    condition.etag !== undefined &&
+    etagMatchesWeakly(parseETagList(condition.etag), state.etag)
+  );
+}
+
 // ---------------------------------------------------------------------------
 // the session
 // ---------------------------------------------------------------------------
@@ -401,32 +504,38 @@ export class WebdavSession {
       return this.#options();
     }
     const path = parseTargetPath(head.target);
+    /* The `If` header is evaluated here, once, for every method that names a
+       resource — §10.4 puts no method restriction on it, and a `GET` whose
+       state lists all fail is as much a `412` as a `PUT`'s. What the *guard*
+       carries on to the mutating methods is the other half of §10.4.1: which
+       tokens were submitted. */
+    const guard = await this.#guard(head, path, method !== "LOCK");
     switch (method) {
       case "GET":
       case "HEAD": {
         return await this.#get(head, path);
       }
       case "PUT": {
-        return await this.#put(head, path, body);
+        return await this.#put(head, path, body, guard);
       }
       case "DELETE": {
-        return await this.#delete(head, path);
+        return await this.#delete(head, path, guard);
       }
       case "MKCOL": {
-        return await this.#mkcol(path, body);
+        return await this.#mkcol(path, body, guard);
       }
       case "COPY":
       case "MOVE": {
-        return await this.#copyOrMove(head, path, method === "MOVE");
+        return await this.#copyOrMove(head, path, method === "MOVE", guard);
       }
       case "PROPFIND": {
-        return await this.#propfind(head, path, body);
+        return await this.#propfind(head, path, body, guard);
       }
       case "PROPPATCH": {
-        return await this.#proppatch(path, body);
+        return await this.#proppatch(path, body, guard);
       }
       case "LOCK": {
-        return await this.#lock(head, path, body);
+        return await this.#lock(head, path, body, guard);
       }
       case "UNLOCK": {
         return this.#unlock(head, path);
@@ -584,6 +693,7 @@ export class WebdavSession {
     head: WebdavRequestHead,
     path: string,
     body: AsyncIterable<Uint8Array>,
+    guard: Guard,
   ): Promise<WebdavResponse> {
     if (head.headers["content-range"] !== undefined) {
       throw refuse(400, { message: "Content-Range is not allowed on a PUT (RFC 9110 §14.2)" });
@@ -596,6 +706,10 @@ export class WebdavSession {
       throw refuse(405, { headers: { allow: ALLOW_HEADER } });
     }
     await this.#requireCollection(dirname(path));
+    /* A `PUT` over an existing resource changes that resource; one that creates
+       a resource also changes its parent's membership (§7.4), and the parent's
+       own depth-0 lock protects exactly that. */
+    this.#requireWritable(path, guard, { membership: existing === undefined });
     await this.#write(path, body);
     const stats = await this.#statOrAbsent(path);
     const headers: Record<string, string> = { "content-length": "0" };
@@ -657,7 +771,7 @@ export class WebdavSession {
    * body — §9.6 is explicit that a `multistatus` must not be sent when
    * everything worked.
    */
-  async #delete(head: WebdavRequestHead, path: string): Promise<WebdavResponse> {
+  async #delete(head: WebdavRequestHead, path: string, guard: Guard): Promise<WebdavResponse> {
     if (path === "/") {
       throw refuse(403, { message: "the root collection is the share itself" });
     }
@@ -673,6 +787,18 @@ export class WebdavSession {
     }
     if (stats.isDirectory() && depth !== "infinity") {
       throw refuse(400, { message: "DELETE of a collection is Depth: infinity" });
+    }
+    /* Removing an internal member is a change to the parent collection (§7.4),
+       so both the resource's own locks and the parent's are in the way. */
+    this.#requireWritable(path, guard, { membership: true });
+    const locked = this.#lockedMembers(path, guard);
+    if (locked.length > 0) {
+      /* A locked member is a failure on a resource other than the request URI,
+         which §9.6.1 answers with a multistatus — its own example is "a
+         response with status 423 (Locked) if an internal resource was locked".
+         Nothing has been deleted at this point: a tree that cannot go whole is
+         not one to start taking apart. */
+      return this.#multistatus(locked);
     }
     if (!stats.isDirectory()) {
       await this.driver.unlink(path);
@@ -756,7 +882,11 @@ export class WebdavSession {
    * extended `MKCOL`), an existing resource of any kind is `405`, and a missing
    * or non-collection parent is `409`.
    */
-  async #mkcol(path: string, body: AsyncIterable<Uint8Array>): Promise<WebdavResponse> {
+  async #mkcol(
+    path: string,
+    body: AsyncIterable<Uint8Array>,
+    guard: Guard,
+  ): Promise<WebdavResponse> {
     const content = await collectBody(body, this.#maxXmlBytes);
     if (content.byteLength > 0) {
       throw refuse(415, { message: "this server defines no MKCOL request body" });
@@ -765,6 +895,8 @@ export class WebdavSession {
       throw refuse(405, { headers: { allow: ALLOW_HEADER } });
     }
     await this.#requireCollection(dirname(path));
+    // A new internal member of the parent collection (§7.4).
+    this.#requireWritable(path, guard, { membership: true });
     await this.driver.mkdir(path);
     return { status: 201, headers: { "content-length": "0" } };
   }
@@ -787,7 +919,12 @@ export class WebdavSession {
    * `201` when the destination was created, `204` when it replaced something,
    * which is §9.8.5's table.
    */
-  async #copyOrMove(head: WebdavRequestHead, path: string, move: boolean): Promise<WebdavResponse> {
+  async #copyOrMove(
+    head: WebdavRequestHead,
+    path: string,
+    move: boolean,
+    guard: Guard,
+  ): Promise<WebdavResponse> {
     const destination = parseDestination(head.headers["destination"], head.headers["host"]);
     const overwrite = parseOverwrite(head.headers["overwrite"]);
     if (overwrite === undefined) {
@@ -816,6 +953,22 @@ export class WebdavSession {
     }
     await this.#requireCollection(dirname(destination));
     const existing = await this.#statOrAbsent(destination);
+    /* §7.5.1's example, stated as a rule: "even though both the source and
+       destination are locked, only one lock token must be submitted (the one
+       for the lock on the destination) ... because the source resource is not
+       modified by a COPY". A `MOVE` modifies both ends, so it needs both. */
+    if (move) {
+      this.#requireWritable(path, guard, { membership: true });
+    }
+    this.#requireWritable(destination, guard, { membership: existing === undefined });
+    const locked = [
+      ...(move ? this.#lockedMembers(path, guard) : []),
+      ...(existing === undefined ? [] : this.#lockedMembers(destination, guard)),
+    ];
+    if (locked.length > 0) {
+      // A locked member at either end, named the way §9.6.1 names one.
+      return this.#multistatus(locked);
+    }
     if (existing !== undefined) {
       if (!overwrite) {
         throw refuse(412, { message: "the destination exists and Overwrite is F" });
@@ -977,6 +1130,7 @@ export class WebdavSession {
     head: WebdavRequestHead,
     path: string,
     body: AsyncIterable<Uint8Array>,
+    guard: Guard,
   ): Promise<WebdavResponse> {
     const depth = parseDepth(head.headers["depth"], "infinity");
     if (depth === undefined) {
@@ -987,9 +1141,10 @@ export class WebdavSession {
     }
     const request = parsePropfind(await collectBody(body, this.#maxXmlBytes));
     const stats = await this.#stat(path);
-    /* One `now` for the whole document: two resources described by one reply
-       must not report leases read off two different clocks. */
-    const now = this.#now();
+    /* One `now` for the whole document, and it is the request's own: two
+       resources described by one reply must not report leases read off two
+       different clocks. */
+    const now = guard.now;
     const entries: MultistatusEntry[] = [
       {
         href: hrefOf(path, stats.isDirectory()),
@@ -1162,9 +1317,15 @@ export class WebdavSession {
    * property it could have set alongside one it could not needs to see which
    * was which.
    */
-  async #proppatch(path: string, body: AsyncIterable<Uint8Array>): Promise<WebdavResponse> {
+  async #proppatch(
+    path: string,
+    body: AsyncIterable<Uint8Array>,
+    guard: Guard,
+  ): Promise<WebdavResponse> {
     const request = parseProppatch(await collectBody(body, this.#maxXmlBytes));
     const stats = await this.#stat(path);
+    // §7's list of what a write lock covers names PROPPATCH explicitly.
+    this.#requireWritable(path, guard);
     const names = [...request.set, ...request.remove];
     return xmlBody(
       207,
@@ -1181,6 +1342,179 @@ export class WebdavSession {
         },
       ]),
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // the If header, and the locks it unlocks
+  // -------------------------------------------------------------------------
+
+  /**
+   * Evaluate the `If` header and collect what it submitted (RFC 4918 §10.4).
+   *
+   * §10.4.1 gives the header two purposes and insists they are separate, and
+   * this method is where that separation lives:
+   *
+   * 1. **A precondition.** Every list is evaluated; if the header has lists and
+   *    none of them is true, the request is `412` and nothing else happens.
+   * 2. **A submission.** Every state token in it counts as submitted "whatever
+   *    the condition it expressed was found to be true" — so the tokens survive
+   *    an evaluation the client did not need, which is what §10.4.8's
+   *    `(Not <DAV:no-lock>)` idiom is for.
+   *
+   * @throws {DavFault} `400` for a header that is not the grammar, `412` for
+   * one that evaluated to false.
+   */
+  async #guard(head: WebdavRequestHead, path: string, evaluate: boolean): Promise<Guard> {
+    const now = this.#now();
+    const lists = this.#ifLists(head);
+    if (lists === undefined) {
+      return { now, submitted: new Set(), lists: undefined };
+    }
+    const guard: Guard = { now, submitted: new Set(submittedTokens(lists)), lists };
+    if (evaluate) {
+      await this.#requireIf(guard, path);
+    }
+    return guard;
+  }
+
+  /**
+   * The precondition half of §10.4.1, on its own: `412` unless some list is
+   * true.
+   *
+   * Separate from {@link WebdavSession.#guard} because `LOCK` calls it at a
+   * different moment — see {@link Guard.lists} — and idempotent, since a header
+   * that is true stays true within one request.
+   *
+   * @throws {DavFault} `412`.
+   */
+  async #requireIf(guard: Guard, path: string): Promise<void> {
+    if (guard.lists !== undefined && !(await this.#evaluateIf(guard.lists, path, guard.now))) {
+      throw refuse(412, { message: "the If header's state lists all evaluated to false" });
+    }
+  }
+
+  /**
+   * Is any list true? A list is true when **every** condition in it is
+   * (§10.4.3: conjunction inside a list, disjunction between them).
+   *
+   * The state of each resource is read at most once per request, because a
+   * header naming the same resource in three lists is one `stat`, not three —
+   * and because two lists about one resource must not be evaluated against two
+   * different views of it.
+   */
+  async #evaluateIf(lists: readonly IfList[], path: string, now: number): Promise<boolean> {
+    const states = new Map<string, ResourceState>();
+    for (const list of lists) {
+      const state = list.foreign
+        ? UNKNOWN_RESOURCE
+        : await this.#resourceState(list.resource ?? path, states, now);
+      let all = true;
+      for (const condition of list.conditions) {
+        if (matchesCondition(condition, state) === condition.negated) {
+          all = false;
+          break;
+        }
+      }
+      if (all) {
+        return true;
+      }
+    }
+    /* v8 ignore next 2 -- `parseIf` never answers an empty list array, so this
+       loop always ran at least once; the `false` is the honest fallthrough. */
+    return false;
+  }
+
+  /**
+   * What an `If` condition can be matched against: the tokens on the resource
+   * and its entity tag.
+   *
+   * §10.4.4's "handling unmapped URLs" rule is the reason both halves are
+   * optional rather than an error: a URL with nothing at it is treated "as if
+   * the URL identified a resource that exists but does not have the specified
+   * state", so it has no tokens and no tag, every plain condition against it is
+   * false, and every negated one is true. A **collection** has no entity tag
+   * here for the same reason `getetag` is not one of its properties — §15.4
+   * defines it against a `GET` this server answers `405` — while its lock
+   * tokens are as real as any resource's.
+   */
+  async #resourceState(
+    path: string,
+    cache: Map<string, ResourceState>,
+    now: number,
+  ): Promise<ResourceState> {
+    const cached = cache.get(path);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const stats = await this.#statOrAbsent(path);
+    const state: ResourceState = {
+      tokens: this.locks.covering(path, now).map((lock) => lock.token),
+      etag:
+        stats === undefined || stats.isDirectory() ? undefined : formatETag(resourceETag(stats)),
+    };
+    cache.set(path, state);
+    return state;
+  }
+
+  /**
+   * Refuse a request that would change a write-locked resource without the
+   * token for it (RFC 4918 §7, §7.5).
+   *
+   * "Clients MUST submit a lock-token they are authorized to use in any request
+   * that modifies a write-locked resource ... or the method MUST fail." What
+   * counts as modifying is §7's list, and it has two shapes, which is what
+   * `membership` selects:
+   *
+   * - **The resource itself** — its bytes or its properties. Every lock
+   *   covering it applies, the depth-infinity one rooted three levels up
+   *   included (§6.1 point 4).
+   * - **Its parent's membership** — a request that *creates* or *removes* an
+   *   internal member of a collection (§7.4: "DELETE a collection's direct
+   *   internal member ... PUT or MKCOL request that would create a new internal
+   *   member"). A depth-**0** lock on the parent protects that and nothing else,
+   *   which is exactly the case a coverage test on the member alone would miss.
+   *
+   * The refusal is §7.5.2's: `423` with `lock-token-submitted` naming the roots
+   * that stopped it, because "it can be difficult for the client to find out
+   * which locked resource made the request fail".
+   *
+   * @throws {DavFault} `423`.
+   */
+  #requireWritable(path: string, guard: Guard, options: { membership?: boolean } = {}): void {
+    const blocking = this.locks
+      .covering(path, guard.now)
+      .filter((lock) => !guard.submitted.has(lock.token));
+    if (options.membership === true && path !== "/") {
+      for (const lock of this.locks.covering(dirname(path), guard.now)) {
+        if (!guard.submitted.has(lock.token) && !blocking.includes(lock)) {
+          blocking.push(lock);
+        }
+      }
+    }
+    if (blocking.length > 0) {
+      throw refuse(423, {
+        condition: "lock-token-submitted",
+        hrefs: blocking.map((lock) => hrefOf(lock.path, lock.collection)),
+        message: `${path} is write-locked and no token for it was submitted`,
+      });
+    }
+  }
+
+  /**
+   * The members of a tree that are separately locked, as `207` entries.
+   *
+   * A lock rooted *below* the request URI is a failure on a **different**
+   * resource, and §9.6.1 answers those with a multistatus rather than a status:
+   * "the Multi-Status body could include a response with status 423 (Locked) if
+   * an internal resource was locked". A lock covering the request URI itself is
+   * not one of these — that one is {@link WebdavSession.#requireWritable}'s
+   * plain `423`, which is what §7.5.2's example shows.
+   */
+  #lockedMembers(path: string, guard: Guard): Failure[] {
+    return this.locks
+      .within(path, guard.now)
+      .filter((lock) => lock.path !== path && !guard.submitted.has(lock.token))
+      .map((lock) => ({ path: lock.path, collection: lock.collection, status: 423 }));
   }
 
   // -------------------------------------------------------------------------
@@ -1207,13 +1541,15 @@ export class WebdavSession {
     head: WebdavRequestHead,
     path: string,
     body: AsyncIterable<Uint8Array>,
+    guard: Guard,
   ): Promise<WebdavResponse> {
     const info = parseLockInfo(await collectBody(body, this.#maxXmlBytes));
-    const now = this.#now();
+    const now = guard.now;
     const timeout = parseTimeout(head.headers["timeout"]);
     if (info === undefined) {
-      return this.#refreshLock(head, path, timeout, now);
+      return await this.#refreshLock(path, timeout, guard);
     }
+    await this.#requireIf(guard, path);
     /* §9.10.3: `0` or `infinity` and nothing else — `1` is a depth the lock
        model has no meaning for — and an absent header is `infinity`. */
     const depth = parseDepth(head.headers["depth"], "infinity");
@@ -1235,6 +1571,11 @@ export class WebdavSession {
          one or more intermediate collections have been created. The server MUST
          NOT create those intermediate collections automatically." */
       await this.#requireCollection(dirname(path));
+      /* The empty resource §7.3 creates is a new internal member of its parent,
+         so a lock on that collection has to be submitted for it (§7.4). The
+         lock being *taken* is judged by the compatibility table alone
+         (§9.10.5), which the conflict check above is. */
+      this.#requireWritable(path, guard, { membership: true });
       await (await this.driver.open(path, "w", 0o666)).close();
     }
     const grant = this.locks.create(
@@ -1279,14 +1620,13 @@ export class WebdavSession {
    * response header: §9.10.2 says it "is not returned in the response for a
    * successful refresh", since no token was created.
    */
-  #refreshLock(
-    head: WebdavRequestHead,
+  async #refreshLock(
     path: string,
     timeout: number | "infinite" | undefined,
-    now: number,
-  ): WebdavResponse {
-    const lists = this.#ifLists(head);
-    if (lists === undefined) {
+    guard: Guard,
+  ): Promise<WebdavResponse> {
+    const now = guard.now;
+    if (guard.lists === undefined) {
       throw refuse(400, { message: "a LOCK with no body refreshes a lock and needs an If header" });
     }
     /* The first submitted token that names a live lock covering this URL. More
@@ -1294,9 +1634,13 @@ export class WebdavSession {
        refreshed at a time"); refreshing the first is the reading that does
        something rather than nothing, and a client that meant the other one gets
        a `timeout` element saying which lock it actually refreshed. */
-    for (const token of submittedTokens(lists)) {
+    for (const token of guard.submitted) {
       const lock = this.locks.find(token, now);
       if (lock !== undefined && DavLockTable.inScope(lock, path)) {
+        /* The header named a lock that is really here; now it has to be true as
+           a precondition as well (§10.4.1's two purposes, in the order that
+           gives each refusal its own reason). */
+        await this.#requireIf(guard, path);
         const refreshed = this.locks.refresh(token, timeout, now);
         /* v8 ignore next 3 -- `find` just answered for this token and nothing
            awaits in between, so `refresh` cannot miss it. */

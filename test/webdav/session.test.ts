@@ -1031,17 +1031,20 @@ describe("locks and the resources under them", () => {
   it("destroys the locks a DELETE unmaps, and leaves the ones above it (§6.1)", async () => {
     const { session: locking } = lockingSession();
     await lockOf(locking, "/", { headers: { depth: "0" }, body: SHARED_LOCKINFO });
-    await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
+    const token = await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
     expect(locking.locks.all(LOCK_START)).toHaveLength(2);
-    expect((await request(locking, "DELETE", "/dir/file.txt")).status).toBe(204);
+    const reply = await request(locking, "DELETE", "/dir/file.txt", {
+      headers: { if: `(<${token}>)` },
+    });
+    expect(reply.status).toBe(204);
     expect(locking.locks.all(LOCK_START).map((lock) => lock.path)).toEqual(["/"]);
   });
 
   it("does not move a lock with the resource it locks (§7.6)", async () => {
     const { session: locking } = lockingSession();
-    await lockOf(locking, "/dir/file.txt");
+    const token = await lockOf(locking, "/dir/file.txt");
     const reply = await request(locking, "MOVE", "/dir/file.txt", {
-      headers: { destination: "/moved.txt" },
+      headers: { destination: "/moved.txt", if: `(<${token}>)` },
     });
     expect(reply.status).toBe(201);
     expect(locking.locks.all(LOCK_START)).toEqual([]);
@@ -1055,10 +1058,232 @@ describe("locks and the resources under them", () => {
     await (await driver.open("/dir/other.txt", "w")).close();
     const token = await lockOf(locking, "/dir/other.txt", { body: SHARED_LOCKINFO });
     const reply = await request(locking, "MOVE", "/dir/file.txt", {
-      headers: { destination: "/dir/other.txt" },
+      /* §7.5.1's own form: the token belongs to the destination, so the list
+         is tagged with the destination rather than left to fall on the request
+         URI — which is not locked by it, and would be a 412. */
+      headers: { destination: "/dir/other.txt", if: `</dir/other.txt> (<${token}>)` },
     });
     expect(reply.status).toBe(204);
     expect(locking.locks.all(LOCK_START).map((lock) => lock.token)).toEqual([token]);
+  });
+});
+
+describe("the If header", () => {
+  it("is a precondition on any method, and a false one is 412", async () => {
+    const { session: locking } = lockingSession();
+    const wrong = { if: `(["${"0".repeat(32)}"])` };
+    expect((await request(locking, "GET", "/dir/file.txt", { headers: wrong })).status).toBe(412);
+    expect(
+      (await request(locking, "PUT", "/dir/file.txt", { headers: wrong, body: "x" })).status,
+    ).toBe(412);
+    expect((await request(locking, "DELETE", "/dir/file.txt", { headers: wrong })).status).toBe(
+      412,
+    );
+  });
+
+  it("matches an entity tag, weakly, as §10.4.4 lets a server choose", async () => {
+    const { session: locking } = lockingSession();
+    const etag = (await request(locking, "HEAD", "/dir/file.txt")).headers["etag"] as string;
+    expect(
+      (await request(locking, "GET", "/dir/file.txt", { headers: { if: `([${etag}])` } })).status,
+    ).toBe(200);
+    /* §10.4.9's example carries `[W/"A weak ETag"]` and expects it to match, so
+       the weak comparison function is the one in use. */
+    expect(
+      (await request(locking, "GET", "/dir/file.txt", { headers: { if: `([W/${etag}])` } })).status,
+    ).toBe(200);
+  });
+
+  it("is a conjunction inside a list and a disjunction between them (§10.4.3)", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir/file.txt");
+    const etag = (await request(locking, "HEAD", "/dir/file.txt")).headers["etag"] as string;
+    // Both conditions hold.
+    expect(
+      (
+        await request(locking, "GET", "/dir/file.txt", {
+          headers: { if: `(<${token}> [${etag}])` },
+        })
+      ).status,
+    ).toBe(200);
+    // One of the two fails, so the list does — and there is no other list.
+    expect(
+      (await request(locking, "GET", "/dir/file.txt", { headers: { if: `(<${token}> ["nope"])` } }))
+        .status,
+    ).toBe(412);
+    // A second list saves it.
+    expect(
+      (
+        await request(locking, "GET", "/dir/file.txt", {
+          headers: { if: `(<${token}> ["nope"]) ([${etag}])` },
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("evaluates a tagged list against the resource it names (§10.4.10)", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir");
+    /* The lock is on the collection, and the list says so — this is the exact
+       shape §10.4.10 walks through for a DELETE of a member. */
+    const tagged = await request(locking, "DELETE", "/dir/file.txt", {
+      headers: { if: `</dir/> (<${token}>)` },
+    });
+    expect(tagged.status).toBe(204);
+  });
+
+  it("treats an unmapped URL as a resource with none of the state asked about (§10.4.11)", async () => {
+    const { session: locking } = lockingSession();
+    expect(
+      (await request(locking, "GET", "/dir/file.txt", { headers: { if: `</nothing> (["4217"])` } }))
+        .status,
+    ).toBe(412);
+    expect(
+      (
+        await request(locking, "GET", "/dir/file.txt", {
+          headers: { if: `</nothing> (Not ["4217"])` },
+        })
+      ).status,
+    ).toBe(200);
+  });
+
+  it("submits a token even when the list it is in was never true (§10.4.8)", async () => {
+    /* `(Not <DAV:no-lock>)` is the idiom: it makes the whole header true, so
+       the first list's truth stops mattering, while the token in it still
+       counts as submitted. */
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir/file.txt");
+    const reply = await request(locking, "PUT", "/dir/file.txt", {
+      headers: { if: `(<${token}> ["stale"]) (Not <DAV:no-lock>)` },
+      body: "rewritten",
+    });
+    expect(reply.status).toBe(204);
+  });
+
+  it("is 400 for a header that is not the grammar", async () => {
+    const { session: locking } = lockingSession();
+    expect(
+      (await request(locking, "GET", "/dir/file.txt", { headers: { if: "nonsense" } })).status,
+    ).toBe(400);
+  });
+});
+
+describe("what a write lock protects", () => {
+  it("refuses a PUT to a locked resource, and names the lock root (§7.5.2)", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir/file.txt");
+    const refused = await request(locking, "PUT", "/dir/file.txt", { body: "mine" });
+    expect(refused.status).toBe(423);
+    expect(refused.text).toContain(
+      `<lock-token-submitted><href>/dir/file.txt</href></lock-token-submitted>`,
+    );
+    // The bytes are untouched, and the token is what lets them through.
+    expect((await request(locking, "GET", "/dir/file.txt")).text).toBe("hello world");
+    const allowed = await request(locking, "PUT", "/dir/file.txt", {
+      headers: { if: `(<${token}>)` },
+      body: "mine",
+    });
+    expect(allowed.status).toBe(204);
+  });
+
+  it("is §7.5.2's answer for a member of a depth-infinity locked collection", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir");
+    const reply = await request(locking, "DELETE", "/dir/file.txt");
+    expect(reply.status).toBe(423);
+    expect(reply.text).toContain(`<lock-token-submitted><href>/dir/</href></lock-token-submitted>`);
+  });
+
+  it("protects a locked collection's membership at depth 0 as well (§7.4)", async () => {
+    /* A depth-0 lock on a collection protects nothing inside it *except* its
+       membership — so an existing member is writable and a new one is not. */
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir", { headers: { depth: "0" } });
+    expect((await request(locking, "PUT", "/dir/file.txt", { body: "still fine" })).status).toBe(
+      204,
+    );
+    expect((await request(locking, "PUT", "/dir/new.txt", { body: "no" })).status).toBe(423);
+    expect((await request(locking, "MKCOL", "/dir/sub")).status).toBe(423);
+    expect((await request(locking, "DELETE", "/dir/file.txt")).status).toBe(423);
+    expect(
+      (await request(locking, "MKCOL", "/dir/sub", { headers: { if: `</dir/> (<${token}>)` } }))
+        .status,
+    ).toBe(201);
+  });
+
+  it("answers 207 with 423 for a locked member of a tree, and deletes nothing", async () => {
+    /* §9.6.1: "the Multi-Status body could include a response with status 423
+       (Locked) if an internal resource was locked" — the failing resource is
+       not the request URI, so it cannot be a bare status. */
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
+    const reply = await request(locking, "DELETE", "/dir");
+    expect(reply.status).toBe(207);
+    expect(hrefs(reply.text)).toEqual(["/dir/file.txt"]);
+    expect(statuses(reply.text)).toEqual([423]);
+    expect((await driver.stat("/dir/file.txt")).size).toBe(11);
+  });
+
+  it("needs both ends of a MOVE and only the destination of a COPY (§7.5.1)", async () => {
+    const { session: locking } = lockingSession();
+    await driver.mkdir("/target");
+    const source = await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
+    const target = await lockOf(locking, "/target", { body: SHARED_LOCKINFO });
+    // A COPY leaves the source alone, so only the destination's token is owed.
+    expect(
+      (
+        await request(locking, "COPY", "/dir/file.txt", {
+          headers: { destination: "/target/copy.txt", if: `</target/> (<${target}>)` },
+        })
+      ).status,
+    ).toBe(201);
+    // A MOVE changes both ends.
+    expect(
+      (
+        await request(locking, "MOVE", "/dir/file.txt", {
+          headers: { destination: "/target/moved.txt", if: `</target/> (<${target}>)` },
+        })
+      ).status,
+    ).toBe(423);
+    expect(
+      (
+        await request(locking, "MOVE", "/dir/file.txt", {
+          headers: {
+            destination: "/target/moved.txt",
+            if: `(<${source}>) </target/> (<${target}>)`,
+          },
+        })
+      ).status,
+    ).toBe(201);
+  });
+
+  it("protects PROPPATCH and leaves GET, HEAD and PROPFIND alone (§7)", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir/file.txt");
+    const proppatch = await request(locking, "PROPPATCH", "/dir/file.txt", {
+      body: `<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:a/></D:prop></D:set></D:propertyupdate>`,
+    });
+    expect(proppatch.status).toBe(423);
+    /* "All other HTTP/WebDAV methods defined so far -- GET in particular --
+       function independently of a write lock." */
+    expect((await request(locking, "GET", "/dir/file.txt")).status).toBe(200);
+    expect((await request(locking, "HEAD", "/dir/file.txt")).status).toBe(200);
+    expect(
+      (await request(locking, "PROPFIND", "/dir/file.txt", { headers: { depth: "0" } })).status,
+    ).toBe(207);
+  });
+
+  it("refuses a LOCK that would create a member of a locked collection (§7.4)", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir", { headers: { depth: "0" } });
+    const refused = await request(locking, "LOCK", "/dir/reserved.txt", { body: LOCKINFO });
+    expect(refused.status).toBe(423);
+    await expect(driver.stat("/dir/reserved.txt")).rejects.toThrow();
+    const allowed = await request(locking, "LOCK", "/dir/reserved.txt", {
+      headers: { if: `</dir/> (<${token}>)` },
+      body: LOCKINFO,
+    });
+    expect(allowed.status).toBe(201);
   });
 });
 

@@ -49,10 +49,13 @@ import {
   MULTIPART_PREFIX,
 } from "./constants.ts";
 import {
+  etagMatchesStrongly,
+  etagMatchesWeakly,
   formatContentRange,
   formatETag,
   formatHttpDate,
   MAX_TIMESTAMP_MS,
+  parseETagList,
   parseHttpDate,
 } from "../http.ts";
 import { normalizePath } from "../path.ts";
@@ -500,10 +503,12 @@ export function s3ErrorResponse(error: S3ErrorSpec, extra: S3ErrorExtra = {}): S
 // ---------------------------------------------------------------------------
 
 /*
- * `HTTP-date`, the `Range` grammar and the `ETag` quoting are RFC 9110 rather
- * than S3, and `mountx/webdav` answers the same three. They live in
- * `src/http.ts` and are re-exported here under the names they have always had,
- * so this module's surface — and `mountx/s3`'s — is unchanged.
+ * `HTTP-date`, the `Range` grammar, the `ETag` quoting and the entity-tag
+ * comparison functions are RFC 9110 rather than S3, and `mountx/webdav` answers
+ * the same ones — its `If` header (RFC 4918 §10.4) matches entity tags with the
+ * very same list parser. They live in `src/http.ts` and are re-exported here
+ * under the names they have always had, so this module's surface — and
+ * `mountx/s3`'s — is unchanged.
  */
 export {
   formatContentRange,
@@ -512,8 +517,11 @@ export {
   formatIsoDate,
   formatUnsatisfiedRange,
   MAX_TIMESTAMP_MS,
+  parseETagList,
   parseHttpDate,
   parseRange,
+  type ETag,
+  type ETagList,
   type RangeSpec,
 } from "../http.ts";
 
@@ -1520,75 +1528,6 @@ export function routeRequest(
 // ---------------------------------------------------------------------------
 // conditional requests
 // ---------------------------------------------------------------------------
-
-/** One entity tag, with the weakness marker kept: `W/` is part of the tag. */
-export interface ETag {
-  /** The opaque value, without quotes and without the `W/` prefix. */
-  value: string;
-  /** Was it sent as `W/"..."`? */
-  weak: boolean;
-}
-
-/** An entity tag list: `*`, or the tags as sent. */
-export type ETagList = { any: true } | { any: false; tags: ETag[] };
-
-/** Take a tag apart: `W/"abc"` is `{ value: "abc", weak: true }`. */
-function parseETag(value: string): ETag {
-  const weak = value.startsWith("W/");
-  const withoutWeak = weak ? value.slice(2) : value;
-  const unquoted =
-    withoutWeak.startsWith(`"`) && withoutWeak.endsWith(`"`) && withoutWeak.length >= 2
-      ? withoutWeak.slice(1, -1)
-      : withoutWeak;
-  return { value: unquoted, weak };
-}
-
-/**
- * Parse an `If-Match`/`If-None-Match` value (RFC 9110 §13.1.1/§13.1.2).
- *
- * The weakness marker is **kept**, because the two headers do not compare tags
- * the same way: `If-Match` uses the strong comparison function and `If-None-
- * Match` the weak one (§8.8.3.2). The client controls its side of that
- * comparison, so `If-Match: W/"x"` never matches anything — including an object
- * whose strong ETag is `x` — while `If-None-Match: W/"x"` does.
- */
-export function parseETagList(value: string): ETagList {
-  if (value.trim() === "*") {
-    return { any: true };
-  }
-  const tags: ETag[] = [];
-  for (const part of value.split(",")) {
-    const trimmed = part.trim();
-    if (trimmed !== "") {
-      tags.push(parseETag(trimmed));
-    }
-  }
-  return { any: false, tags };
-}
-
-/**
- * The **strong** comparison function (RFC 9110 §8.8.3.2): the values match and
- * *neither* tag is weak. `*` matches any existing representation.
- */
-function etagMatchesStrongly(list: ETagList, etag: string): boolean {
-  if (list.any) {
-    return true;
-  }
-  const target = parseETag(etag);
-  return !target.weak && list.tags.some((tag) => !tag.weak && tag.value === target.value);
-}
-
-/**
- * The **weak** comparison function: the values match, whatever either side's
- * weakness marker says.
- */
-function etagMatchesWeakly(list: ETagList, etag: string): boolean {
-  if (list.any) {
-    return true;
-  }
-  const target = parseETag(etag);
-  return list.tags.some((tag) => tag.value === target.value);
-}
 
 /** What the conditional headers are evaluated against. */
 export interface ConditionalTarget {
