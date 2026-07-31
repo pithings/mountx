@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
 import { createLoopback } from "../src/harness.ts";
 import { S_IFCHR, S_IFIFO, S_IFSOCK } from "../src/types.ts";
+import { Rng } from "./fuse/random.ts";
 
 describe("memory driver", () => {
   it("applies umask and ownership options", async () => {
@@ -54,6 +55,67 @@ describe("memory driver", () => {
     expect((await fs.stat("/")).nlink).toBe(4);
     await fs.rmdir("/b");
     expect((await fs.stat("/")).nlink).toBe(3);
+  });
+
+  it("keeps the directory link count in step with the tree it counts", async () => {
+    // `nlinkOf` stopped scanning a directory's children per `stat` and started
+    // keeping a running total, which is only right if every path that moves a
+    // directory in or out of a parent maintains it — `rename` most of all,
+    // since it is the one that deletes from a child map without going through
+    // `unlinkEntry`. So: random operations, and after each one the counter is
+    // checked against the scan it replaced, for every directory in the tree.
+    const fs = createLoopback(createMemoryDriver());
+    const rng = new Rng(0x6e_6c_69_6e);
+    const names = ["a", "b", "c", "d"];
+    const paths = ["/", "/a", "/b", "/a/c", "/a/d", "/b/c", "/b/c/d"];
+    const pick = <T>(from: readonly T[]): T => from[rng.int(from.length)]!;
+
+    const scan = async (dir: string): Promise<void> => {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const subdirs = entries.filter((entry) => entry.isDirectory());
+      expect((await fs.stat(dir)).nlink).toBe(2 + subdirs.length);
+      for (const entry of subdirs) {
+        await scan(dir === "/" ? `/${entry.name}` : `${dir}/${entry.name}`);
+      }
+    };
+
+    for (let step = 0; step < 400; step++) {
+      const path = pick(paths);
+      const other = `${pick(paths)}/${pick(names)}`;
+      // Most of these fail — ENOENT, EEXIST, ENOTEMPTY, EINVAL for a rename
+      // into its own subtree — and a failed operation must not move the count
+      // either, so they are as much of the test as the ones that land.
+      try {
+        switch (rng.int(6)) {
+          case 0: {
+            await fs.mkdir(path);
+            break;
+          }
+          case 1: {
+            await fs.rmdir(path);
+            break;
+          }
+          case 2: {
+            await fs.writeFile(path, "x");
+            break;
+          }
+          case 3: {
+            await fs.unlink(path);
+            break;
+          }
+          case 4: {
+            await fs.symlink("/a", path);
+            break;
+          }
+          default: {
+            await fs.rename(path, other);
+          }
+        }
+      } catch {
+        // Expected for most steps; the invariant below is what is under test.
+      }
+      await scan("/");
+    }
   });
 
   it("accounts for used blocks in statfs", async () => {
@@ -147,6 +209,28 @@ describe("memory driver", () => {
     expect((await fs.readdir("/d", { withFileTypes: true })).map((entry) => entry.name)).toEqual([
       "taken",
     ]);
+  });
+
+  it("sizes a symlink target the way TextEncoder would, pair by pair", async () => {
+    // `sizeOf` counts UTF-8 bytes without encoding any, so the four widths and
+    // the two surrogate cases are checked against the encoder it replaced —
+    // the conformance suite's `héllo→ø` reaches 2 and 3 bytes but never a pair.
+    const fs = createLoopback(createMemoryDriver());
+    const encoder = new TextEncoder();
+    const targets = [
+      "/plain/ascii",
+      "café", // 2 bytes
+      "日本語", // 3 bytes
+      "🎉🚀", // surrogate pairs, 4 bytes each
+      "a🎉b→c", // mixed widths, so a miscounted pair shifts the total
+      "\uD83C", // an unpaired high surrogate: `TextEncoder` substitutes U+FFFD
+      "\uDC00x", // an unpaired low surrogate
+      "\uD83Cx", // a high surrogate followed by something that is not a low one
+    ];
+    for (const [index, target] of targets.entries()) {
+      await fs.symlink(target, `/l-${index}`);
+      expect((await fs.lstat(`/l-${index}`)).size).toBe(encoder.encode(target).byteLength);
+    }
   });
 
   it("validates read/write arguments the way node:fs does", async () => {

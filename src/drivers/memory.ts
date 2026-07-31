@@ -35,7 +35,6 @@ import {
 const BLOCK_SIZE = 4096;
 const MAX_SYMLINK_DEPTH = 40;
 const EMPTY = new Uint8Array(0);
-const encoder = new TextEncoder();
 
 interface MemNode {
   ino: number;
@@ -52,6 +51,11 @@ interface MemNode {
   data?: Uint8Array;
   /** Directories. */
   children?: Map<string, MemNode>;
+  /**
+   * Directories: how many of {@link children} are themselves directories, kept
+   * as a running total for {@link nlinkOf}. See its comment for why.
+   */
+  subdirs?: number;
   /** Symlinks. */
   target?: string;
 }
@@ -93,18 +97,37 @@ const SPECIAL_TYPES: ReadonlySet<number> = new Set([S_IFIFO, S_IFCHR, S_IFBLK, S
 const isSpecial = (node: MemNode): boolean => SPECIAL_TYPES.has(node.mode & S_IFMT);
 
 /**
- * The seven type predicates `StatsLike` and `DirentLike` both carry — one field
- * of `mode` decides all of them — are written out at each of the two sites that
- * build one, rather than shared by a helper the site spreads in.
+ * How many bytes a string is in UTF-8, without encoding it into any.
  *
- * That looks like duplication worth removing, and removing it costs 2× on
- * `readdir` and 1.4× on `stat` for the memory driver: `{...typePredicates(mode)}`
- * is a runtime `CopyDataProperties` over an intermediate object per entry, where
- * a literal is one allocation of a shape V8 already knows. It was measured going
- * the wrong way — the helper landed in `5defab0` and the loopback column lost
- * half its `readdir` throughput — so if this is factored out again, re-measure
- * (`bench/`, the loopback column) rather than assuming the spread is free.
+ * `sizeOf` needs this for every `stat` of a symlink, and the obvious
+ * `encoder.encode(target).byteLength` allocates a whole `Uint8Array` to read one
+ * number off it — which measured 3.2× on `lstat` of a symlink against `lstat` of
+ * a regular file, all of it allocation. An unpaired surrogate counts as 3, which
+ * is what `TextEncoder` charges for the U+FFFD it would substitute.
  */
+function utf8Length(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit < 0x80) {
+      bytes += 1;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else if (
+      unit >= 0xd8_00 &&
+      unit <= 0xdb_ff &&
+      (value.charCodeAt(index + 1) & 0xfc_00) === 0xdc_00
+    ) {
+      // A surrogate pair is one code point and four bytes, and the low half
+      // must not be counted again.
+      bytes += 4;
+      index++;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
 
 function toMs(time: TimeLike): number {
   return typeof time === "number" ? time * 1000 : time.getTime();
@@ -164,6 +187,11 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
       birthtimeMs: time,
       ...extra,
     };
+    if (isDirectory(node)) {
+      // Empty until `link` says otherwise, and every directory has one from the
+      // moment it exists — so `nlinkOf` never has to ask whether it is there.
+      node.subdirs = 0;
+    }
     // Every node created here is linked into a directory by its caller on the
     // next line, bar the root — which is in the tree by definition.
     nodeCount++;
@@ -236,11 +264,17 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
 
   function link(entry: Entry, node: MemNode): void {
     entry.parent.children!.set(entry.name, node);
+    if (isDirectory(node)) {
+      entry.parent.subdirs!++;
+    }
     entry.parent.mtimeMs = entry.parent.ctimeMs = now();
   }
 
   function unlinkEntry(entry: Entry, node: MemNode): void {
     entry.parent.children!.delete(entry.name);
+    if (isDirectory(node)) {
+      entry.parent.subdirs!--;
+    }
     entry.parent.mtimeMs = entry.parent.ctimeMs = now();
     node.nlink--;
     node.ctimeMs = now();
@@ -259,17 +293,21 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
     }
   }
 
+  /**
+   * A directory's link count is itself, its entry in its parent, and one `..`
+   * per subdirectory — so `2 + subdirs`, and the root counts the same way
+   * because nothing links to it but itself.
+   *
+   * Counted rather than scanned for the reason `statfs` keeps running totals
+   * (see {@link nodeCount}): `stat` is called constantly and a directory can be
+   * wide, so scanning made `stat` O(width) — a 1000-entry directory answered at
+   * 2.5e5 ops/s against 2.7e6 for a narrow one, 11× for a number the caller
+   * usually ignores. The three places a directory's child set changes all go
+   * through {@link link} and {@link unlinkEntry}, bar `rename`'s own `delete`,
+   * which says why it is not one of them.
+   */
   function nlinkOf(node: MemNode): number {
-    if (!isDirectory(node)) {
-      return node.nlink;
-    }
-    let count = 2;
-    for (const child of node.children!.values()) {
-      if (isDirectory(child)) {
-        count++;
-      }
-    }
-    return count;
+    return isDirectory(node) ? 2 + node.subdirs! : node.nlink;
   }
 
   function sizeOf(node: MemNode): number {
@@ -277,13 +315,26 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
       return BLOCK_SIZE;
     }
     // A symlink's size is its target in bytes, not in UTF-16 code units.
-    return isSymlink(node) ? encoder.encode(node.target!).byteLength : (node.data?.byteLength ?? 0);
+    return isSymlink(node) ? utf8Length(node.target!) : (node.data?.byteLength ?? 0);
   }
 
   function blocksOf(node: MemNode): number {
     return Math.ceil(sizeOf(node) / BLOCK_SIZE);
   }
 
+  /**
+   * The seven type predicates `StatsLike` and `DirentLike` both carry — one
+   * field of `mode` decides all of them — are written out here and again in
+   * `readdir`, rather than shared by a helper each site spreads in.
+   *
+   * That looks like duplication worth removing, and removing it costs 2× on
+   * `readdir` and 1.4× on `stat`: `{...typePredicates(mode)}` is a runtime
+   * `CopyDataProperties` over an intermediate object per entry, where a literal
+   * is one allocation of a shape V8 already knows. It was measured going the
+   * wrong way — the helper landed in `5defab0` and the loopback column lost half
+   * its `readdir` throughput — so if this is factored out again, re-measure
+   * (`bench/`, the loopback column) rather than assuming the spread is free.
+   */
   function toStats(node: MemNode): StatsLike {
     const size = sizeOf(node);
     const type = node.mode & S_IFMT;
@@ -482,9 +533,10 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
       // per entry is all waste — and `nlinkOf` makes it worse than waste, by
       // rescanning every subdirectory's children to count links nobody reads.
       // The file type is one field of `mode`.
-      return [...node.children!].map(([name, child]) => {
+      const entries: DirentLike[] = [];
+      for (const [name, child] of node.children!) {
         const type = child.mode & S_IFMT;
-        return {
+        entries.push({
           name,
           parentPath,
           isFile: () => type === S_IFREG,
@@ -494,8 +546,9 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
           isCharacterDevice: () => type === S_IFCHR,
           isFIFO: () => type === S_IFIFO,
           isSocket: () => type === S_IFSOCK,
-        };
-      });
+        });
+      }
+      return entries;
     },
 
     async open(path, flags = "r", mode = 0o666) {
@@ -623,7 +676,14 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
         }
         unlinkEntry(to, to.node);
       }
+      // Not `unlinkEntry`: the node is moving, not going away, so its `nlink`
+      // and the `statfs` totals must not move with it. The subdirectory count
+      // does — `link` puts it back on whichever parent it lands in, which is
+      // the same one when the rename stays put.
       from.parent.children!.delete(from.name);
+      if (directory) {
+        from.parent.subdirs!--;
+      }
       from.parent.mtimeMs = from.parent.ctimeMs = now();
       link(to, from.node);
       from.node.ctimeMs = now();
