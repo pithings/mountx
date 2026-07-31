@@ -688,10 +688,29 @@ day-to-day difference; the 0.83×/0.85× rows are smaller and less certain.
 Three things follow. It is a **driver** finding, not a 9P one — no transport row
 shows it, because at 100 entries a round trip costs more than an entry does (NFS
 `readdir` is 128,732 entries/s this sitting against 130,860 on 2026-07-29, i.e.
-unmoved). It is **not chased here**, because this milestone is a benchmark
-column. And it is precisely why the 9P section quotes denominators from its own
-sitting: reading a 9P number against the loopback table above would have credited
-this transport with a change in the driver underneath it.
+unmoved). It was **not chased in this milestone**, because this milestone is a
+benchmark column. And it is precisely why the 9P section quotes denominators from
+its own sitting: reading a 9P number against the loopback table above would have
+credited this transport with a change in the driver underneath it.
+
+**Since fixed, and fully.** `603df04` found the cause — `5defab0` had factored
+the seven type predicates into a helper that `toStats` and `readdir` each spread
+into the object they build, turning one allocation of a shape V8 already knows
+into a runtime `CopyDataProperties` over an intermediate object per entry — and
+wrote the literals out at both sites again, keeping the two type branches
+`mountx.mknod` needs. That commit measures the recovery at **2.09× on `readdir`**
+(5.5 → 11.5 M entries/s at 100 entries) and **1.40× on `stat`** (1.90 → 2.66 M
+ops/s), i.e. the whole of what the table above lost. Those two numbers are
+`603df04`'s own measurement, not this sitting's, and are quoted as its evidence
+rather than restated as this file's; the table above stands as the record of the
+sitting that found the regression.
+
+The 9P rows were taken on the pre-fix driver and are left as measured. They are
+round-trip bound, which is the same reason no transport row showed the regression
+in the first place — the driver underneath moved 1.9× and NFS `readdir` did not
+move at all. A sitting that re-measures them on the post-fix driver would settle
+it properly; until one runs, that is an assumption this paragraph is making
+explicit rather than a result.
 
 ---
 
