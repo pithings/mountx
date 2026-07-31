@@ -152,14 +152,19 @@ export interface NfsSessionOptions {
   /** Directory snapshots kept for readdir cookies. Default `64`. */
   snapshotCache?: number;
   /**
-   * `chown` a newly created entry to the `AUTH_SYS` uid/gid the request
-   * carried. Default `true`.
+   * `chown` a newly created entry to the `AUTH_SYS` uid the request carried,
+   * and to the group POSIX gives it. Default `true`.
    *
    * The same problem the FUSE session solves the same way: the driver creates
    * everything as the server process, while the requests arriving on it come
    * from whoever mounted the share. Quiet when the driver has no `lchown`, or
    * when the server is not privileged enough to hand ownership away — a driver
    * with no concept of ownership is not thereby broken.
+   *
+   * The group is not always the caller's: a set-gid parent directory hands its
+   * own down and a new directory takes the bit with it, which is `chmod`'s job
+   * and so is gated by this option too (`src/ownership.ts`). Turning it off
+   * leaves every new entry exactly as the driver made it.
    */
   claimOwnership?: boolean;
   /** Called for every request that ends in an error status. */

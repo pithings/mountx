@@ -1469,11 +1469,20 @@ export class P9Session {
   /**
    * Give a newly created entry to whoever asked for it.
    *
-   * Character-for-character `NfsSession.#claim`'s stance, with the credentials
-   * gathered from the two places 9P keeps them: the uid from the `Tattach` this
-   * fid descends from (`p9_client_attach()` sends it once per user, and every
-   * walk inherits it), the gid from the create message itself, which is the one
-   * credential 9P repeats per request.
+   * `NfsSession.#claim`'s stance, with the credentials gathered from the two
+   * places 9P keeps them: the uid from the `Tattach` this fid descends from
+   * (`p9_client_attach()` sends it once per user, and every walk inherits it),
+   * the gid from the create message itself, which is the one credential 9P
+   * repeats per request.
+   *
+   * **Set-gid inheritance is deliberately absent here, and is not a gap.** The
+   * rule the NFS sessions apply (`../ownership.ts`) is applied by the *client*
+   * on this wire: `v9fs_get_fsgid_for_create()` hands `Tmkdir`/`Tcreate`/
+   * `Tsymlink`/`Tmknod` the parent's gid when the parent is set-gid, and
+   * `v9fs_vfs_mkdir_dotl()` sets `S_ISGID` in the mode it sends. So the `gid`
+   * below already *is* the inherited group, and the mode `#mkdir` passes
+   * through already carries the bit — applying the rule a second time here
+   * would be the server disagreeing with the kernel that computed it.
    *
    * Best effort, deliberately. A driver with no `lchown` (`ENOSYS`), or one not
    * privileged enough to hand ownership away (`EPERM`/`ENOTSUP`), is not

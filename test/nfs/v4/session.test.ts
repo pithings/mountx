@@ -26,10 +26,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../../src/drivers/memory.ts";
 import { fsError } from "../../../src/errors.ts";
 import {
+  AUTH_SYS,
   authSys,
   decodeReply,
+  encodeAuthSys,
   encodeCall,
   MSG_ACCEPTED,
+  type OpaqueAuth,
   RPC_PROC_UNAVAIL,
   RPC_SUCCESS,
 } from "../../../src/nfs/rpc.ts";
@@ -268,7 +271,13 @@ let nextXid = 1;
  */
 function compoundCall(
   ops: Op[],
-  options: { tag?: string; minorversion?: number; xid?: number; count?: number } = {},
+  options: {
+    tag?: string;
+    minorversion?: number;
+    xid?: number;
+    count?: number;
+    cred?: OpaqueAuth;
+  } = {},
 ): { xid: number; bytes: Uint8Array } {
   const writer = new XdrWriter(512);
   writer.string(options.tag ?? "");
@@ -293,7 +302,7 @@ function compoundCall(
       program: NFS4_PROGRAM,
       version: NFS_V4,
       procedure: NFSPROC4_COMPOUND,
-      cred: authSys(1000, 1000),
+      cred: options.cred ?? authSys(1000, 1000),
       args: writer.bytes(),
     }),
   };
@@ -408,10 +417,18 @@ class Client {
   slotSeqid = 0;
   clientid = 0n;
 
-  constructor(readonly session: Nfs4Session) {}
+  constructor(
+    readonly session: Nfs4Session,
+    /** The credential every compound this client sends carries. */
+    readonly cred?: OpaqueAuth,
+  ) {}
 
-  static async open(session: Nfs4Session, ownerid = "test-client"): Promise<Client> {
-    const client = new Client(session);
+  static async open(
+    session: Nfs4Session,
+    ownerid = "test-client",
+    cred?: OpaqueAuth,
+  ): Promise<Client> {
+    const client = new Client(session, cred);
     const exchange = await client.send([
       {
         op: OP_EXCHANGE_ID,
@@ -452,7 +469,7 @@ class Client {
 
   /** A raw compound, with no SEQUENCE prepended. */
   async send(ops: Op[], options: Parameters<typeof compoundCall>[1] = {}): Promise<Reply> {
-    const { bytes } = compoundCall(ops, options);
+    const { bytes } = compoundCall(ops, { cred: this.cred, ...options });
     const reply = await this.session.handleCall(bytes);
     expect(reply).not.toBeNull();
     return readReply(reply!);
@@ -1965,8 +1982,12 @@ describe("the version router", () => {
  * server answers `NFS4ERR_GRACE` until it does — which is a case of its own
  * below.
  */
-async function ready(session: Nfs4Session, ownerid = "test-client"): Promise<Client> {
-  const client = await Client.open(session, ownerid);
+async function ready(
+  session: Nfs4Session,
+  ownerid = "test-client",
+  cred?: OpaqueAuth,
+): Promise<Client> {
+  const client = await Client.open(session, ownerid, cred);
   const done = await client.run([{ op: OP_RECLAIM_COMPLETE, args: { oneFs: false } }]);
   expect(done.compound.status).toBe(NFS4_OK);
   return client;
@@ -4084,5 +4105,208 @@ describe("the v4 client over a real socket", () => {
     // And the first client's state was discarded with its record, which is what
     // a reboot means and is a status that names the cause.
     expect((await first.renew()).status).toBe(10_052); // NFS4ERR_BADSESSION
+  });
+});
+
+/**
+ * The rule in `src/ownership.ts`, driven through CREATE and a creating OPEN.
+ *
+ * §18.4.3 has the server "derive the owner ... from the principal indicated in
+ * the RPC credentials of the call", and says nothing about the group, because
+ * the group is not the principal's to give: a set-gid parent hands its own
+ * down, and a new directory takes the bit with it. The fixture is built through
+ * the driver rather than through the server, so the setup is not itself subject
+ * to the rule under test.
+ */
+describe("set-gid inheritance", () => {
+  const TEAM = 4000;
+  /** A caller in no group the fixture uses, so every group below is inherited. */
+  const OUTSIDER = credential(4242, 4343);
+  /** The same caller, with the team in its supplementary list (`AUTH_SYS` gids). */
+  const MEMBER = credential(4242, 4343, [7, TEAM]);
+
+  function credential(uid: number, gid: number, gids: number[] = []): OpaqueAuth {
+    // `authSys()` always sends an empty `gids`, and the supplementary list is
+    // exactly what one half of the rule turns on.
+    return {
+      flavor: AUTH_SYS,
+      body: encodeAuthSys({ stamp: 0, machineName: "test", uid, gid, gids }),
+    };
+  }
+
+  /** `/team` is set-gid and owned by group 4000; `/plain` is an ordinary one. */
+  async function fixture(): Promise<FullFsDriver> {
+    const driver = createMemoryDriver();
+    await driver.mkdir("/team");
+    await driver.chown("/team", 500, TEAM);
+    await driver.chmod("/team", 0o2775);
+    await driver.mkdir("/plain");
+    return driver;
+  }
+
+  async function serving(
+    options: { cred?: OpaqueAuth; claimOwnership?: boolean } = {},
+  ): Promise<{ session: Nfs4Session; client: Client }> {
+    const session = new Nfs4Session(await fixture(), {
+      claimOwnership: options.claimOwnership,
+    });
+    return { session, client: await ready(session, "test-client", options.cred ?? OUTSIDER) };
+  }
+
+  const TO_TEAM: Op[] = [{ op: OP_PUTROOTFH }, { op: OP_LOOKUP, args: { objname: "team" } }];
+  const TO_PLAIN: Op[] = [{ op: OP_PUTROOTFH }, { op: OP_LOOKUP, args: { objname: "plain" } }];
+
+  it("gives a file created by OPEN the parent's group and the caller the ownership", async () => {
+    const { session, client } = await serving();
+    const reply = await client.run([
+      ...TO_TEAM,
+      OPEN({
+        name: "f",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o644 } }),
+      }),
+      GETATTR([FATTR4_OWNER, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // §5.9's numeric form, since nothing is idmapped here.
+    expect(attrsFor(reply)).toMatchObject({ owner: "4242", ownerGroup: String(TEAM) });
+    expect(await session.driver.lstat("/team/f")).toMatchObject({ uid: 4242, gid: TEAM });
+  });
+
+  it("inherits on the exclusive create paths as well", async () => {
+    const { session, client } = await serving();
+    for (const [mode, name] of [
+      [EXCLUSIVE4, "one"],
+      [EXCLUSIVE4_1, "two"],
+    ] as const) {
+      const reply = await client.run([
+        ...TO_TEAM,
+        OPEN({
+          name,
+          access: OPEN4_SHARE_ACCESS_BOTH,
+          openhow: exclusiveHow(mode, VERIFIER),
+        }),
+      ]);
+      expect(reply.compound.status).toBe(NFS4_OK);
+      expect((await session.driver.lstat(`/team/${name}`)).gid).toBe(TEAM);
+    }
+  });
+
+  it("gives a new directory the group *and* the set-gid bit", async () => {
+    const { session, client } = await serving();
+    const reply = await client.run([
+      ...TO_TEAM,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "sub",
+          createattrs: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o750 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // `inode(7)`: "newly created subdirectories inherit the set-group-ID bit",
+    // which is what makes the rule apply to a whole tree rather than one level.
+    expect(attrsFor(reply)).toMatchObject({ mode: 0o2750, ownerGroup: String(TEAM) });
+    // A symlink takes the group and keeps its own 0o777 — nothing was chmod'ed
+    // through the link.
+    const link = await client.run([
+      ...TO_TEAM,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4LNK, linkdata: "./f" },
+          objname: "l",
+          createattrs: { attrmask: [], values: {}, unsupported: [] },
+        },
+      },
+    ]);
+    expect(link.compound.status).toBe(NFS4_OK);
+    expect(await session.driver.lstat("/team/l")).toMatchObject({ gid: TEAM, mode: 0o120777 });
+  });
+
+  it("gives the caller's own group in an ordinary directory", async () => {
+    const { session, client } = await serving();
+    const reply = await client.run([
+      ...TO_PLAIN,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "sub",
+          createattrs: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o750 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // No parent bit, nothing to inherit: the mode is the one that was asked for.
+    expect(attrsFor(reply)).toMatchObject({ mode: 0o750, ownerGroup: "4343" });
+    expect((await session.driver.lstat("/plain/sub")).gid).toBe(4343);
+  });
+
+  it("clears set-gid on a new executable the creator has no claim to that group", async () => {
+    const outsider = await serving();
+    const reply = await outsider.client.run([
+      ...TO_TEAM,
+      OPEN({
+        name: "run",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o2775 } }),
+      }),
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // A set-gid executable is a way to *run as* a group, so one may not be made
+    // for a group its creator is not in — `inode_init_owner()`, and the reason
+    // the supplementary list is on the wire at all.
+    expect(attrsFor(reply).mode).toBe(0o775);
+
+    const member = await serving({ cred: MEMBER });
+    const kept = await member.client.run([
+      ...TO_TEAM,
+      OPEN({
+        name: "run",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o2775 } }),
+      }),
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(kept.compound.status).toBe(NFS4_OK);
+    expect(attrsFor(kept).mode).toBe(0o2775);
+  });
+
+  it("does not claim at all with claimOwnership off", async () => {
+    const { session, client } = await serving({ claimOwnership: false });
+    const reply = await client.run([
+      ...TO_TEAM,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "sub",
+          createattrs: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o750 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // Whatever the driver did on its own: no bit added, no group inherited.
+    expect(attrsFor(reply).mode).toBe(0o750);
+    expect((await session.driver.lstat("/team/sub")).gid).toBe(process.getgid?.() ?? 0);
   });
 });

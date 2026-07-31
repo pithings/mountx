@@ -57,10 +57,17 @@ import {
   RPC_PROG_UNAVAIL,
 } from "../../../src/nfs/v3/constants.ts";
 import { NFS_V4 } from "../../../src/nfs/v4/constants.ts";
-import { decodeReply, encodeCall, frameFragments } from "../../../src/nfs/rpc.ts";
+import {
+  AUTH_SYS,
+  decodeReply,
+  encodeAuthSys,
+  encodeCall,
+  frameFragments,
+  type OpaqueAuth,
+} from "../../../src/nfs/rpc.ts";
 import { encodeXdr } from "../../../src/nfs/xdr.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
-import type { FsDriver } from "../../../src/types.ts";
+import type { FsDriver, FullFsDriver } from "../../../src/types.ts";
 import { withoutExtensions } from "../../no-extensions.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
 import { createLoopback, type Loopback } from "../../../src/harness.ts";
@@ -86,10 +93,13 @@ afterEach(async () => {
   }
 });
 
-async function serve(driver: FsDriver = createMemoryDriver()): Promise<Harness> {
-  const server = createNfsServer(driver);
+async function serve(
+  driver: FsDriver = createMemoryDriver(),
+  options: { cred?: OpaqueAuth; claimOwnership?: boolean } = {},
+): Promise<Harness> {
+  const server = createNfsServer(driver, { claimOwnership: options.claimOwnership });
   await server.listen();
-  const client = await NfsClient.connect({ port: server.port });
+  const client = await NfsClient.connect({ port: server.port, cred: options.cred });
   const mounted = await client.mnt("/");
   expect(mounted.status).toBe(MNT3_OK);
   const harness: Harness = {
@@ -994,6 +1004,148 @@ describe("individual procedures", () => {
     expect(server.session.stats.procedures.get("NFS:GETATTR")).toBe(1);
     expect(server.session.stats.procedures.get("MOUNT:MNT")).toBe(1);
     expect(server.session.stats.replies).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The rule in `src/ownership.ts`, driven through CREATE/MKDIR/SYMLINK/MKNOD.
+ *
+ * Everything here is about the *group*, which the caller's `AUTH_SYS`
+ * credential does not settle: a set-gid parent hands its own group down, and a
+ * new directory takes the bit with it. The tree is built through the driver
+ * rather than through the mount, so that the setup is not itself subject to the
+ * rule under test.
+ */
+describe("set-gid inheritance", () => {
+  const TEAM = 4000;
+  /** A caller in no group the fixture uses, so every group below is inherited. */
+  const OUTSIDER = credential(4242, 4343);
+  /** The same caller, with the team in its supplementary list (`AUTH_SYS` gids). */
+  const MEMBER = credential(4242, 4343, [7, TEAM]);
+
+  function credential(uid: number, gid: number, gids: number[] = []): OpaqueAuth {
+    // `authSys()` always sends an empty `gids`, and the supplementary list is
+    // exactly what one half of the rule turns on.
+    return {
+      flavor: AUTH_SYS,
+      body: encodeAuthSys({ stamp: 0, machineName: "test", uid, gid, gids }),
+    };
+  }
+
+  /** `/team` is set-gid and owned by group 4000; `/plain` is an ordinary one. */
+  async function fixture(): Promise<FullFsDriver> {
+    const driver = createMemoryDriver();
+    await driver.mkdir("/team");
+    await driver.chown("/team", 500, TEAM);
+    await driver.chmod("/team", 0o2775);
+    await driver.mkdir("/plain");
+    return driver;
+  }
+
+  async function served(options: { cred?: OpaqueAuth; claimOwnership?: boolean } = {}): Promise<{
+    client: NfsClient;
+    team: Uint8Array;
+    plain: Uint8Array;
+  }> {
+    const { client, root } = await serve(await fixture(), { cred: OUTSIDER, ...options });
+    return {
+      client,
+      team: check(await client.lookup(root, "team"), "lookup").object!,
+      plain: check(await client.lookup(root, "plain"), "lookup").object!,
+    };
+  }
+
+  it("gives a new file the parent's group and the caller the ownership", async () => {
+    const { client, team } = await served();
+    const created = check(await client.create(team, "f", CREATE_UNCHECKED), "create");
+    expect(created.objAttributes!.uid).toBe(4242);
+    expect(created.objAttributes!.gid).toBe(TEAM);
+    // EXCLUSIVE carries no `sattr3` at all, and inherits just the same.
+    const exclusive = check(
+      await client.create(team, "x", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    expect(exclusive.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("gives a new directory the group *and* the set-gid bit", async () => {
+    const { client, team } = await served();
+    const made = check(await client.mkdir(team, "sub", { mode: 0o755 }), "mkdir");
+    expect(made.objAttributes!.gid).toBe(TEAM);
+    // `inode(7)`: "newly created subdirectories inherit the set-group-ID bit",
+    // which is what makes the rule apply to the whole tree rather than one
+    // level of it.
+    expect(made.objAttributes!.mode).toBe(0o2755);
+    // And it really is inherited *again* one level down.
+    const sub = made.obj!;
+    expect(check(await client.mkdir(sub, "deeper"), "mkdir").objAttributes!.mode & 0o2000).toBe(
+      0o2000,
+    );
+    expect(
+      check(await client.create(sub, "f", CREATE_UNCHECKED), "create").objAttributes!.gid,
+    ).toBe(TEAM);
+  });
+
+  it("inherits through SYMLINK and MKNOD too", async () => {
+    const { client, team } = await served();
+    const link = check(await client.symlink(team, "l", "./f"), "symlink");
+    expect(link.objAttributes!.gid).toBe(TEAM);
+    // A symlink's own mode is 0o777 and stays it: nothing was chmod'ed through
+    // the link.
+    expect(link.objAttributes!.mode).toBe(0o777);
+    const fifo = check(await client.mknod(team, "fifo", NF3FIFO, { mode: 0o644 }), "mknod");
+    expect(fifo.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("gives the caller's own group in an ordinary directory", async () => {
+    const { client, plain } = await served();
+    const created = check(await client.create(plain, "f", CREATE_UNCHECKED), "create");
+    expect(created.objAttributes!.uid).toBe(4242);
+    expect(created.objAttributes!.gid).toBe(4343);
+    const made = check(await client.mkdir(plain, "sub", { mode: 0o755 }), "mkdir");
+    expect(made.objAttributes!.gid).toBe(4343);
+    // No parent bit, nothing to inherit: the mode is the one that was asked for.
+    expect(made.objAttributes!.mode).toBe(0o755);
+  });
+
+  it("clears set-gid on a new executable the creator has no claim to that group", async () => {
+    const { client, team } = await served();
+    const created = check(
+      await client.create(team, "run", CREATE_UNCHECKED, { mode: 0o2775 }),
+      "create",
+    );
+    // A set-gid executable is a way to *run as* a group, so one may not be made
+    // for a group its creator is not in — `inode_init_owner()`, and the reason
+    // the supplementary list is on the wire at all.
+    expect(created.objAttributes!.mode).toBe(0o775);
+    expect(created.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("keeps it when only the supplementary list makes the creator a member", async () => {
+    const { client, team } = await served({ cred: MEMBER });
+    const created = check(
+      await client.create(team, "run", CREATE_UNCHECKED, { mode: 0o2775 }),
+      "create",
+    );
+    expect(created.objAttributes!.mode).toBe(0o2775);
+    // Not group-executable, so there is nothing to run as and nothing to clear.
+    const plainMode = check(
+      await client.create(team, "data", CREATE_UNCHECKED, { mode: 0o2664 }),
+      "create",
+    );
+    expect(plainMode.objAttributes!.mode).toBe(0o2664);
+  });
+
+  it("does not claim at all with claimOwnership off", async () => {
+    const { client, team } = await served({ claimOwnership: false });
+    const created = check(await client.create(team, "f", CREATE_UNCHECKED), "create");
+    // Whatever the driver did on its own: the server's own uid and gid, and no
+    // set-gid bit added to a new directory either.
+    expect(created.objAttributes!.uid).toBe(process.getuid?.() ?? 0);
+    expect(created.objAttributes!.gid).toBe(process.getgid?.() ?? 0);
+    const made = check(await client.mkdir(team, "sub", { mode: 0o755 }), "mkdir");
+    expect(made.objAttributes!.mode).toBe(0o755);
+    expect(made.objAttributes!.gid).toBe(process.getgid?.() ?? 0);
   });
 });
 

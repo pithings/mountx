@@ -35,6 +35,7 @@ import { constants } from "node:fs";
 import { fsError } from "../../errors.ts";
 import { createLoopback, type Loopback } from "../../harness.ts";
 import { PathLock } from "../../lock.ts";
+import { claimNewEntry, type NewEntry, newEntryOwnership } from "../../ownership.ts";
 import { dirname, joinPath, normalizePath } from "../../path.ts";
 import type { FileHandleLike, FsDriver, StatsLike, TimeLike } from "../../types.ts";
 import { S_IFDIR, S_IFLNK, S_IFMT } from "../../types.ts";
@@ -637,8 +638,23 @@ export class Nfs3Session {
 
   /** The `before` half of a `wcc_data`, taken before the operation runs. */
   async #preOp(path: string): Promise<WccAttr | undefined> {
+    const stats = await this.#preOpStats(path);
+    return stats === undefined ? undefined : wccAttrOf(stats);
+  }
+
+  /**
+   * The whole `lstat` behind {@link Nfs3Session.#preOp}, for the creating
+   * operations: they need the parent's mode and gid for set-gid inheritance
+   * (`#claim`) as well as the three fields a `wcc_attr` keeps, and this is the
+   * `lstat` they were already paying for.
+   *
+   * Swallows the failure for the same reason `#preOp` does — a `wcc_data` is a
+   * hint — and an unreadable parent then inherits nothing, which is what a
+   * parent with the bit clear does too.
+   */
+  async #preOpStats(path: string): Promise<StatsLike | undefined> {
     try {
-      return wccAttrOf(await this.#statOf(path));
+      return await this.#statOf(path);
     } catch {
       return undefined;
     }
@@ -1089,23 +1105,22 @@ export class Nfs3Session {
    * server process, and without this a file created by uid 1000 comes back
    * owned by the server and then fails every permission check its own creator
    * makes. Skipped when the caller *is* the server, and quiet when the driver
-   * cannot express ownership.
+   * cannot express ownership — both in `claimNewEntry`.
+   *
+   * The group is not simply the caller's: a set-gid parent hands its own down,
+   * and a new directory takes the bit with it (`../../ownership.ts` has the
+   * rule and where it comes from). That is why `parent` is threaded in from the
+   * `lstat` `#preOpStats` already did for the reply's `wcc_data` rather than
+   * stat'ed here — every creating operation in this file reads the parent
+   * anyway, so the rule costs no extra round trip. It does cost a `chmod` when
+   * a new directory has to take the bit, which is the one case that cannot be
+   * folded into the create.
    */
-  async #claim(path: string, creds: RpcCredentials): Promise<void> {
-    if (this.options.claimOwnership === false || creds.uid === undefined) {
+  async #claim(path: string, creds: RpcCredentials, entry: NewEntry): Promise<void> {
+    if (this.options.claimOwnership === false) {
       return;
     }
-    if (creds.uid === (process.getuid?.() ?? -1) && creds.gid === (process.getgid?.() ?? -1)) {
-      return;
-    }
-    try {
-      await this.driver.lchown(path, creds.uid, creds.gid ?? -1);
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
-        throw error;
-      }
-    }
+    await claimNewEntry(this.driver, path, newEntryOwnership(creds, entry));
   }
 
   async #create(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
@@ -1116,21 +1131,22 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "open"));
-      before = await this.#preOp(dir);
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
       if (request.mode === CREATE_EXCLUSIVE) {
-        await this.#createExclusive(dir, path, request.verf, creds);
+        await this.#createExclusive(dir, path, request.verf, creds, parent);
         await this.#created(writer, dir, before, path);
         return;
       }
-      const mode = request.attributes?.mode;
+      const mode = (request.attributes?.mode ?? 0o666) & 0o7777;
       const flags =
         constants.O_WRONLY |
         constants.O_CREAT |
         (request.mode === CREATE_GUARDED ? constants.O_EXCL : 0);
-      const handle = await this.driver.open(path, flags, (mode ?? 0o666) & 0o7777);
+      const handle = await this.driver.open(path, flags, mode);
       await handle.close();
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      await this.#claim(path, creds, { parent, directory: false, mode });
       // `UNCHECKED` over an existing file still applies the attributes, which
       // is how a client asks for `open(…, O_CREAT|O_TRUNC)` in one round trip.
       await this.#applySattr(path, { ...request.attributes, mode: undefined });
@@ -1170,6 +1186,7 @@ export class Nfs3Session {
     path: string,
     verf: Uint8Array | undefined,
     creds: RpcCredentials,
+    parent: StatsLike | undefined,
   ): Promise<void> {
     const verifier = verf ?? new Uint8Array(NFS3_CREATEVERFSIZE);
     let handle: FileHandleLike;
@@ -1194,7 +1211,7 @@ export class Nfs3Session {
     await handle.close();
     this.#exclusives.set(path, verifier);
     this.#invalidate(dir);
-    await this.#claim(path, creds);
+    await this.#claim(path, creds, { parent, directory: false, mode: 0o666 });
   }
 
   async #mkdir(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
@@ -1205,10 +1222,12 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "mkdir"));
-      before = await this.#preOp(dir);
-      await this.driver.mkdir(path, { mode: (request.attributes.mode ?? 0o777) & 0o7777 });
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
+      const mode = (request.attributes.mode ?? 0o777) & 0o7777;
+      await this.driver.mkdir(path, { mode });
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      await this.#claim(path, creds, { parent, directory: true, mode });
       await this.#applySattr(path, { ...request.attributes, mode: undefined });
       await this.#created(writer, dir, before, path);
     } catch (error) {
@@ -1225,10 +1244,13 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "symlink"));
-      before = await this.#preOp(dir);
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
       await this.driver.symlink(request.target, path);
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      // A symlink's own mode is 0o777 and not the client's to choose, so the
+      // only half of the rule that can apply to one is the group.
+      await this.#claim(path, creds, { parent, directory: false, mode: 0o777 });
       // A symlink has no mode of its own to set; times and ownership still do.
       await this.#applySattr(
         path,
@@ -1259,7 +1281,8 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "mknod"));
-      before = await this.#preOp(dir);
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
       const mknod = this.driver.mountx?.mknod;
       if (mknod === undefined) {
         throw new NfsStatusError(NFS3ERR_NOTSUPP, "MKNOD needs the mountx.mknod extension");
@@ -1268,7 +1291,7 @@ export class Nfs3Session {
       const rdev = ((request.spec?.major ?? 0) << 8) | (request.spec?.minor ?? 0);
       await mknod.call(this.driver.mountx, path, mode | modeBitsOfFtype(request.type), rdev);
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      await this.#claim(path, creds, { parent, directory: false, mode });
       await this.#created(writer, dir, before, path);
     } catch (error) {
       await this.#createFailed(writer, dir, before, error);

@@ -71,6 +71,7 @@ import { constants } from "node:fs";
 import { ERRNO_CODES, fsError } from "../../errors.ts";
 import { createLoopback, type Loopback } from "../../harness.ts";
 import { PathLock } from "../../lock.ts";
+import { claimNewEntry, type NewEntry, newEntryOwnership } from "../../ownership.ts";
 import { dirname, joinPath } from "../../path.ts";
 import type { FileHandleLike, FsDriver, StatsLike, TimeLike } from "../../types.ts";
 import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../types.ts";
@@ -2326,23 +2327,23 @@ export class Nfs4Session {
    * indicated in the RPC credentials of the call". Without it a file created by
    * uid 1000 comes back owned by the server and then fails every permission
    * check its own creator makes. Quiet when the driver cannot express
-   * ownership, which is not the same as broken.
+   * ownership, which is not the same as broken — that, and the skip when the
+   * caller *is* the server, are in `claimNewEntry`.
+   *
+   * The *group* is not derived from the principal alone: §18.4.3's "MUST
+   * derive" is about the owner, and the group a set-gid parent hands down is
+   * the parent's (`../../ownership.ts` has the rule and where it comes from).
+   * `parent` is therefore threaded in from the `stat` the caller already took —
+   * CREATE reads the parent to check it is a directory, OPEN to build its
+   * `change_info4` — so the rule adds no round trip of its own. A new directory
+   * taking the set-gid bit does cost a `chmod`, which is the one part of it
+   * that cannot be folded into the create.
    */
-  async #claim(path: string, creds: RpcCredentials): Promise<void> {
-    if (this.options.claimOwnership === false || creds.uid === undefined) {
+  async #claim(path: string, creds: RpcCredentials, entry: NewEntry): Promise<void> {
+    if (this.options.claimOwnership === false) {
       return;
     }
-    if (creds.uid === (process.getuid?.() ?? -1) && creds.gid === (process.getgid?.() ?? -1)) {
-      return;
-    }
-    try {
-      await this.driver.lchown(path, creds.uid, creds.gid ?? -1);
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
-        throw error;
-      }
-    }
+    await claimNewEntry(this.driver, path, newEntryOwnership(creds, entry));
   }
 
   /**
@@ -2420,7 +2421,14 @@ export class Nfs4Session {
     }
 
     this.#invalidate(dir);
-    await this.#claim(path, cursor.creds);
+    // A symlink's mode is 0o777 and not the client's to choose — `createattrs`
+    // never reached `symlink` — so the mode named here is the one the object
+    // really has.
+    await this.#claim(path, cursor.creds, {
+      parent,
+      directory: type === NF4DIR,
+      mode: type === NF4LNK ? 0o777 : mode,
+    });
     // `mkdir` already took the mode; a symlink has none to take. `size` is not
     // a writable attribute of any of these types, so it is neither applied nor
     // reported (§18.4.3, "any writable attribute valid for the object type").
@@ -3034,11 +3042,15 @@ export class Nfs4Session {
     let dir: string | undefined;
     let before = 0n;
     let path: string;
+    // Kept for `#openCreate`: a creating OPEN always names its file inside a
+    // directory (the CLAIM_FH arm above is refused for one), and set-gid
+    // inheritance is decided from the parent this already read.
+    let parent: StatsLike | undefined;
     if (claim === CLAIM_FH) {
       path = this.#pathOfCurrent(cursor);
     } else {
       dir = this.#pathOfCurrent(cursor);
-      const parent = await this.#statOf(dir);
+      parent = await this.#statOf(dir);
       if ((parent.mode & S_IFMT) !== S_IFDIR) {
         return refused(NFS4ERR_NOTDIR);
       }
@@ -3048,7 +3060,7 @@ export class Nfs4Session {
 
     const attrset: number[] = [];
     if (create) {
-      const refusal = await this.#openCreate(args, path, cursor, attrset);
+      const refusal = await this.#openCreate(args, path, cursor, attrset, parent);
       if (refusal !== undefined) {
         return refused(refusal);
       }
@@ -3139,10 +3151,11 @@ export class Nfs4Session {
     path: string,
     cursor: Cursor,
     attrset: number[],
+    parent: StatsLike | undefined,
   ): Promise<number | undefined> {
     const how = args.openhow.how!;
     if (how.mode === EXCLUSIVE4 || how.mode === EXCLUSIVE4_1) {
-      return this.#openCreateExclusive(how, path, cursor, attrset);
+      return this.#openCreateExclusive(how, path, cursor, attrset, parent);
     }
     const attrs = how.createattrs!;
     this.#settableOrRefuse(attrs);
@@ -3159,7 +3172,7 @@ export class Nfs4Session {
       }
       return undefined;
     }
-    await this.#claim(path, cursor.creds);
+    await this.#claim(path, cursor.creds, { parent, directory: false, mode });
     // The mode went in as `open`'s third argument, so `#applyAttrs` must not
     // see it — and must see everything else, size included: a create names the
     // initial state of a file that did not exist a moment ago.
@@ -3224,6 +3237,7 @@ export class Nfs4Session {
     path: string,
     cursor: Cursor,
     attrset: number[],
+    parent: StatsLike | undefined,
   ): Promise<number | undefined> {
     const exclusive4 = how.mode === EXCLUSIVE4;
     const verifier = exclusive4 ? how.createverf! : how.createboth!.verf;
@@ -3231,7 +3245,8 @@ export class Nfs4Session {
     if (attrs !== undefined) {
       this.#settableOrRefuse(attrs);
     }
-    const created = await this.#createFile(path, (attrs?.values.mode ?? 0o666) & 0o7777);
+    const mode = (attrs?.values.mode ?? 0o666) & 0o7777;
+    const created = await this.#createFile(path, mode);
     if (!created) {
       const remembered = this.#exclusives.match(path, verifier);
       if (remembered === undefined) {
@@ -3242,7 +3257,7 @@ export class Nfs4Session {
       attrset.push(...remembered.attrset);
       return undefined;
     }
-    await this.#claim(path, cursor.creds);
+    await this.#claim(path, cursor.creds, { parent, directory: false, mode });
     const bits: number[] = [];
     let status = NFS4_OK;
     if (attrs !== undefined) {

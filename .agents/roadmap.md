@@ -130,8 +130,36 @@ rather than by accident.
   A generation-stamped LRU is the fix if a workload needs a bound on _that_ — it
   is the only remaining growth, and the one an LRU can serve without breaking a
   live client.
-- **Set-gid inheritance and caller credentials in the driver interface.** A new
-  entry in a set-gid directory should take its parent's group; more generally,
-  supplementary groups and per-call caller credentials want to be first-class in
-  `FsDriver` rather than patched on after the fact (the way new-inode ownership
-  is today, via a post-hoc `lchown` in each session's `#claim`).
+- **Set-gid inheritance on the FUSE session.** The rule itself now exists —
+  `src/ownership.ts`, a transcription of `inode_init_owner()` — and both NFS
+  sessions apply it: a new entry in a set-gid directory takes the parent's
+  group, a new directory takes the bit, and a new group-executable loses
+  `S_ISGID` when its creator is in neither the effective nor the supplementary
+  group `AUTH_SYS` carried. 9P needs nothing: its client computes both halves
+  (`v9fs_get_fsgid_for_create()`) and they arrive on the wire. **FUSE is the
+  gap**, and `#claim` in `src/fuse/session.ts` says why it was not simply
+  mirrored: the NFS sessions read the parent anyway (for `wcc_data` and
+  `change_info4`) while nothing on the FUSE path does, so the rule would add an
+  `lstat` to every create for every caller — including the daemon-is-the-caller
+  case that currently costs no driver call at all — and the membership half
+  needs `FUSE_CREATE_SUPP_GROUP` (7.38), which `src/fuse/init.ts` does not ask
+  for. Both are decisions to take deliberately, not omissions.
+- **Per-call caller credentials in `FsDriver`: considered, and not the
+  answer.** The shape was a `mountx.*` extension carrying the caller's
+  uid/gid/groups into each creating call, so ownership would be the driver's
+  from the start instead of a post-hoc `lchown` in `#claim`. Three things
+  against it, and they compound: `node:fs/promises` has no credential parameter
+  and the POSIX way to get one — `setfsuid(2)`/`setfsgid(2)` — is per-thread
+  state Node does not expose and the threadpool would scramble, so `node-fs`
+  could never implement it and `unstorage`/S3 have no ownership to implement it
+  with; the memory driver, the only one that could, enforces no permissions at
+  all, so the sole observable effect of a credential inside it is the initial
+  owner and group, which `src/ownership.ts` now gets right; and invariant 5
+  means every session must keep the `lchown` path anyway for drivers without
+  the extension, so the whole surface buys one driver's atomicity at the price
+  of two permanent code paths. What would reopen it is a driver that enforces
+  permissions itself — at that point the credential decides whether a call
+  _succeeds_, not just who owns the result, and `#claim` cannot express that at
+  all. Note that the credential is already first-class where the **server**
+  decides: `allowedAccess()` in `src/nfs/util.ts` answers ACCESS from the
+  effective and supplementary groups both.

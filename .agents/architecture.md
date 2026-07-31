@@ -27,15 +27,16 @@ Deviations are noted per area below.
 
 ## Core (`src/`)
 
-| File         | What                                                                                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `types.ts`   | `FsDriver`, `FsCapabilities`, `StatsLike`/`DirentLike`/`FileHandleLike`, and the `mountx.*` namespace — **two live members**, `mknod` and `utimens`, no xattr |
-| `errors.ts`  | `ERRNO_CODES` (Linux), `fsError()` (byte-identical to `node:fs`'s), `errnoOf()` — the one errno table in the repo                                             |
-| `path.ts`    | absolute POSIX helpers, `..` clamps at root; canonical paths early-return, `resolvePath()` returns `{ path, segments }`                                       |
-| `harness.ts` | `createLoopback(driver)` — normalize, fill gaps with `ENOSYS`, resolve capabilities. The method table is fixed **at construction**                            |
-| `lock.ts`    | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                 |
-| `subtree.ts` | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                     |
-| `auto.ts`    | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                     |
+| File           | What                                                                                                                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.ts`     | `FsDriver`, `FsCapabilities`, `StatsLike`/`DirentLike`/`FileHandleLike`, and the `mountx.*` namespace — **two live members**, `mknod` and `utimens`, no xattr |
+| `errors.ts`    | `ERRNO_CODES` (Linux), `fsError()` (byte-identical to `node:fs`'s), `errnoOf()` — the one errno table in the repo                                             |
+| `path.ts`      | absolute POSIX helpers, `..` clamps at root; canonical paths early-return, `resolvePath()` returns `{ path, segments }`                                       |
+| `harness.ts`   | `createLoopback(driver)` — normalize, fill gaps with `ENOSYS`, resolve capabilities. The method table is fixed **at construction**                            |
+| `lock.ts`      | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                 |
+| `subtree.ts`   | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                     |
+| `ownership.ts` | who a new entry belongs to: `inode_init_owner()`'s set-gid rule, plus the `lchown`/`chmod` that applies it. Internal; used by the two NFS sessions' `#claim`  |
+| `auto.ts`      | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                     |
 
 ### Drivers (`src/drivers/`)
 
@@ -177,6 +178,13 @@ The facts no single file's header can own.
   transport (FUSE keeps the orphan for a later `FORGET`, NFS drops the key, 9P
   releases the qid identity). Cost is O(tracked paths) per rename; a trie is the real
   fix and waits on a benchmark that wants it.
+- **`src/ownership.ts` is one rule for four sessions, and two of them use it.** The
+  NFS sessions apply it from the parent `stat` they already took for `wcc_data` /
+  `change_info4`; 9P's client computes the same rule and puts the answer on the wire
+  (`v9fs_get_fsgid_for_create()`), so the session would be disagreeing with the
+  kernel if it applied it again; FUSE's would need an `lstat` per create that nothing
+  there does today, and `FUSE_CREATE_SUPP_GROUP` for the membership half. Each of the
+  three states its own reason at its `#claim`.
 - **`v3/` and `v4/` never import from each other.** `nfs/session.ts` and
   `nfs/util.ts` are the only seam, and the router hands both versions one shared
   `FileHandleTable`/`PathLock`.
