@@ -234,16 +234,16 @@ describe("lifecycle", () => {
     expect(table.all(START)).toEqual([]);
   });
 
-  it("discards every lock rooted in a subtree, and nothing rooted above it", () => {
+  it("finds the roots an unmapping request has to delete, and not the one above them", () => {
+    /* §6.1 point 8 is the session's to apply — it deletes the roots that really
+       went — and this is the query it applies it to. */
     const table = tableOf();
     const tree = granted(table, SHARED_TREE, START);
     const file = granted(table, SHARED_FILE, START);
-    expect(table.discard("/notes/draft.txt", START).map((lock) => lock.token)).toEqual([
-      file.token,
-    ]);
+    expect(table.within("/notes/draft.txt", START).map((lock) => lock.token)).toEqual([file.token]);
+    table.remove(file.token);
     expect(table.all(START).map((lock) => lock.token)).toEqual([tree.token]);
-    expect(table.discard("/notes", START).map((lock) => lock.token)).toEqual([tree.token]);
-    expect(table.all(START)).toEqual([]);
+    expect(table.within("/notes", START).map((lock) => lock.token)).toEqual([tree.token]);
   });
 
   it("refuses a lock past the cap, counting only the live ones", () => {

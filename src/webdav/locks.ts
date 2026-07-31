@@ -63,11 +63,12 @@
  * resource MUST NOT move the write lock with the resource", and §6.1 point 8
  * settles what happens instead — "if a request causes the lock-root of any lock
  * to become an unmapped URL, then the lock MUST also be deleted by that
- * request". So a `MOVE` or `DELETE` of a lock root **destroys** that lock
- * ({@link DavLockTable.discard}), and the moved resource arrives at its
- * destination unlocked — except for whatever depth-infinity lock already covers
- * the destination, which picks it up for free because coverage is a prefix
- * test.
+ * request". So a `MOVE` or `DELETE` of a lock root **destroys** that lock — the
+ * session walks {@link DavLockTable.within} the path it unmapped, checks each
+ * root and {@link DavLockTable.remove}s the ones that really went — and the
+ * moved resource arrives at its destination unlocked, except for whatever
+ * depth-infinity lock already covers the destination, which picks it up for free
+ * because coverage is a prefix test.
  *
  * ## Why the lookups are linear
  *
@@ -380,23 +381,6 @@ export class DavLockTable {
   /** Delete one lock by token, and say whether there was one (`UNLOCK`, §9.11). */
   remove(token: string): boolean {
     return this.#locks.delete(token);
-  }
-
-  /**
-   * Delete every lock rooted at `path` or under it, and answer which went.
-   *
-   * §6.1 point 8, and it is the *only* thing that happens to a lock when its
-   * resource moves or goes away: "if a request causes the lock-root of any lock
-   * to become an unmapped URL, then the lock MUST also be deleted by that
-   * request". Called by `DELETE` and by the source side of a `MOVE`; a lock
-   * rooted *above* the path is untouched, because its own root is still mapped.
-   */
-  discard(path: string, now: number): DavLock[] {
-    const doomed = this.within(path, now);
-    for (const lock of doomed) {
-      this.#locks.delete(lock.token);
-    }
-    return doomed;
   }
 
   /**

@@ -1418,16 +1418,20 @@ export class WebdavSession {
   // -------------------------------------------------------------------------
 
   /**
-   * Refuse to write properties, in the form §9.2 requires.
+   * Write properties, in the form §9.2 requires — which here means writing one
+   * and refusing the rest.
    *
-   * Every property in the request is named in the reply with `403` and the
-   * `cannot-modify-protected-property` condition (§16), because every property
-   * this server has is a live one derived from the driver's own metadata and
-   * there is nowhere to put a dead one (see the module docs). The status is a
-   * `207` rather than a plain `403`: §9.2 requires the per-property form
-   * whenever the request named more than nothing, and a client that sent one
-   * property it could have set alongside one it could not needs to see which
-   * was which.
+   * Every property the request named is in the reply with its own status, which
+   * is why this is a `207` and never a plain `403`: a client that sent one
+   * property it could set alongside one it could not needs to see which was
+   * which. What each property gets is {@link WebdavSession.#settable}'s answer.
+   *
+   * **Nothing is written until every instruction has an answer.** §9.2 makes the
+   * method atomic — "instructions MUST either all be executed or none executed"
+   * — so a request naming `getlastmodified` and one protected property changes
+   * neither, and §9.2.1 turns the one that could have succeeded into `424
+   * Failed Dependency`. Building the outcomes first is what makes that true by
+   * construction rather than by an undo path there is no way to write.
    */
   async #proppatch(
     path: string,
@@ -1528,10 +1532,10 @@ export class WebdavSession {
    *
    * 1. **A precondition.** Every list is evaluated; if the header has lists and
    *    none of them is true, the request is `412` and nothing else happens.
-   * 2. **A submission.** Every state token in it counts as submitted "whatever
-   *    the condition it expressed was found to be true" — so the tokens survive
-   *    an evaluation the client did not need, which is what §10.4.8's
-   *    `(Not <DAV:no-lock>)` idiom is for.
+   * 2. **A submission.** Every state token in it counts as submitted
+   *    "independently of whether or not the condition it expressed was found to
+   *    be true" — so the tokens survive an evaluation that failed, which is what
+   *    §10.4.8's `(Not <DAV:no-lock>)` idiom relies on.
    *
    * @throws {DavFault} `400` for a header that is not the grammar, `412` for
    * one that evaluated to false.

@@ -262,6 +262,17 @@ describe("parseProppatch", () => {
     ).toEqual({ set: [{ name: "displayname", text: "x" }], remove: ["mine"] });
   });
 
+  it("ignores a set child that is not a prop, and a child that is neither set nor remove", () => {
+    expect(
+      parseProppatch(
+        utf8(
+          `<propertyupdate xmlns="DAV:"><set><whatever/>` +
+            `<prop><displayname>v</displayname></prop></set></propertyupdate>`,
+        ),
+      ),
+    ).toEqual({ set: [{ name: "displayname", text: "v" }], remove: [] });
+  });
+
   it("ignores a child that is neither set nor remove", () => {
     expect(
       parseProppatch(
@@ -524,6 +535,7 @@ describe("parseIf", () => {
       "(garbage)",
       `(["unterminated)`,
       "<no-close (<urn:uuid:a>)",
+      "<unterminated",
     ]) {
       expect(parseIf(value, host), JSON.stringify(value)).toBeUndefined();
     }
