@@ -111,7 +111,11 @@
  *   it.** A link back to any ancestor makes the walk revisit a subtree it is
  *   still writing into, and each pass creates the next one; there is no depth at
  *   which that stops being wrong. A link to a *file* is followed and its bytes
- *   are copied, because that cannot recur.
+ *   are copied, because that cannot recur. The rule holds at the **top** of the
+ *   tree as well as inside it, and that is the end where it does the most work:
+ *   `COPY /link → /dst` with `/link → /` passes the destination-inside-source
+ *   test — as text the two paths are unrelated — and then copies a tree it is
+ *   writing into, forever.
  *
  * ## The properties this server has
  *
@@ -1056,6 +1060,17 @@ export class WebdavSession {
          resource. `403` rather than a no-op, because a client that asked for
          this has a bug the no-op would hide. */
       throw refuse(403, { message: "the destination is the source" });
+    }
+    if (!move && stats.isDirectory() && (await this.#linkStat(path)).isSymbolicLink()) {
+      /* The same rule `#copyTree` applies to a link it meets *inside* the tree,
+         applied at the top of it — where it matters more, because the guard
+         below cannot see through a link. A link to an ancestor makes
+         `isPathInside(destination, path)` false (the paths are unrelated as
+         text) while the walk copies a tree it is writing into, creating the
+         next level as it goes: `COPY /link → /dst` with `/link → /` never
+         terminates. A `MOVE` is safe and stays allowed — it renames the link
+         itself and walks nothing. */
+      throw refuse(403, { message: "a symbolic link to a collection is not a collection to copy" });
     }
     if (stats.isDirectory() && isPathInside(destination, path)) {
       /* Copying or moving a collection into itself is the one shape that cannot

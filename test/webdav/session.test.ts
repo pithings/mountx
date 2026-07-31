@@ -510,6 +510,38 @@ describe("COPY", () => {
   });
 });
 
+describe("COPY of a symbolic link at the top of the tree", () => {
+  it("is 403 for a link to a collection, which is what makes the walk terminate", async () => {
+    /* The destination-inside-source test compares paths as text, so a link to
+       an ancestor slips past it — and the walk then copies a tree it is writing
+       into, creating the next level every pass. `#copyTree` already refuses a
+       link to a collection it meets *inside* the tree; this is the same rule at
+       the top of it. */
+    await driver.symlink("/", "/link");
+    const reply = await request(session, "COPY", "/link", {
+      headers: { destination: "/dst" },
+    });
+    expect(reply.status).toBe(403);
+    await expect(driver.stat("/dst")).rejects.toThrow();
+  });
+
+  it("still copies the bytes behind a link to a file, and still moves the link", async () => {
+    await driver.symlink("/dir/file.txt", "/pointer");
+    expect(
+      (await request(session, "COPY", "/pointer", { headers: { destination: "/copied.txt" } }))
+        .status,
+    ).toBe(201);
+    expect((await request(session, "GET", "/copied.txt")).text).toBe("hello world");
+    // A MOVE walks nothing — it renames the link itself — so it is untouched.
+    await driver.symlink("/dir", "/dirlink");
+    expect(
+      (await request(session, "MOVE", "/dirlink", { headers: { destination: "/moved-link" } }))
+        .status,
+    ).toBe(201);
+    expect((await driver.lstat("/moved-link")).isSymbolicLink()).toBe(true);
+  });
+});
+
 describe("MOVE", () => {
   const to = (destination: string, extra: Record<string, string> = {}) => ({
     headers: { destination, host: "dav.test", ...extra },
