@@ -36,6 +36,7 @@ import {
   P9_GETATTR_ALL,
   P9_HDRSZ,
   P9_IOHDRSZ,
+  P9_LOCK_TYPE_WRLCK,
   P9_MAXWELEM,
   P9_NOFID,
   P9_NOTAG,
@@ -777,11 +778,24 @@ describe("hostile requests", () => {
     // Plus a handle the fuzzer definitely did not close, so teardown has work.
     await harness.client.walk(0, 9, ["file"]).catch(() => undefined);
     await harness.client.lopen(9, 0).catch(() => undefined);
+    // And a byte range nothing released either. Taken here rather than left to
+    // the storm because the storm's own `Tlock`s are as likely to be unlocked
+    // or clunked away as held, and a leak check that passes on an empty table
+    // is not one. A fresh attach rather than the fid above, because the storm
+    // may have removed the file that one walks to — the root is the one path
+    // it cannot take away.
+    await harness.client.attach(11);
+    await harness.client.lock(11, { type: P9_LOCK_TYPE_WRLCK });
+    expect(harness.session.locks.held).toBe(1);
 
     await harness.session.destroy();
     expect(harness.handles.opened()).toBeGreaterThan(0);
     expect(harness.handles.live()).toBe(0);
     expect(harness.session.fids.size).toBe(0);
+    // The same leak check for the other thing a torn-down session can strand,
+    // and the worse one: a byte range in a table that outlives the session is a
+    // range nothing is left able to release.
+    expect(harness.session.locks.held).toBe(0);
     expect(harness.session.assertions).toEqual([]);
     accounted(harness.session);
   });
