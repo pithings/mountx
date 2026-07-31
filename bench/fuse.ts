@@ -11,8 +11,8 @@
  * added to the library to make this possible; these are all existing options.
  *
  * The mounts are served from *this* process and driven from a child
- * (`bench/fuse-client.ts`), which is what makes it safe to have operations in
- * flight — see the note there.
+ * (`bench/drive.ts` → `bench/mount-client.ts`), which is what makes it safe to
+ * have operations in flight — see the note there.
  *
  * ```sh
  * pnpm bench:root                       # human summary
@@ -20,18 +20,17 @@
  * ```
  */
 
-import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
 import { FUSE_READDIRPLUS_AUTO } from "../src/fuse/constants.ts";
 import type { FuseSession } from "../src/fuse/session.ts";
 import { mount, type MountOptions, unmountAll } from "../src/fuse/mount.ts";
 import { createLoopback } from "../src/harness.ts";
+import { drive } from "./drive.ts";
 import { report, type Measurement } from "./harness.ts";
-import { type ClientRequest, CORE, FULL_FUSE, populateCold, RESULT_PREFIX } from "./scenarios.ts";
+import { CORE, FULL_FUSE, populateCold } from "./scenarios.ts";
 
 interface Variant {
   name: string;
@@ -113,38 +112,6 @@ const VARIANTS: Variant[] = [
     why: "four, against the default of two",
   },
 ];
-
-const here = dirname(fileURLToPath(import.meta.url));
-
-/** Run one variant's scenarios in a child process and hand back what it measured. */
-function drive(request: ClientRequest): Promise<Measurement[]> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [join(here, "fuse-client.ts"), JSON.stringify(request)], {
-      // Never a cwd inside the mountpoint: `uv_spawn` has the child `chdir`
-      // before it execs while the parent blocks on the exec pipe, so the LOOKUP
-      // that produces would be waiting on the thread that has to answer it.
-      cwd: dirname(here),
-      // The client is the side with operations in flight, and every one of them
-      // parks a pool thread of its own.
-      env: { ...process.env, UV_THREADPOOL_SIZE: "128" },
-      stdio: ["ignore", "pipe", "inherit"],
-    });
-    let out = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      out += chunk;
-    });
-    child.once("error", reject);
-    child.once("close", (status) => {
-      const line = out.split("\n").find((candidate) => candidate.startsWith(RESULT_PREFIX));
-      if (line === undefined) {
-        reject(new Error(`bench: the client exited ${status} without a result`));
-        return;
-      }
-      resolve(JSON.parse(line.slice(RESULT_PREFIX.length)) as Measurement[]);
-    });
-  });
-}
 
 /**
  * Watch the session's request counter while the client works.

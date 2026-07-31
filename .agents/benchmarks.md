@@ -13,19 +13,25 @@ carry the host line with it.
 
 ## Host
 
-**Every number in this file was taken on one host, in one sitting, on one day.**
-That has not always been true of this file — the loopback/NFS columns and the
-FUSE column are two separate commands (`pnpm bench` and `pnpm bench:root`) and
-have previously been regenerated apart — so it is stated here rather than
-assumed. Four runs went into it: both commands on the shipping tree, and both
-again on a pre-sweep baseline (below).
+**Every number in this file was taken on one host, and — apart from the 9P
+column — in one sitting, on one day.** That has not always been true of this
+file — the loopback/NFS columns and the FUSE column are two separate commands
+(`pnpm bench` and `pnpm bench:root`) and have previously been regenerated apart
+— so it is stated here rather than assumed. Four runs went into the 2026-07-29
+sitting: both commands on the shipping tree, and both again on a pre-sweep
+baseline (below).
+
+**The 9P column is a second sitting, two days later**, because it did not exist
+until then; it carries its own date, its own tree and its own denominators, and
+[says so in full](#9p-over-transunix-a-real-kernel-mount). Nothing above it was
+re-measured for it and nothing above it was changed by it.
 
 |                          |                                                                                                               |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| Date                     | 2026-07-29                                                                                                    |
-| Tree                     | `95c2c44`, i.e. after the `c7ee989..95c2c44` performance sweep                                                |
+| Date                     | 2026-07-29 (loopback, NFSv3, FUSE) · 2026-07-31 (9P)                                                          |
+| Tree                     | `95c2c44`, i.e. after the `c7ee989..95c2c44` performance sweep · `81b40a4` for the 9P column                  |
 | Baseline tree            | `0f359e7` + the type-stripping fix only (see below)                                                           |
-| Columns                  | loopback, NFSv3 and FUSE — all three measured together, on both trees, this sitting                           |
+| Columns                  | loopback, NFSv3 and FUSE — all three measured together, on both trees, in the first sitting; 9P in the second |
 | OS                       | Linux 6.12.96+deb13-amd64 (container, Fedora 44 userland)                                                     |
 | CPU                      | 16 × Intel(R) Core(TM) i7-10700K @ 3.80 GHz                                                                   |
 | Memory                   | 31.3 GiB                                                                                                      |
@@ -38,7 +44,8 @@ Reproduce with:
 ```sh
 pnpm bench                       # loopback + NFS columns, no root
 pnpm bench:root                  # the FUSE column, sudo
-pnpm bench -- --json out.json    # either one, machine-readable
+pnpm bench:9p                    # the 9P column, sudo (mount(2) needs CAP_SYS_ADMIN)
+pnpm bench -- --json out.json    # any one of them, machine-readable
 ```
 
 `bench/` is scripts only — nothing here runs inside `pnpm test`.
@@ -456,6 +463,257 @@ if you want one that does not depend on which transport you started from.
 
 ---
 
+## 9P over `trans=unix`, a real kernel mount
+
+**A second sitting, and it says so.** Everything above was measured on
+2026-07-29 at `95c2c44`; this column was measured on **2026-07-31 at `81b40a4`**
+(branch `fix/9p`), on the same host, with `pnpm bench:9p`. It is a separate
+command because a 9P mount needs `CAP_SYS_ADMIN` — `mount(2)`, and v9fs has no
+setuid helper of the `fusermount3` kind — and a separate sitting because the
+column did not exist until now. Two consequences, both handled below rather than
+waved at: the numbers here come with **their own denominators**, re-measured in
+this sitting (the trees differ by one commit that touches the driver every
+column runs through — see [the denominator
+moved](#the-denominator-moved-and-why-this-column-carries-its-own)), and every
+comparison with the FUSE tables above is **cross-sitting** and marked as such.
+
+**Two runs, minutes apart, are reported side by side.** A column whose entire
+point is two untuned knobs has to show which differences survive a repeat, and
+this pair measures its own spread instead of borrowing the FUSE column's: run 2
+came out **12–27% faster than run 1 on nine of ten rows**, wider than the ±8%
+this file calibrates elsewhere, so **treat anything under ~1.3× in this section
+as no difference** unless it holds in both runs. The tenth row is `stat walk`,
+which went the other way by 1.94× at `n = 3` — the single most spread-out
+measurement in this file, and a reminder of what `n = 3` is worth.
+
+The mount is the one `mount9p()` builds and `.agents/environment.md` records
+verbatim: `trans=unix` over a `0700` socket, `version=9p2000.L`, `msize=131096`,
+`access=client`, **`cache=none`**, one connection, the memory driver, and the
+client in a child process (`bench/drive.ts`). Read `cache=none` as the headline
+of the whole section: **nothing here is answered out of a kernel cache.** A
+repeated `stat(2)` costs three to four messages every single time — the session
+counters below show 4.3 requests per `stat(2)` over a whole variant — where the
+FUSE `default` column is mostly the kernel answering itself. So compare these
+rows against FUSE's `attr/entry timeout=0` variant, never against its defaults.
+
+### Shipped defaults
+
+| scenario                  | ops/sec | rate             |  p50 ms |  p99 ms |    n | run 2             |
+| ------------------------- | ------: | ---------------- | ------: | ------: | ---: | ----------------- |
+| stat                      |   2,123 | —                |   0.448 |   0.826 | 2123 | 2,381 ops/s       |
+| open + read 4 KiB         |   1,392 | —                |   0.696 |   1.072 | 1392 | 1,660 ops/s       |
+| write 4 KiB               |   5,486 | —                |   0.174 |   0.290 | 5486 | 6,459 ops/s       |
+| readdir (100 entries)     |  865.36 | 86,536 entries/s |   1.102 |   1.755 |  866 | 109,979 entries/s |
+| sequential read, 100 MiB  |    7.88 | 787.89 MiB/s     | 126.154 | 129.239 |    3 | 895.06 MiB/s      |
+| sequential write, 100 MiB |    4.09 | 408.62 MiB/s     | 247.284 | 247.434 |    3 | 466.20 MiB/s      |
+| create 500 small files    |    1.72 | 859.15 files/s   | 553.958 | 658.369 |    3 | 1,091 files/s     |
+| ls -l (1000 entries)      |    2.24 | 2,238 entries/s  | 449.690 | 450.698 |    3 | 2,631 entries/s   |
+| stat walk (500 files)     |    2.80 | 1,401 stats/s    | 357.913 | 358.982 |    3 | 721.38 stats/s    |
+| stat ×64 in flight        |  200.00 | 12,800 ops/s     |   4.838 |   8.171 |  200 | 14,885 ops/s      |
+
+**Interpretation.** This is the first column in this file where every row is a
+real kernel client with no cache in front of it, and it reads that way: the
+metadata rows are two to five _thousand_ operations per second where the cached
+FUSE column is tens of thousands, and the throughput rows are within a factor of
+two of the transports that do cache. The two comparisons worth making:
+
+- **Against FUSE at zero timeouts** (2026-07-29 sitting, so indicative, not
+  paired): `stat` 2,123–2,381/s against 3,429/s, `open + read 4 KiB`
+  1,392–1,660/s against 1,924/s, `ls -l` 2,238–2,631 entries/s against 2,970,
+  `stat walk` against 2,052 stats/s. 9P lands at **0.7–0.9× of an uncached FUSE
+  mount on metadata** while doing strictly more work per syscall — v9fs clones a
+  fid per operation, so a `stat(2)` is `Twalk`/`Tgetattr`/`Tclunk` where FUSE's is
+  `LOOKUP`/`GETATTR`. On concurrency it is **ahead**: 12,800–14,885 ops/s with 64
+  stats in flight against FUSE's 9,132 at zero timeouts, which is the socket and
+  the event loop against `/dev/fuse` and the threadpool.
+- **Against NFSv3 re-measured in this sitting** (`stat` 5,281/s, `write 4 KiB`
+  14,726/s, `readdir` 128,732 entries/s, sequential read 861 MiB/s, write 475
+  MiB/s, 64 in flight 12,229 ops/s): NFS wins every per-message row, and it is
+  **not a like-for-like win** — that column's client is JavaScript in the same
+  process with no kernel between the two, so it pays one round trip where 9P pays
+  three to four plus a context switch. The rows where the two are close in spite
+  of that (throughput, and 64-in-flight, where 9P is ahead) are the ones where the
+  kernel client's cost is amortised.
+
+Sequential read at 788–895 MiB/s and write at 409–466 MiB/s are **6–7% of the
+loopback ceiling** measured the same day (13.1 GiB/s and 1.25 GiB/s), against
+FUSE's 12% for an uncached read on the older tree. Nothing about that is
+mysterious: at the shipped `msize` a 100 MiB read is 800 round trips, and the
+next section prices exactly that.
+
+**What the session sustained**, sampled off `session.stats.requests` while the
+client worked — the same instrument `bench/fuse.ts` uses, and the same warning:
+this is **not** any scenario's ops/sec, because one syscall is several messages.
+
+| variant          | peak 9P requests/sec (run 1 / run 2) | requests in the run |
+| ---------------- | -----------------------------------: | ------------------: |
+| `default`        |                      55,440 / 62,061 |   253,604 / 270,723 |
+| `msize=16KiB`    |                      17,246 / 18,981 |     82,017 / 83,641 |
+| `msize=1MiB`     |                      11,394 / 13,341 |     22,711 / 26,909 |
+| `maxInFlight=1`  |                      51,282 / 61,041 |     55,594 / 75,748 |
+| `maxInFlight=64` |                      72,143 / 84,677 |    90,599 / 103,947 |
+
+**This is the highest request rate any transport in this file has been measured
+at: 72–85 k messages per second peak, 55–62 k at the shipped defaults**, against
+the FUSE session's 20–50 k from the 2026-07-28 direct sampling. It is a peak over
+a 250 ms window on a variant's whole mix, so read it as a ceiling rather than as
+a sustained rate — but it settles the direction of IDEA.md's "low tens of
+thousands of ops/sec" for this transport: at the _message_ level 9P is comfortably
+above it, and the reason a user sees 2,000 `stat`s a second anyway is that v9fs
+spends three to four messages on each one.
+
+The message census confirms what `.agents/environment.md` found by hand, on a
+much larger sample — the `default` variant's run 1, in order:
+
+```
+Tgetattr=80495 Twalk=68437 Tclunk=64684 Twrite=13158 Txattrwalk=9661 Tread=4601
+```
+
+Walk and clunk dominate, `Tgetattr` outnumbers `Twalk`, and there is roughly one
+`Txattrwalk` — the `security.*` probe, refused cheaply — per file created. **The
+fid table is the hot data structure in this transport, not the codec**, and any
+future optimization work should start there.
+
+### `msize`, measured
+
+The knob the roadmap called untuned. `mountMsize` is the client's proposal; the
+negotiated value is the smaller of it and the session's own ceiling, and the
+figure below is what the session reported after `Tversion`. The default is
+131096 = 128 KiB + `P9_IOHDRSZ`, character for character the kernel's own. Every
+cell is `run 1 / run 2`, as in the table above.
+
+| scenario                  |                msize=16 KiB |           **131096 (default)** |               msize=1 MiB |
+| ------------------------- | --------------------------: | -----------------------------: | ------------------------: |
+| sequential read, 100 MiB  |       258.89 / 278.27 MiB/s |      **787.89 / 895.06 MiB/s** |       1,015 / 1,176 MiB/s |
+| sequential write, 100 MiB |       190.49 / 188.10 MiB/s |      **408.62 / 466.20 MiB/s** |     475.05 / 598.30 MiB/s |
+| write 4 KiB               |         5,400 / 6,032 ops/s |        **5,486 / 6,459 ops/s** |       4,897 / 6,286 ops/s |
+| readdir (100 entries)     | 100,233 / 103,950 entries/s | **86,536 / 109,979 entries/s** | 84,365 / 98,592 entries/s |
+
+**The default is worth 3.0–3.2× on sequential read and 2.1–2.5× on sequential
+write against the 16 KiB the kernel shipped for years**, and both ratios hold in
+both runs, well clear of this column's spread. That is the clearest measured win
+in the section and it is entirely mechanical: 100 MiB at 16 KiB a message is
+6,400 round trips, at 131096 it is 800.
+
+**Raising it further to the 1 MiB ceiling is worth another 1.29× / 1.31× on read
+and 1.16× / 1.28× on write** — a real effect, repeated, and much smaller than the
+step below it, exactly as an 8× reduction in an already-small round-trip count
+should be. It is **not free**: `msize` is the per-request allocation on both ends
+(the kernel allocates from a `kmem_cache` of exactly this size, and this server's
+frame assembler adopts the negotiated value), so 1 MiB is 8× the memory per
+in-flight request for ~1.3× the bulk throughput. With `maxInFlight` at 16 that is
+16 MiB of reply headroom per connection instead of 2.
+
+**Nothing else moves with it, in either direction.** `write 4 KiB` is 0.89×–1.07×
+across a 64× change in `msize` — a 4 KiB write fits in every one of them — and
+`readdir` of a 100-entry directory is 0.86×–1.06×, because one page carries the
+whole listing at any of these sizes. Both are controls, and both come back flat,
+which is what makes the throughput rows readable.
+
+**The recommendation the numbers support:** leave `mountMsize` alone. Raise it
+toward `P9_MAX_MOUNT_MSIZE` only for a bulk-transfer workload on a connection
+count you can afford the memory for, and expect ~1.3×, not a step change.
+
+### The dispatch window (`maxInFlight`), measured
+
+`DEFAULT_MAX_IN_FLIGHT = 16` (`src/9p/server.ts`) is how many requests one
+connection answers at once before the rest wait as frames. It can only matter
+when requests are actually in flight, so these two rows are the whole
+experiment — 64 concurrent `stat`s, and a strictly sequential `stat` as the
+control.
+
+| scenario           | maxInFlight=1         | **16 (default)**          | maxInFlight=64        |
+| ------------------ | --------------------- | ------------------------- | --------------------- |
+| stat ×64 in flight | 11,981 / 12,984 ops/s | **12,800 / 14,885 ops/s** | 17,184 / 20,025 ops/s |
+| stat (sequential)  | 507\* / 2,809 ops/s   | **2,123 / 2,381 ops/s**   | 2,522 / 2,746 ops/s   |
+
+\* an outlier, and named as one: `mean` 1.971 ms against a `p50` of 0.517 ms and
+a `p99` of 16.666 ms, i.e. a handful of multi-millisecond stalls in an otherwise
+normal run, **not reproduced** — the second run of the same variant measured
+2,809 ops/s with a 0.482 ms p99. It is left in the table rather than dropped,
+because a window of 1 is the configuration where a stall of that shape is at
+least plausible, and one unreplicated observation is exactly the kind of thing
+this file should record without believing.
+
+**Widening the window to 64 is worth 1.34× / 1.35× on the 64-in-flight
+scenario**, in both runs, which is the only claim here that clears the spread.
+The mechanism is visible in the counters above: that variant's peak message rate
+is 72–85 k/s against the default's 55–62 k. **Closing it to 1 costs only
+0.87×–0.94×** on the same scenario — much less than the 16× change in the knob
+suggests, and the reason is that the window bounds _dispatch_, not the kernel:
+v9fs keeps its own handful of requests outstanding per mount, so the queue behind
+a window of 1 is short and the frames waiting in it cost their wire size.
+
+**The recommendation the numbers support:** leave `maxInFlight` at 16 for a
+mount. It is a memory bound first and a throughput knob second — the replies
+alive at once are `maxInFlight × msize` — and the ~1.34× at 64 is only reachable
+by a client that keeps dozens of requests outstanding, which the kernel's own
+client does not do for ordinary work. Raise it, with the memory arithmetic in
+hand, for a `createP9Server` serving several attached clients.
+
+### What this column does not say
+
+- **Nothing about `cache=`.** Every mount here is the shipped `cache=none`, so
+  there is no warm/cold distinction to draw and no `ls -l (cold)` row of the kind
+  the FUSE column runs. Raising `cache=` would measure the bet documented on
+  `MountP9Options.cache` — that nothing but the mount modifies the driver — and
+  that is a semantics decision, not a benchmark one.
+- **Nothing about `trans=tcp`.** Every row is the default unix socket. A TCP
+  mount is the VM-guest shape and would be measuring the loopback stack.
+- **Nothing about multiple clients.** One connection, one session, one fid table.
+
+### The denominator moved, and why this column carries its own
+
+The 9P column's sitting is two days and one `src/` commit after the rest of the
+file, so the loopback column was re-measured in it — and **a paired run, in this
+sitting, of `95c2c44` against `81b40a4` shows the shared denominator moving**:
+
+| loopback scenario     | `95c2c44`            | `81b40a4` (two runs)            |                  ratio |
+| --------------------- | -------------------- | ------------------------------- | ---------------------: |
+| readdir (100 entries) | 10,323,455 entries/s | 5,421,611 / 5,230,716 entries/s |      **0.53× / 0.51×** |
+| stat                  | 1,086,332 ops/s      | 900,930 / 849,935 ops/s         |          0.83× / 0.78× |
+| stat ×64 in flight    | 1,437,160 ops/s      | 1,226,443 / 1,194,581 ops/s     |          0.85× / 0.83× |
+| ls -l (1000 entries)  | 867,224 entries/s    | 755,421 / 764,958 entries/s     |          0.87× / 0.88× |
+| stat walk (500 files) | 982,499 stats/s      | 895,877 / 924,847 stats/s       |          0.91× / 0.94× |
+| everything else       | —                    | —                               | 0.96×–1.15×, i.e. flat |
+
+Method: a `git worktree` at `95c2c44`, `node bench/index.ts` in it, and the same
+command on `81b40a4`, minutes apart on this host — the discipline
+[stated above](#the-baseline-and-why-there-is-one), applied in the direction it
+was written for. The only commit touching `src/` between the two trees is
+`5defab0` (`mountx.mknod` and the memory driver's special files), so **the
+`readdir` half is a real, paired, 1.9× regression in the memory driver**, not a
+day-to-day difference; the 0.83×/0.85× rows are smaller and less certain.
+
+Three things follow. It is a **driver** finding, not a 9P one — no transport row
+shows it, because at 100 entries a round trip costs more than an entry does (NFS
+`readdir` is 128,732 entries/s this sitting against 130,860 on 2026-07-29, i.e.
+unmoved). It was **not chased in this milestone**, because this milestone is a
+benchmark column. And it is precisely why the 9P section quotes denominators from
+its own sitting: reading a 9P number against the loopback table above would have
+credited this transport with a change in the driver underneath it.
+
+**Since fixed, and fully.** `603df04` found the cause — `5defab0` had factored
+the seven type predicates into a helper that `toStats` and `readdir` each spread
+into the object they build, turning one allocation of a shape V8 already knows
+into a runtime `CopyDataProperties` over an intermediate object per entry — and
+wrote the literals out at both sites again, keeping the two type branches
+`mountx.mknod` needs. That commit measures the recovery at **2.09× on `readdir`**
+(5.5 → 11.5 M entries/s at 100 entries) and **1.40× on `stat`** (1.90 → 2.66 M
+ops/s), i.e. the whole of what the table above lost. Those two numbers are
+`603df04`'s own measurement, not this sitting's, and are quoted as its evidence
+rather than restated as this file's; the table above stands as the record of the
+sitting that found the regression.
+
+The 9P rows were taken on the pre-fix driver and are left as measured. They are
+round-trip bound, which is the same reason no transport row showed the regression
+in the first place — the driver underneath moved 1.9× and NFS `readdir` did not
+move at all. A sitting that re-measures them on the post-fix driver would settle
+it properly; until one runs, that is an assumption this paragraph is making
+explicit rather than a result.
+
+---
+
 ## What the sweep moved
 
 `0f359e7` (+ the type-stripping fix) against `95c2c44`, both measured in this
@@ -602,9 +860,16 @@ denominator, 53 MiB/s over NFS would have looked like an NFS number.
 - **One paired run, not several.** The baseline makes attribution possible; it does
   not make a 10% delta readable. Medians over repeated pairs would, and would also
   retire [the three open rows](#what-is-left-open-and-small).
-- **No 9P or NFSv4.1 column.** Both transports ship, both are in the conformance
-  matrix, and neither has a `bench/` column — so no number may be quoted for
-  either, including in `docs/2.transports/`.
+- **No NFSv4.1 or S3 column.** Both ship, NFSv4.1 is in the conformance matrix,
+  and neither has a `bench/` column — so no number may be quoted for either,
+  including in `docs/2.transports/`.
+- **The 9P column is a second sitting, and only two runs of it.** Its own
+  numbers are paired against denominators taken with them, so they stand on their
+  own; what does not stand is a FUSE-versus-9P table, because no sitting has yet
+  measured both. `pnpm bench && pnpm bench:root && pnpm bench:9p` in one sitting
+  would produce one, and would be the right way to regenerate this whole file
+  next time. Until then, every cross-transport sentence in the 9P section is
+  marked indicative and must stay that way.
 - **One driver.** Every number is against the in-memory driver, on purpose: it
   isolates the transport. A driver that does real I/O will be bounded by its own
   latency long before any of these ceilings, which is the honest thing to tell a

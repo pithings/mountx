@@ -22,7 +22,10 @@ import {
   P9_GETATTR_MODE,
   P9_GETATTR_SIZE,
   P9_IOHDRSZ,
+  P9_LOCK_BLOCKED,
+  P9_LOCK_ERROR,
   P9_LOCK_SUCCESS,
+  P9_LOCK_TYPE_RDLCK,
   P9_LOCK_TYPE_UNLCK,
   P9_LOCK_TYPE_WRLCK,
   P9_MAXWELEM,
@@ -71,6 +74,7 @@ import {
   writeTxattrcreate,
   writeTxattrwalk,
 } from "../../src/9p/protocol.ts";
+import { P9LockTable } from "../../src/9p/locks.ts";
 import { DEFAULT_MSIZE, P9Session, type P9SessionOptions } from "../../src/9p/session.ts";
 import type { P9Writer } from "../../src/9p/wire.ts";
 import { O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY } from "../../src/fuse/constants.ts";
@@ -2018,15 +2022,19 @@ describe("Txattrwalk, Txattrcreate, Tlock and Tgetlock", () => {
     expect(session.fids.get(1)).toBeUndefined();
   });
 
-  it("grants every lock and reports nothing locked", async () => {
-    const { client, fs } = await serve();
+  it("grants a lone client's locks, since nothing else can be in its table", async () => {
+    const { client, session, fs } = await serve();
     await fs.writeFile("/file", "x");
     await client.walk(0, 1, ["file"]);
     await client.lopen(1, O_RDWR);
     expect(await client.lock(1, { type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+    expect(session.locks.held).toBe(1);
     expect(await client.lock(1, { type: P9_LOCK_TYPE_UNLCK })).toBe(P9_LOCK_SUCCESS);
-    // The client kernel does the POSIX-lock bookkeeping for its own processes;
-    // there is no second client for this reply to protect anything from.
+    expect(session.locks.held).toBe(0);
+    // A session made by hand holds a table of its own — this is the
+    // single-client `mount9p()` case, where the client kernel does the
+    // POSIX-lock bookkeeping for its own processes and there is nobody else for
+    // this reply to protect anything from.
     expect(
       await client.getlock(1, { start: 4n, length: 16n, procId: 99, clientId: "somebody" }),
     ).toEqual({
@@ -2049,6 +2057,350 @@ describe("Txattrwalk, Txattrcreate, Tlock and Tgetlock", () => {
     for (const type of [P9_TOPEN, P9_TCREATE, P9_TSTAT, P9_TWSTAT]) {
       expect(await client.expectError(type, (writer) => writer.u32(0))).toBe(ERRNO_CODES.ENOTSUP);
     }
+  });
+});
+
+describe("byte-range locks between two clients", () => {
+  /** Two processes on two machines — the identity `Tlock` puts on the wire. */
+  const ALICE = { procId: 10, clientId: "host-a" };
+  const BOB = { procId: 20, clientId: "host-b" };
+
+  interface Shared {
+    a: Harness;
+    b: Harness;
+    locks: P9LockTable;
+    fs: Loopback;
+  }
+
+  /**
+   * Two sessions over one driver and **one lock table**: what
+   * `createP9Server` builds for two connections.
+   *
+   * Both end up with fid 1 open on `/file`, which is 200 bytes long so a range
+   * in the middle of it is a range in the middle of a file.
+   */
+  async function shared(options: P9SessionOptions = {}): Promise<Shared> {
+    const driver = createMemoryDriver();
+    const locks = options.locks ?? new P9LockTable();
+    const a = await serve(driver, { ...options, locks });
+    await a.fs.writeFile("/file", "x".repeat(200));
+    const b = await serve(driver, { ...options, locks });
+    for (const harness of [a, b]) {
+      await harness.client.walk(0, 1, ["file"]);
+      await harness.client.lopen(1, O_RDWR);
+    }
+    return { a, b, locks, fs: a.fs };
+  }
+
+  /** Every range on a path, in start order, as `[start, end, type]` triples. */
+  function ranges(locks: P9LockTable, path = "/file"): [bigint, bigint, number][] {
+    return [...locks.at(path)]
+      .sort((left, right) => (left.start < right.start ? -1 : 1))
+      .map((lock) => [lock.start, lock.end, lock.type]);
+  }
+
+  it("denies a conflicting write lock to the second client, and names the holder", async () => {
+    const { a, b } = await shared();
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 64n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    // Overlapping by one byte is overlapping.
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 63n, length: 64n }),
+    ).toBe(P9_LOCK_BLOCKED);
+    // `Tgetlock` is the only way one client ever learns another exists.
+    expect(
+      await b.client.getlock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 63n, length: 64n }),
+    ).toEqual({
+      type: P9_LOCK_TYPE_WRLCK,
+      start: 0n,
+      length: 64n,
+      procId: ALICE.procId,
+      clientId: ALICE.clientId,
+    });
+    // And the byte after it is free, which is what makes this a *range* lock.
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 64n, length: 64n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(
+      await b.client.getlock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 64n, length: 64n }),
+    ).toMatchObject({ type: P9_LOCK_TYPE_UNLCK });
+  });
+
+  it("lets read locks share and refuses a write against them", async () => {
+    const { a, b } = await shared();
+    const range = { start: 0n, length: 64n };
+    expect(await a.client.lock(1, { ...ALICE, ...range, type: P9_LOCK_TYPE_RDLCK })).toBe(
+      P9_LOCK_SUCCESS,
+    );
+    expect(await b.client.lock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_RDLCK })).toBe(
+      P9_LOCK_SUCCESS,
+    );
+    expect(await b.client.lock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_WRLCK })).toBe(
+      P9_LOCK_BLOCKED,
+    );
+    // A reader is never denied by a reader, so testing for one finds nothing —
+    // and testing for a writer finds the *other* client's read lock, never the
+    // asker's own.
+    expect(await b.client.getlock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_RDLCK })).toMatchObject(
+      { type: P9_LOCK_TYPE_UNLCK },
+    );
+    expect(await b.client.getlock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_WRLCK })).toMatchObject(
+      { type: P9_LOCK_TYPE_RDLCK, procId: ALICE.procId, clientId: ALICE.clientId },
+    );
+  });
+
+  it("upgrades and downgrades a range it already holds", async () => {
+    const { a, b, locks } = await shared();
+    const range = { start: 0n, length: 64n };
+    expect(await a.client.lock(1, { ...ALICE, ...range, type: P9_LOCK_TYPE_RDLCK })).toBe(
+      P9_LOCK_SUCCESS,
+    );
+    expect(await b.client.lock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_WRLCK })).toBe(
+      P9_LOCK_BLOCKED,
+    );
+    // The upgrade replaces the owner's own range rather than conflicting with
+    // it, which is the whole difference between "another owner" and "this one".
+    expect(await a.client.lock(1, { ...ALICE, ...range, type: P9_LOCK_TYPE_WRLCK })).toBe(
+      P9_LOCK_SUCCESS,
+    );
+    expect(ranges(locks)).toEqual([[0n, 64n, P9_LOCK_TYPE_WRLCK]]);
+    expect(await b.client.lock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_RDLCK })).toBe(
+      P9_LOCK_BLOCKED,
+    );
+    // ...and back down again, at which point the reader is welcome.
+    expect(await a.client.lock(1, { ...ALICE, ...range, type: P9_LOCK_TYPE_RDLCK })).toBe(
+      P9_LOCK_SUCCESS,
+    );
+    expect(ranges(locks)).toEqual([[0n, 64n, P9_LOCK_TYPE_RDLCK]]);
+    expect(await b.client.lock(1, { ...BOB, ...range, type: P9_LOCK_TYPE_RDLCK })).toBe(
+      P9_LOCK_SUCCESS,
+    );
+  });
+
+  it("splits a range when the middle of it is unlocked", async () => {
+    const { a, b, locks } = await shared();
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 100n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_UNLCK, start: 40n, length: 10n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(ranges(locks)).toEqual([
+      [0n, 40n, P9_LOCK_TYPE_WRLCK],
+      [50n, 100n, P9_LOCK_TYPE_WRLCK],
+    ]);
+    // The hole is a real hole, and its edges are still held.
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 40n, length: 10n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 39n, length: 1n }),
+    ).toBe(P9_LOCK_BLOCKED);
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 50n, length: 1n }),
+    ).toBe(P9_LOCK_BLOCKED);
+  });
+
+  it("joins one owner's touching ranges and never two owners'", async () => {
+    const { a, b, locks } = await shared();
+    for (const start of [0n, 16n, 32n]) {
+      expect(
+        await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start, length: 16n }),
+      ).toBe(P9_LOCK_SUCCESS);
+    }
+    expect(ranges(locks)).toEqual([[0n, 48n, P9_LOCK_TYPE_WRLCK]]);
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 48n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(ranges(locks)).toEqual([
+      [0n, 48n, P9_LOCK_TYPE_WRLCK],
+      [48n, 64n, P9_LOCK_TYPE_WRLCK],
+    ]);
+  });
+
+  it("treats a length of zero as running to the end of the file", async () => {
+    const { a, b } = await shared();
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 100n, length: 0n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    // Past the end of a 200-byte file, and still inside a to-EOF lock.
+    expect(
+      await b.client.getlock(1, {
+        ...BOB,
+        type: P9_LOCK_TYPE_WRLCK,
+        start: 1_000_000n,
+        length: 8n,
+      }),
+    ).toEqual({
+      type: P9_LOCK_TYPE_WRLCK,
+      start: 100n,
+      // Back out the way it came in: zero, not the width of a u64.
+      length: 0n,
+      procId: ALICE.procId,
+      clientId: ALICE.clientId,
+    });
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 100n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 99n, length: 2n }),
+    ).toBe(P9_LOCK_BLOCKED);
+  });
+
+  it("is owned by (client_id, proc_id) rather than by the connection", async () => {
+    const { a, b, locks } = await shared();
+    const range = { type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 64n };
+    expect(await a.client.lock(1, { ...ALICE, ...range })).toBe(P9_LOCK_SUCCESS);
+    // The same process, reaching the server over a second connection: POSIX
+    // says a process's own ranges never conflict, and the replacement is
+    // recorded against the connection that asked last.
+    expect(await b.client.lock(1, { ...ALICE, ...range })).toBe(P9_LOCK_SUCCESS);
+    expect(locks.size).toBe(1);
+    expect(locks.at("/file")[0]?.holder).toBe(b.session.locks.id);
+    expect(a.session.locks.held).toBe(0);
+    expect(b.session.locks.held).toBe(1);
+    // Somebody else is still somebody else.
+    expect(await b.client.lock(1, { ...BOB, ...range })).toBe(P9_LOCK_BLOCKED);
+  });
+
+  it("releases the ranges a clunked fid took, and only those", async () => {
+    const { a, b, locks } = await shared();
+    await a.client.walk(0, 2, ["file"]);
+    await a.client.lopen(2, O_RDWR);
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(
+      await a.client.lock(2, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 32n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(a.session.locks.held).toBe(2);
+
+    await a.client.clunk(1);
+    expect(ranges(locks)).toEqual([[32n, 48n, P9_LOCK_TYPE_WRLCK]]);
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+
+    // `Tremove` clunks its fid whether or not the removal works, so it releases
+    // just as a `Tclunk` does.
+    await a.client.remove(2);
+    expect(a.session.locks.held).toBe(0);
+  });
+
+  it("unlocks through a different fid of the same owner", async () => {
+    const { a, locks } = await shared();
+    await a.client.walk(0, 2, ["file"]);
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    // An unlock names a range, not a fid; POSIX unlocks the process's ranges.
+    expect(
+      await a.client.lock(2, { ...ALICE, type: P9_LOCK_TYPE_UNLCK, start: 0n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(locks.size).toBe(0);
+    // Unlocking bytes nobody holds is a success, not a refusal.
+    expect(
+      await a.client.lock(2, { ...ALICE, type: P9_LOCK_TYPE_UNLCK, start: 0n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+  });
+
+  it("releases everything a session held when it goes away", async () => {
+    const { a, b, locks } = await shared();
+    expect(await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+    expect(await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_BLOCKED);
+
+    // What a dropped connection does: the transport notices EOF and destroys
+    // the session, and nothing else is left able to release these.
+    await a.session.destroy();
+    expect(locks.size).toBe(0);
+    expect(await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+  });
+
+  it("releases everything a Tversion reset clunked", async () => {
+    const { a, locks } = await shared();
+    expect(await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+    // "aborts all outstanding I/O and clunks all fids" — the locks those fids
+    // took go with them.
+    await a.client.version();
+    expect(locks.size).toBe(0);
+    expect(a.session.locks.held).toBe(0);
+  });
+
+  it("moves ranges with a rename and drops them with the file", async () => {
+    const { a, b, locks } = await shared();
+    expect(await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+
+    // A rename onto the name it already has moves nothing, locks included.
+    await b.client.renameat(0, "file", 0, "file");
+    expect(ranges(locks)).toEqual([[0n, 1n << 64n, P9_LOCK_TYPE_WRLCK]]);
+
+    // The rename is the *file's*, so the other client's range moves with it.
+    await b.client.renameat(0, "file", 0, "moved");
+    expect(locks.at("/file")).toHaveLength(0);
+    expect(ranges(locks, "/moved")).toEqual([[0n, 1n << 64n, P9_LOCK_TYPE_WRLCK]]);
+    await b.client.walk(0, 2, ["moved"]);
+    expect(await b.client.lock(2, { ...BOB, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_BLOCKED);
+
+    // A name that stops existing takes its ranges with it: the next file
+    // created there is a different file, and a range left behind would deny it
+    // to everybody.
+    await b.client.unlinkat(0, "moved");
+    expect(locks.size).toBe(0);
+    expect(locks.files).toBe(0);
+  });
+
+  it("drops the ranges under a name a rename replaced", async () => {
+    const { a, b, locks, fs } = await shared();
+    await fs.writeFile("/other", "y".repeat(50));
+    await b.client.walk(0, 2, ["other"]);
+    expect(await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+    expect(await b.client.lock(2, { ...BOB, type: P9_LOCK_TYPE_WRLCK })).toBe(P9_LOCK_SUCCESS);
+    expect(locks.files).toBe(2);
+
+    await b.client.renameat(0, "other", 0, "file");
+    // The file `/file` named has been replaced, so the ranges held on it are
+    // ranges on a file that no longer has that name — and the mover's ranges
+    // are what `/file` means now.
+    expect(locks.files).toBe(1);
+    expect(locks.at("/file")).toHaveLength(1);
+    expect(locks.at("/file")[0]?.holder).toBe(b.session.locks.id);
+    expect(a.session.locks.held).toBe(0);
+  });
+
+  it("answers ERROR — the client's ENOLCK — when a file is at its cap", async () => {
+    const { a, b } = await shared({ locks: new P9LockTable({ maxLocksPerFile: 1 }) });
+    expect(
+      await a.client.lock(1, { ...ALICE, type: P9_LOCK_TYPE_WRLCK, start: 0n, length: 16n }),
+    ).toBe(P9_LOCK_SUCCESS);
+    expect(
+      await b.client.lock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 32n, length: 16n }),
+    ).toBe(P9_LOCK_ERROR);
+    // Not a conflict, and not the file's fault: the range is free, the table is
+    // full, and `P9_LOCK_ERROR` is what reaches userspace as `ENOLCK`.
+    expect(
+      await b.client.getlock(1, { ...BOB, type: P9_LOCK_TYPE_WRLCK, start: 32n, length: 16n }),
+    ).toMatchObject({ type: P9_LOCK_TYPE_UNLCK });
+  });
+
+  it("refuses a type it cannot hold and a range that cannot exist", async () => {
+    const { a } = await shared();
+    // A malformed request rather than a refused lock: `P9_LOCK_ERROR` reaches
+    // userspace as `ENOLCK`, which would describe a full lock table.
+    expect(await codeOfRejection(a.client.lock(1, { ...ALICE, type: 7 }))).toBe("EINVAL");
+    expect(await codeOfRejection(a.client.getlock(1, { ...ALICE, type: P9_LOCK_TYPE_UNLCK }))).toBe(
+      "EINVAL",
+    );
+    expect(
+      await codeOfRejection(
+        a.client.lock(1, {
+          ...ALICE,
+          type: P9_LOCK_TYPE_WRLCK,
+          start: 1n << 63n,
+          length: (1n << 63n) + 1n,
+        }),
+      ),
+    ).toBe("EINVAL");
   });
 });
 

@@ -237,8 +237,9 @@ describe.skipIf(!probe.usable)("mount9p", () => {
     const listed = await run("ls", ["-a", join(at, "d")]);
     expect(listed.status).toBe(0);
     expect(listed.out.trim().split("\n").sort()).toEqual([".", "..", "x"]);
-    // `Tlock`/`Tgetlock` always grant, so both syscalls have to succeed. v9fs
-    // really does put them on the wire (witnessed: 8 `Tlock` for this shape).
+    // One client, so the lock table it shares with nobody cannot refuse it and
+    // both syscalls have to succeed. v9fs really does put them on the wire
+    // (witnessed: 8 `Tlock` for this shape).
     const locked = await run("flock", ["-x", "-w", "5", join(at, "d/x"), "true"]);
     expect(locked.status).toBe(0);
   }, 60_000);

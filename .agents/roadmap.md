@@ -36,29 +36,106 @@ those.
 Nothing here blocks a release; each is a real gap worth picking up deliberately
 rather than by accident.
 
-- **Relay mode and sync-driver-in-worker-threads concurrency modes.** Async
-  main-thread mode is all that ships. Relay would take `/dev/fuse` off the libuv
-  threadpool entirely (removing the self-client hazard); sync-worker is the mode
-  expected to scale with worker count. Both are unmeasured — see the "known
-  gaps" in `.agents/benchmarks.md`. A relay mode is also where `src/9p/`'s
-  deferred `trans=fd` would finally earn its keep: it wants a descriptor the
-  relay already holds, where `mount9p()`'s own `trans=unix` has nothing to relay
-  to.
-- **A 9P bench column.** `bench/` has loopback and NFS columns and a sudo-gated
-  FUSE one; 9P has none, and unlike when the transport was designed, a host that
-  can mount it now exists (`.agents/environment.md`). `msize` and `maxInFlight`
-  (`DEFAULT_MAX_IN_FLIGHT = 16`, `src/9p/server.ts`) are both real tuning knobs
-  with no measured numbers behind them, and the invariant that perf claims come
-  only from `.agents/benchmarks.md` means none of it can be said in prose until
-  the column exists.
-- **An NFSv4.1 bench column**, for the same reason: both it and 9P are in the
-  conformance matrix and neither is in the benchmarks.
-- **A real multi-client lock table for 9P.** `Tlock`/`Tgetlock` grant
-  unconditionally today (`src/9p/session.ts`), which is honest for the one local
-  client `mount9p()` serves and not for a second one attached to a
-  `createP9Server` over TCP. Worth doing only if TCP serving — multiple VM
-  guests, or several processes against one `attach()`ed server — grows real
-  users; until then it is a documented gap, not a silent one.
+- **FUSE reader concurrency: one mode worth building, two not.** Async
+  main-thread mode is all that ships. This bullet used to ask for a relay mode
+  and a sync-driver-in-workers mode; a design pass against
+  `.agents/benchmarks.md` cut it down, and what follows is the residue.
+
+  **Relay buys no throughput.** The reader-count experiment already says pulling
+  requests off `/dev/fuse` is not the bottleneck, so a mode whose whole content
+  is pulling them differently cannot move the ceiling. What it buys is one of
+  the four self-client hazards — the async-`fs`-fan-out form. The synchronous
+  form, the `uv_spawn` form and the driver-needs-the-pool form all survive, as
+  9P demonstrates: it already answers from the event loop over a socket, the
+  shape relay would give FUSE, and `src/9p/mount.ts`'s header still documents
+  the `spawn` deadlock.
+
+  **What is left is smaller and opt-in:** a worker thread doing blocking
+  `readSync` into a `SharedArrayBuffer` ring, replies still written from the
+  main thread — so the reply path crosses no boundary and invariants 9 and 12
+  keep their present shape (invariant 12's transport half becomes "release the
+  slot when `handleMessage` returns", which is `#arm(buffer)` with a different
+  verb). A worker reading _asynchronously_ would fix nothing: the libuv
+  threadpool is process-global and shared with worker threads. It cannot be the
+  default, and it does not improve invariant 21 — a worker parked in a blocking
+  read is shed by neither `unref()` nor `terminate()` nor `process.exit()`, only
+  by `SIGKILL`. Three things gate it, all unmeasured: a predicted single-digit
+  sequential regression, the ring's memory ordering (argued from the memory
+  model, never measured), and whether `fs.readSync` on `/dev/fuse` can
+  short-read.
+
+  **Sync-driver-in-workers is declined.** An `FsDriver` is closures and closures
+  do not `postMessage`, so it needs a second driver contract that invariant 4
+  will not have; and the loopback column against the FUSE one — 1,093,940 stat/s
+  against 33,434 (`.agents/benchmarks.md`) — says the driver is a rounding error
+  in every measured column. A driver that wants a worker pool can own one today
+  with no library support.
+
+  **And the fix that covers all four hazards is free:** serve from one process
+  and use the mount from another. `bench/drive.ts` does exactly that in reverse,
+  which is why no benchmark column has ever wedged.
+
+- **9P `trans=fd`, no longer waiting on a relay.** It was deferred twice, and
+  both premises are gone. `.agents/9p-plan.md` deferred it because Node
+  supposedly cannot create a socketpair without native code; that is **false**,
+  and verified on this host — libuv's `stdio: "pipe"` on POSIX _is_
+  `socketpair(AF_UNIX, SOCK_STREAM)`, the child's inherited fd reads
+  `socket:[…]`, and the parent end is a full-duplex `net.Socket` that
+  round-trips bytes. This file deferred it again because it wanted a descriptor
+  only a relay would hold; with relay cut down to a worker that holds nothing of
+  the sort, that no longer follows either. So `trans=fd` is reachable today with
+  no relay and no native code, and it is now an ordinary option to be judged on
+  its own merits. Two facts need one root mount each first: whether `mount(8)`
+  keeps an inherited socket fd open across `mount(2)`, and whether v9fs's
+  `trans=fd` drives an `AF_UNIX` stream.
+- **An NFSv4.1 bench column.** 9P has one now (`pnpm bench:9p`), which leaves
+  v4.1 as the last transport that is in the conformance matrix and not in the
+  benchmarks.
+- **Whether `DEFAULT_MAX_IN_FLIGHT` should be higher.** The 9P column put numbers
+  behind both of that transport's knobs, and they point opposite ways. The
+  dispatch window pays: 64 against the shipped 16 is 1.34–1.35× on stats 64 deep,
+  and closing it to 1 costs 0.87–0.94×, so the default sits below where it stops
+  earning. `msize` is settled the other way — 1 MiB buys 1.29× over the shipped
+  default for eight times the per-request memory, and the default is already
+  3.0–3.2× the 16 KiB the kernel used to ship. Changing a shipped default wants a
+  second sitting on another host before the one measurement becomes a decision.
+- **Cross-session fid remap, and a `PathLock` that spans connections.** A rename
+  moves the byte ranges with the file (`P9LockTable.remap`) but rewrites only the
+  renaming connection's fid table, because `FidTable.remap` is per connection —
+  so another client holding a pre-rename fid goes on naming the old path, and its
+  next `Tlock`/`Tgetlock` files itself there. Nothing is stranded (records still
+  die with the fid or the connection) and a client that walks to the new name
+  afterwards sees them. It is the same missing piece as the per-connection
+  `PathLock`: a rename by one client is not serialized against another's work
+  either. `src/9p/locks.ts` documents both edges.
+- **No Tier-2 multi-client 9P case.** The lock table's cross-client behaviour is
+  covered at Tier 0/1 — two connections on one `createP9Server`, including the
+  release when one drops — but two _real_ mounts of one server, a guest and its
+  host or two guests, is not, and needs a host that can produce them.
+- **A driver → transport "path X changed underneath you" channel.** Half of this
+  already ships, and it is the transport-facing half: `notifyInvalInode()` /
+  `notifyInvalEntry()` on the FUSE session (`src/fuse/session.ts`) and on the
+  mount (`src/fuse/mount.ts`), pure encoders in `src/fuse/notify.ts`. What is
+  missing is the driver end — nothing in `FsDriver` can say a path changed, so
+  the only caller today is code that already knows because it made the change
+  itself. It is **not** a `mountx.*` member: every extension there is a
+  path-shaped call the session makes, and this is an event the driver raises
+  unprompted, so it wants a `watch`-shaped surface on `FsDriver` rather than a
+  method in the namespace. The FUSE half of the translation is already in place
+  — `InodeTable.byPath` turns the path into the `ino` a notification needs, and
+  a path the kernel never looked up has nothing cached, which is the natural
+  no-op.
+  **FUSE is the only transport that could consume it today, and the only one
+  that can without new protocol work.** 9P has no invalidation message at all
+  (below). NFSv3 is request/response only: client caching is bounded by
+  attribute timeouts and nothing server-initiated exists. NFSv4.1 does have a
+  back channel — delegation recall and `CB_NOTIFY` — but this server grants no
+  delegations, never sets `CREATE_SESSION4_FLAG_CONN_BACK_CHAN`, refuses a
+  `CDFC4_BACK` `BIND_CONN_TO_SESSION` with `NFS4ERR_INVAL` and answers
+  `BACKCHANNEL_CTL` the same way, so reaching it means building the callback
+  program, delegations, and `GET_DIR_DELEGATION` for the directory case — far
+  more work than the notification it would carry. The S3 gateway has neither a
+  channel nor a client cache to invalidate.
 - **9P has no FUSE-style invalidation channel.** `notify_inval_inode`/
   `notify_inval_entry` have no 9P analogue — nothing in the protocol lets a
   server tell a client that something it cached has changed — which is why
@@ -98,8 +175,9 @@ rather than by accident.
   backing store the FIFO would be real to the mounting process and absent to
   every other one.
 - **xattr and the rest of the `mountx.*` extension namespace** (byte-range
-  locks, `fallocate`/`lseek`, cache-invalidation `notify`) — `ENOTSUP` until a
-  real user needs one.
+  locks, `fallocate`/`lseek`) — `ENOTSUP` until a real user needs one.
+  Cache-invalidation `notify` used to be listed here and is not an extension at
+  all; it has its own entry above.
 - **`suppattr_exclcreat` (75) is still unadvertised** in `src/nfs/v4/attr.ts`'s
   `SUPPORTED_ATTRS`. Exclusive create shipped, and its verifier lives beside the
   file rather than in an attribute, so the honest value is now the full settable

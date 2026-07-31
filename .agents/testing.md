@@ -118,7 +118,8 @@ rclone`/`curl` and needing no root, so it runs as part of `pnpm test` and skips
   `addr=`/`clientaddr=` leaves the helper nothing to resolve). See
   `.agents/environment.md` § VM guests. Turning that into a Tier-2 column would mean
   carrying a VM in the suite.
-- **No 9P or S3 benchmark column** — see `.agents/benchmarks.md`.
+- **No NFSv4.1 or S3 benchmark column**, and the 9P one is from a later sitting than
+  the rest — see `.agents/benchmarks.md`.
 
 ## Runner scripts
 

@@ -70,14 +70,15 @@ Linux only. No `server.ts` — it owns `/dev/fuse` directly.
 9P2000.L only. Constants from the kernel's `include/net/9p/9p.h` (tag v6.12), diod's
 `protocol.md` as the prose reference. Linux, root only — v9fs has no setuid helper.
 
-| File         | What                                                                                                                                                                      |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wire.ts`    | `P9Reader`/`P9Writer` — little-endian, unaligned, bounds-checked, u64 as `bigint`                                                                                         |
-| `fids.ts`    | `FidTable` — fid → path + open state + iounit + readdir cursor. `qid.path` comes off this table's own counter, because v9fs derives `st_ino` from it. Synchronous         |
-| `session.ts` | version negotiation, attach, walk, the whole `.L` opcode set, `Tflush`. Anything else → `Rlerror ENOTSUP`; errnos go on the wire raw, with no mapping layer               |
-| `server.ts`  | TCP, unix socket, or `attach(duplex)` — one session and one assembler **per connection**, since fids are per-connection state                                             |
-| `mount.ts`   | `trans=unix` by default (a `0700` dir holding a `0600` socket), `trans=tcp` for VM guests, `trans=fd` deferred. **Read its header before spawning anything near a mount** |
-| `probe.ts`   | needs `9p` in `/proc/filesystems`; reports `9pnet_fd` without refusing on it                                                                                              |
+| File         | What                                                                                                                                                                                             |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `wire.ts`    | `P9Reader`/`P9Writer` — little-endian, unaligned, bounds-checked, u64 as `bigint`                                                                                                                |
+| `fids.ts`    | `FidTable` — fid → path + open state + iounit + readdir cursor. `qid.path` comes off this table's own counter, because v9fs derives `st_ino` from it. Synchronous                                |
+| `locks.ts`   | `P9LockTable` — POSIX byte ranges for `Tlock`/`Tgetlock`, owned by `(client_id, proc_id)` and keyed by path. **Per server, not per session**; a conflict is `BLOCKED`, never a wait. Synchronous |
+| `session.ts` | version negotiation, attach, walk, the whole `.L` opcode set, `Tflush`. Anything else → `Rlerror ENOTSUP`; errnos go on the wire raw, with no mapping layer                                      |
+| `server.ts`  | TCP, unix socket, or `attach(duplex)` — one session and one assembler **per connection**, since fids are per-connection state; one lock table shared across all of them                          |
+| `mount.ts`   | `trans=unix` by default (a `0700` dir holding a `0600` socket), `trans=tcp` for VM guests, `trans=fd` deferred. **Read its header before spawning anything near a mount**                        |
+| `probe.ts`   | needs `9p` in `/proc/filesystems`; reports `9pnet_fd` without refusing on it                                                                                                                     |
 
 ## NFS (`src/nfs/`, exported as `mountx/nfs`)
 
@@ -147,8 +148,10 @@ cannot `recvmsg` a descriptor.
 ## Tests, benchmarks, docs
 
 `test/` — see `.agents/testing.md`. `bench/` — `harness.ts`, `scenarios.ts` (written
-once against the driver interface), `index.ts` (loopback + NFS), `fuse.ts` +
-`fuse-client.ts`; generates `.agents/benchmarks.md`, and has no 9P or S3 column yet.
+once against the driver interface), `index.ts` (loopback + NFS), `fuse.ts` and `9p.ts`
+(the two sudo-gated real-mount columns, each its own command), and the client half
+they share, `drive.ts` + `mount-client.ts`; generates `.agents/benchmarks.md`, and has
+no NFSv4.1 or S3 column yet.
 
 `docs/` — the [undocs](https://undocs.dev) site at <https://mountx.vercel.app>, and
 **where user-facing prose goes**: anything longer than a paragraph belongs on a page
@@ -172,12 +175,13 @@ The facts no single file's header can own.
   per _phase_, each step given `remaining()`, so a phase costs one `unmountTimeout`
   however many spawns it takes. The arithmetic is written out at `src/nfs/mount.ts`'s
   `#unmount`.
-- **`src/subtree.ts` is shared by three tables** (`fuse/inodes.ts`, `nfs/handles.ts`,
-  `9p/fids.ts`) and drives each one's own detach/attach pair. What is shared is the
-  walk and the two-pass rewrite; what "this path went away" _means_ differs per
-  transport (FUSE keeps the orphan for a later `FORGET`, NFS drops the key, 9P
-  releases the qid identity). Cost is O(tracked paths) per rename; a trie is the real
-  fix and waits on a benchmark that wants it.
+- **`src/subtree.ts` is shared by four tables** (`fuse/inodes.ts`, `nfs/handles.ts`,
+  `9p/fids.ts`, `9p/locks.ts`) and drives each one's own detach/attach pair. What is
+  shared is the walk and the two-pass rewrite; what "this path went away" _means_
+  differs per transport (FUSE keeps the orphan for a later `FORGET`, NFS drops the
+  key, 9P releases the qid identity — and, in the lock table, the ranges granted under
+  a name that has been replaced). Cost is O(tracked paths) per rename; a trie is the
+  real fix and waits on a benchmark that wants it.
 - **`src/ownership.ts` is one rule for four sessions, and two of them use it.** The
   NFS sessions apply it from the parent `stat` they already took for `wcc_data` /
   `change_info4`; 9P's client computes the same rule and puts the answer on the wire

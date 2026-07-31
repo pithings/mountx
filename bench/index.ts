@@ -12,7 +12,8 @@
  *   RPC scheduling; this host has no NFS client to measure with, so the honest
  *   description of the column is "the server's own cost, plus TCP".
  *
- * The FUSE column is `bench/fuse.ts` (`pnpm bench:root`).
+ * The two real-mount columns need root and are their own commands: FUSE is
+ * `bench/fuse.ts` (`pnpm bench:root`) and 9P is `bench/9p.ts` (`pnpm bench:9p`).
  */
 
 import { createMemoryDriver } from "../src/drivers/memory.ts";
