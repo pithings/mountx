@@ -44,21 +44,36 @@ rather than by accident.
   deferred `trans=fd` would finally earn its keep: it wants a descriptor the
   relay already holds, where `mount9p()`'s own `trans=unix` has nothing to relay
   to.
-- **A 9P bench column.** `bench/` has loopback and NFS columns and a sudo-gated
-  FUSE one; 9P has none, and unlike when the transport was designed, a host that
-  can mount it now exists (`.agents/environment.md`). `msize` and `maxInFlight`
-  (`DEFAULT_MAX_IN_FLIGHT = 16`, `src/9p/server.ts`) are both real tuning knobs
-  with no measured numbers behind them, and the invariant that perf claims come
-  only from `.agents/benchmarks.md` means none of it can be said in prose until
-  the column exists.
-- **An NFSv4.1 bench column**, for the same reason: both it and 9P are in the
-  conformance matrix and neither is in the benchmarks.
-- **A real multi-client lock table for 9P.** `Tlock`/`Tgetlock` grant
-  unconditionally today (`src/9p/session.ts`), which is honest for the one local
-  client `mount9p()` serves and not for a second one attached to a
-  `createP9Server` over TCP. Worth doing only if TCP serving — multiple VM
-  guests, or several processes against one `attach()`ed server — grows real
-  users; until then it is a documented gap, not a silent one.
+- **An NFSv4.1 bench column.** 9P has one now (`pnpm bench:9p`), which leaves
+  v4.1 as the last transport that is in the conformance matrix and not in the
+  benchmarks.
+- **Whether `DEFAULT_MAX_IN_FLIGHT` should be higher.** The 9P column put numbers
+  behind both of that transport's knobs, and they point opposite ways. The
+  dispatch window pays: 64 against the shipped 16 is 1.34–1.35× on stats 64 deep,
+  and closing it to 1 costs 0.87–0.94×, so the default sits below where it stops
+  earning. `msize` is settled the other way — 1 MiB buys 1.29× over the shipped
+  default for eight times the per-request memory, and the default is already
+  3.0–3.2× the 16 KiB the kernel used to ship. Changing a shipped default wants a
+  second sitting on another host before the one measurement becomes a decision.
+- **Cross-session fid remap, and a `PathLock` that spans connections.** A rename
+  moves the byte ranges with the file (`P9LockTable.remap`) but rewrites only the
+  renaming connection's fid table, because `FidTable.remap` is per connection —
+  so another client holding a pre-rename fid goes on naming the old path, and its
+  next `Tlock`/`Tgetlock` files itself there. Nothing is stranded (records still
+  die with the fid or the connection) and a client that walks to the new name
+  afterwards sees them. It is the same missing piece as the per-connection
+  `PathLock`: a rename by one client is not serialized against another's work
+  either. `src/9p/locks.ts` documents both edges.
+- **No Tier-2 multi-client 9P case.** The lock table's cross-client behaviour is
+  covered at Tier 0/1 — two connections on one `createP9Server`, including the
+  release when one drops — but two _real_ mounts of one server, a guest and its
+  host or two guests, is not, and needs a host that can produce them.
+- **The memory driver's `readdir` regressed 1.9×.** A paired same-sitting run
+  across `95c2c44` → `81b40a4` puts it at 0.51–0.53× (10.3M → ~5.3M entries/s on
+  the loopback column), with `stat` at 0.78–0.83×; the only `src/` commit between
+  those trees is `5defab0` (`mountx.mknod`). Recorded in `.agents/benchmarks.md`
+  and not chased: it is a driver finding, not a transport one — no transport row
+  shows it, because at 100 entries a round trip costs more than an entry does.
 - **9P has no FUSE-style invalidation channel.** `notify_inval_inode`/
   `notify_inval_entry` have no 9P analogue — nothing in the protocol lets a
   server tell a client that something it cached has changed — which is why

@@ -110,7 +110,7 @@ import("node:fs/promises")` must compile with no cast.
 | `pnpm build:native`                            | `zig build` **and** regenerate the embed; only for `native/src/` changes | no        |
 | `pnpm mountx`                                  | the CLI from source; `--help` for flags                                  | no        |
 | `pnpm matrix`                                  | regenerate `.agents/conformance-matrix.md`                               | no        |
-| `pnpm bench` / `pnpm bench:root`               | loopback + NFS columns / the FUSE column                                 | no / sudo |
+| `pnpm bench` / `:root` / `:9p`                 | loopback + NFS columns / the FUSE column / the 9P column                 | no / sudo |
 | `pnpm fmt` / `pnpm lint` / `pnpm build`        | `automd`+`oxlint`+`oxfmt` / check / `obuild`                             | no        |
 
 Every Tier-2 file skips itself when the host cannot mount (`nfsClientProbe()`,
