@@ -36,14 +36,58 @@ those.
 Nothing here blocks a release; each is a real gap worth picking up deliberately
 rather than by accident.
 
-- **Relay mode and sync-driver-in-worker-threads concurrency modes.** Async
-  main-thread mode is all that ships. Relay would take `/dev/fuse` off the libuv
-  threadpool entirely (removing the self-client hazard); sync-worker is the mode
-  expected to scale with worker count. Both are unmeasured — see the "known
-  gaps" in `.agents/benchmarks.md`. A relay mode is also where `src/9p/`'s
-  deferred `trans=fd` would finally earn its keep: it wants a descriptor the
-  relay already holds, where `mount9p()`'s own `trans=unix` has nothing to relay
-  to.
+- **FUSE reader concurrency: one mode worth building, two not.** Async
+  main-thread mode is all that ships. This bullet used to ask for a relay mode
+  and a sync-driver-in-workers mode; a design pass against
+  `.agents/benchmarks.md` cut it down, and what follows is the residue.
+
+  **Relay buys no throughput.** The reader-count experiment already says pulling
+  requests off `/dev/fuse` is not the bottleneck, so a mode whose whole content
+  is pulling them differently cannot move the ceiling. What it buys is one of
+  the four self-client hazards — the async-`fs`-fan-out form. The synchronous
+  form, the `uv_spawn` form and the driver-needs-the-pool form all survive, as
+  9P demonstrates: it already answers from the event loop over a socket, the
+  shape relay would give FUSE, and `src/9p/mount.ts`'s header still documents
+  the `spawn` deadlock.
+
+  **What is left is smaller and opt-in:** a worker thread doing blocking
+  `readSync` into a `SharedArrayBuffer` ring, replies still written from the
+  main thread — so the reply path crosses no boundary and invariants 9 and 12
+  keep their present shape (invariant 12's transport half becomes "release the
+  slot when `handleMessage` returns", which is `#arm(buffer)` with a different
+  verb). A worker reading _asynchronously_ would fix nothing: the libuv
+  threadpool is process-global and shared with worker threads. It cannot be the
+  default, and it does not improve invariant 21 — a worker parked in a blocking
+  read is shed by neither `unref()` nor `terminate()` nor `process.exit()`, only
+  by `SIGKILL`. Three things gate it, all unmeasured: a predicted single-digit
+  sequential regression, the ring's memory ordering (argued from the memory
+  model, never measured), and whether `fs.readSync` on `/dev/fuse` can
+  short-read.
+
+  **Sync-driver-in-workers is declined.** An `FsDriver` is closures and closures
+  do not `postMessage`, so it needs a second driver contract that invariant 4
+  will not have; and the loopback column against the FUSE one — 1,093,940 stat/s
+  against 33,434 (`.agents/benchmarks.md`) — says the driver is a rounding error
+  in every measured column. A driver that wants a worker pool can own one today
+  with no library support.
+
+  **And the fix that covers all four hazards is free:** serve from one process
+  and use the mount from another. `bench/drive.ts` does exactly that in reverse,
+  which is why no benchmark column has ever wedged.
+
+- **9P `trans=fd`, no longer waiting on a relay.** It was deferred twice, and
+  both premises are gone. `.agents/9p-plan.md` deferred it because Node
+  supposedly cannot create a socketpair without native code; that is **false**,
+  and verified on this host — libuv's `stdio: "pipe"` on POSIX _is_
+  `socketpair(AF_UNIX, SOCK_STREAM)`, the child's inherited fd reads
+  `socket:[…]`, and the parent end is a full-duplex `net.Socket` that
+  round-trips bytes. This file deferred it again because it wanted a descriptor
+  only a relay would hold; with relay cut down to a worker that holds nothing of
+  the sort, that no longer follows either. So `trans=fd` is reachable today with
+  no relay and no native code, and it is now an ordinary option to be judged on
+  its own merits. Two facts need one root mount each first: whether `mount(8)`
+  keeps an inherited socket fd open across `mount(2)`, and whether v9fs's
+  `trans=fd` drives an `AF_UNIX` stream.
 - **An NFSv4.1 bench column.** 9P has one now (`pnpm bench:9p`), which leaves
   v4.1 as the last transport that is in the conformance matrix and not in the
   benchmarks.
