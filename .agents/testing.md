@@ -112,6 +112,16 @@ rclone`/`curl` and needing no root, so it runs as part of `pnpm test` and skips
   clean when either binary is absent. That is the file that catches a symmetric
   misreading of RFC 4918, the same role rclone plays for the S3 gateway. **No
   conformance column yet** — see Known gaps.
+- `test/webdav/mount.test.ts` — Tier 2, and the only test in the package that puts a
+  **kernel** in front of this server: `mount.davfs` (davfs2, over FUSE) mounts the
+  share and the workload is ordinary syscalls, not WebDAV. Gated on the in-file
+  `davfsClientProbe()` — Linux, `mount.davfs`, `/dev/fuse`, and root, since davfs2
+  refuses an unprivileged caller without an `/etc/fstab` entry — so it is sudo only
+  (`pnpm test:webdav:mount` / `pnpm test:root`) and skips clean everywhere else. Two
+  facts shape it, both in `.agents/environment.md`: davfs2 caches, so a driver-side
+  check is a bounded poll and the read path is proved by seeding the driver _before_
+  mounting; and teardown is `umount -i`, because the `umount.davfs` helper waits on a
+  daemon that a container with no reaping init never reaps.
 - `test/auto.test.ts` — Tier 0 for `mountx/auto`: the preference order and the
   ruled-out reasons, answered for darwin and win32 from any host via the `platform`
   override. `test/auto-mount.test.ts` — Tier 2, whichever transport this host chose.

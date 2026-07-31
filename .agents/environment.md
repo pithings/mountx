@@ -80,6 +80,17 @@
   **Use libnfs whenever the wire format changes**: it shares none of our
   codecs, which is exactly what the Tier-1 JS client — built from the server's
   own codecs — cannot give. `tshark` dissects the exchange to confirm.
+- **Half of that has changed, and it made `pnpm test:nfs:mount` go red
+  (2026-07-31).** `nfs` and `nfs4` are now in `/proc/filesystems` — the client
+  module is loaded — while there is still **no `mount.nfs` binary anywhere**. So
+  `nfsClientProbe()` now reports usable and the Tier-2 suite stops skipping, but
+  every mount fails at `mount(8)`: `fsconfig() failed: NFS: Server address does
+not match proto= option`, exit 32, 4 failed. Reproduced with
+  `pnpm test:nfs:mount` on a tree carrying no NFS changes, so it is the host and
+  not a regression. Two things follow: the probe's kernel test is not sufficient
+  on its own — a loaded module without the userland helper is a state it does not
+  distinguish — and `pnpm test:root` is red on this host until one of the two is
+  addressed.
 
 ## 9P mounting (verified 2026-07-29, this Linux host)
 
@@ -407,6 +418,106 @@ until something asks:
   rclone reads as "not a plain MD5": it reports `N hashes could not be checked`
   and falls back to **size plus modification time**. `--size-only` is the
   comparison with no hash in it at all.
+
+## davfs2, the WebDAV mount client (installed 2026-07-31, this Linux host)
+
+`test/webdav/mount.test.ts` is the one Tier-2 column that needs it. **`pnpm
+test:webdav:mount` passes**: 5 passed, 2 skipped, ~0.2 s of tests.
+
+- **`/usr/sbin/mount.davfs`, davfs2 1.7.3**, from `sudo dnf install davfs2`
+  (pulls `neon` 0.37.1 and `libntlm`; creates the `davfs2` user and group). It
+  needs **no kernel module of its own**: davfs2 mounts through **FUSE**, which
+  this host already has, and the mount table line names the share as its source:
+
+  ```
+  http://127.0.0.1:37487/ /tmp/…/mnt fuse rw,nosuid,nodev,relatime,user_id=0,group_id=0,allow_other,max_read=65536 0 0
+  ```
+
+- **It needs root, and that is davfs2's rule rather than the kernel's.**
+  `mount.davfs` is `-rwsr-xr-x root root`, but an unprivileged caller is refused
+  with `no entry for <path> found in /etc/fstab` — the unprivileged route wants
+  an `/etc/fstab` line plus `davfs2` group membership, neither of which a test
+  may arrange. So this column is sudo-only, like 9P. Nothing about the _server_
+  needs privilege: it is an ordinary user's process on an ordinary TCP socket.
+- **The configuration goes in a file passed with `-o conf=`**, so
+  `/etc/davfs2/davfs2.conf` is neither read nor written — the same
+  "configuration entirely outside the developer's own" trick
+  `test/webdav/oracle.test.ts` plays with `RCLONE_CONFIG=""`. The mount line the
+  suite uses, verbatim:
+
+  ```sh
+  mount.davfs http://127.0.0.1:PORT/ /mnt/point -o conf=…/davfs2.conf,rw,uid=0,gid=0
+  ```
+
+- **A class-1 share is fully writable, with `use_locks` left on.** davfs2 sends
+  `OPTIONS` first, reads `DAV: 1, 3`, prints `mount.davfs: warning: the server
+does not support locks` and mounts read-write anyway. **Not one `LOCK` reaches
+  the server** — verified by shadowing `session.handleRequest` and counting. So
+  the class-2 gap costs nothing here; macOS's `mount_webdav` is the client that
+  insists, and it is a different client.
+- **HTTP Basic works through the mount.** `-o username=ada` with the password on
+  the helper's stdin mounts; a wrong password fails the mount outright with
+  `Could not authenticate to server: rejected Basic challenge`, which is the
+  server's `401` being read rather than the client guessing.
+- **`umount` hangs in this container, and `umount -i` does not.** Plain `umount`
+  runs `/sbin/umount.davfs`, which unmounts and _then_ polls until the
+  `mount.davfs` daemon leaves the process table. The daemon exits immediately,
+  but this container's pid 1 is not an init and never reaps it, so it sits there
+  `Z` forever and the helper waits forever with it. `umount -i` skips the helper,
+  issues the same `umount(2)`, and returns in ~9 ms with the table clear. This is
+  a container artefact, not a davfs2 defect — but the suite uses `-i`
+  unconditionally, because the helper's wait buys nothing it needs.
+- **No wedge risk, unlike FUSE.** With the server killed under a live mount,
+  metadata is still answered from cache, a read that needs the network fails
+  immediately with `EAGAIN` (`Resource temporarily unavailable`) rather than
+  parking, and a plain `umount -i` still returns 0. Nothing here needs
+  `umount -f`, `fusectl` or an abort.
+- **The one leak `umount -i` does leave is the cache.** davfs2 keeps a per-mount
+  cache at `/var/cache/davfs2/<host>+<mountpoint with the slashes turned into
+dashes>+<owner>`, and `umount.davfs` is what would remove it. The suite removes
+  its own by matching the `mkdtemp` basename. `cache_dir` in the config **cannot**
+  redirect it into the test's temp tree: the daemon drops to uid 998 (`davfs2`)
+  and cannot traverse a `0700` `mkdtemp` chain — `mount.davfs: can't open cache
+directory …`.
+- **Timings, this host:** mount ~20 ms, first listing ~1 ms, `umount -i` ~9 ms.
+  A write returns as soon as it is cached and the `PUT` follows on `close(2)`,
+  landing on the driver **1–3 ms** later with `delay_upload 0` (the default is a
+  ten-second delay). That gap is why every driver-side assertion is a bounded
+  poll.
+- **Its cache also means a read-back proves nothing by itself**: a file this
+  mount just wrote is served from cache and the server sees no `GET` at all (one
+  `GET` and one `HEAD` across an entire exploratory workload). The read path is
+  only real for files written to the driver **before** the mount existed, which
+  is how the suite tests it.
+- **What davfs2 actually sends.** One exploratory workload — trees, appends,
+  truncate, rename-over, `cp -r`, `rm -rf`, 16 MiB both ways, 40-file
+  directories, `df`, `touch`, `chmod`:
+
+  ```
+  PUT=75 PROPFIND=19 MKCOL=17 DELETE=10 MOVE=2 PROPPATCH=1 OPTIONS=1 HEAD=1 GET=1
+  ```
+
+  **Every reply was 2xx** — 201/204 for `PUT`, 207 for `PROPFIND`, 201 for
+  `MKCOL`, 204 for `DELETE` — so this client found no fault in the server.
+
+- **Verified through the mount, all passing**: read/write/`mkdir`/rename/
+  `unlink`/`rmdir`; 1 MiB and 16 MiB files byte-exact in both directions; a
+  positional read at a 512 KiB offset; append, `truncate`, rename-over-existing,
+  `cp -r`, `rm -rf`; a 4-deep tree; 40-entry listings through `readdir` and
+  through `ls` in a separate process; `ENOENT`/`ENOTDIR`/`ENOTEMPTY`/`EEXIST`;
+  `df` (statfs, answered from the RFC 4331 quota properties); and names carrying
+  a space, `+ # ? % & ' ; @ = [ ] ~` and non-ASCII (`naïve`, `¥`, `日本語`) —
+  every one round-tripped byte-exact, so the target↔`href` escaping holds against
+  paths a VFS chose.
+- **Three things WebDAV cannot carry, and they are not bugs.** `symlink` is
+  `ENOSYS` and `link` is `EPERM` (no method exists for either); `chmod` and
+  `utimes` succeed through the mount but never reach the driver — davfs2 keeps
+  the mode locally, and `touch` produces a `PROPPATCH` that this server answers
+  `207` with a `403` propstat inside, exactly as `src/webdav/session.ts` says it
+  will for a server with no dead properties.
+- **davfs2 shows a synthetic `lost+found` at the root of the mount** that does
+  not exist on the driver (its cache's orphan directory). Anything asserting on a
+  root listing has to allow for it — the suite works in subdirectories instead.
 
 ## macOS host (verified 2026-07-28)
 
