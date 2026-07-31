@@ -31,8 +31,11 @@
  * - **No dead properties.** A driver stores bytes and inode metadata; there is
  *   nowhere to keep an arbitrary XML property without inventing a sidecar file
  *   that would then show up in every listing. `PROPPATCH` therefore answers
- *   `403 cannot-modify-protected-property` for everything, which is the
- *   truthful answer for a server whose properties are all live and all derived.
+ *   `403 cannot-modify-protected-property` for every property but one, which is
+ *   the truthful answer for a server whose properties are all live and all
+ *   derived. The exception is `getlastmodified`, which is live *and* writable
+ *   because the driver interface has a call for it (`utimes`) — and only on a
+ *   driver declaring the `times` capability.
  * - **Conditional requests on `GET`, `HEAD` and `PUT` only.** RFC 9110's four
  *   — `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` —
  *   are evaluated there, by the same `src/http.ts` code `mountx/s3` uses over
@@ -152,6 +155,7 @@ import {
   formatHttpDate,
   formatIsoDate,
   parseETagList,
+  parseHttpDate,
   parseRange,
 } from "../http.ts";
 import { basename, dirname, isPathInside, joinPath } from "../path.ts";
@@ -197,6 +201,7 @@ import {
   type IfList,
   type MultistatusEntry,
   type Propstat,
+  type ProppatchSet,
   type WebdavRequestHead,
   type WebdavResponse,
 } from "./protocol.ts";
@@ -319,6 +324,52 @@ interface Failure {
   path: string;
   collection: boolean;
   status: number;
+}
+
+/**
+ * What a `PROPPATCH` decided about one property, before anything was written.
+ *
+ * `apply` is present exactly when `status` is `200`, and it is deliberately not
+ * called until every instruction has one of these: §9.2 makes the method atomic
+ * ("instructions MUST either all be executed or none executed"), so a request
+ * that names one property this server can store and one it cannot must store
+ * neither.
+ */
+interface PropertyOutcome {
+  name: string;
+  status: number;
+  /** A §16 condition for the propstat this outcome lands in. */
+  condition?: string;
+  /** The write itself, run only if nothing in the request failed. */
+  apply?: () => Promise<void>;
+}
+
+/**
+ * Group the outcomes into `propstat` blocks, in document order.
+ *
+ * §9.2.1's atomicity rule turned into a document: "note that if [200] appears
+ * for one property, it appears for every property in the response, due to the
+ * atomicity of PROPPATCH" — so when anything failed, the properties that *would*
+ * have succeeded become `424 Failed Dependency`, "the property change could not
+ * be made because of another property change that failed". One block per
+ * (status, condition) pair, because a `propstat` is defined as the properties
+ * that share a status.
+ */
+function propstatsOf(outcomes: readonly PropertyOutcome[], blocked: boolean): Propstat[] {
+  const propstats: Propstat[] = [];
+  for (const outcome of outcomes) {
+    const status = blocked && outcome.status === 200 ? 424 : outcome.status;
+    const condition = status === 424 ? undefined : outcome.condition;
+    const existing = propstats.find(
+      (propstat) => propstat.status === status && propstat.condition === condition,
+    );
+    if (existing === undefined) {
+      propstats.push({ status, condition, props: [{ name: outcome.name }] });
+    } else {
+      existing.props.push({ name: outcome.name });
+    }
+  }
+  return propstats;
 }
 
 /**
@@ -1387,22 +1438,82 @@ export class WebdavSession {
     const stats = await this.#stat(path);
     // §7's list of what a write lock covers names PROPPATCH explicitly.
     this.#requireWritable(path, guard);
-    const names = [...request.set, ...request.remove];
+    /* Document order, which §9.2 makes normative, and one outcome per
+       instruction before anything is written — because the write only happens
+       if *every* instruction can succeed. */
+    const outcomes: PropertyOutcome[] = [
+      ...request.set.map((instruction) => this.#settable(instruction, path, stats)),
+      ...request.remove.map((name) => ({
+        name,
+        status: 403,
+        condition: "cannot-modify-protected-property",
+      })),
+    ];
+    const blocked = outcomes.some((outcome) => outcome.status !== 200);
+    if (!blocked) {
+      for (const outcome of outcomes) {
+        /* v8 ignore next 3 -- every `200` outcome carries an `apply`; the guard
+           is what keeps that a fact rather than an assumption. */
+        if (outcome.apply !== undefined) {
+          await outcome.apply();
+        }
+      }
+    }
     return xmlBody(
       207,
       encodeMultistatus([
-        {
-          href: hrefOf(path, stats.isDirectory()),
-          propstat: [
-            {
-              status: 403,
-              props: names.map((name) => ({ name })),
-              condition: "cannot-modify-protected-property",
-            },
-          ],
-        },
+        { href: hrefOf(path, stats.isDirectory()), propstat: propstatsOf(outcomes, blocked) },
       ]),
     );
+  }
+
+  /**
+   * What one `<set>` instruction can do here: store it, or say why not.
+   *
+   * **`getlastmodified` is the one property this server can write**, and it can
+   * only because the driver interface has a call for it: `utimes`. Everything
+   * else is either live and derived — `getetag`, `getcontentlength`,
+   * `resourcetype`, which §15 calls protected outright — or dead, and a dead
+   * property needs a store the driver interface does not have (see the module
+   * docs). Both answer `403` with §9.2.1's `cannot-modify-protected-property`.
+   *
+   * The two refusals that are not that one:
+   *
+   * - **`409`** for a value that is not an `HTTP-date` (§15.7 defines the
+   *   property as one). §9.2.1 defines that status as
+   *   "the client has provided a value whose semantics are not appropriate for
+   *   the property", which is exactly a `getlastmodified` that does not parse.
+   * - **`403`** again, for a driver that cannot keep it: `times` is a declared-
+   *   or-inferred capability (`AGENTS.md`, invariant 5), and on a driver
+   *   without it `getlastmodified` really *is* protected — it is whatever the
+   *   `stat` says and no request can change that. Answering `200` and dropping
+   *   the value on the floor is the one thing that must not happen.
+   *
+   * The `atime` handed to `utimes` is the resource's own, from the `stat` this
+   * request already took: RFC 4918 has no property for it, so a `PROPPATCH`
+   * that changed it would be changing something the client never named.
+   */
+  #settable(instruction: ProppatchSet, path: string, stats: StatsLike): PropertyOutcome {
+    const { name, text } = instruction;
+    if (name !== "getlastmodified") {
+      return { name, status: 403, condition: "cannot-modify-protected-property" };
+    }
+    if (!this.driver.capabilities.times) {
+      return { name, status: 403, condition: "cannot-modify-protected-property" };
+    }
+    const at = parseHttpDate(text.trim());
+    if (at === undefined) {
+      /* No §16 condition: there is none for a bad value, and inventing one
+         would be a machine-readable claim about a rule that does not exist. */
+      return { name, status: 409 };
+    }
+    return {
+      name,
+      status: 200,
+      apply: async () => {
+        await this.driver.utimes(path, new Date(stats.atimeMs), new Date(at));
+      },
+    };
   }
 
   // -------------------------------------------------------------------------

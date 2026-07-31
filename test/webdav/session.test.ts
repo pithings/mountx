@@ -706,17 +706,17 @@ describe("PROPFIND", () => {
 // ---------------------------------------------------------------------------
 
 describe("PROPPATCH", () => {
-  it("names every property with 403 and the condition that explains it", async () => {
+  it("names every property with its own status and the condition that explains it", async () => {
     const reply = await request(session, "PROPPATCH", "/dir/file.txt", {
       body:
         `<D:propertyupdate xmlns:D="DAV:">` +
-        `<D:set><D:prop><D:getlastmodified>x</D:getlastmodified></D:prop></D:set>` +
+        `<D:set><D:prop><D:displayname>x</D:displayname></D:prop></D:set>` +
         `<D:remove><D:prop><Z:mine xmlns:Z="urn:z"/></D:prop></D:remove>` +
         `</D:propertyupdate>`,
     });
     expect(reply.status).toBe(207);
     expect(statuses(reply.text)).toEqual([403]);
-    expect(reply.text).toContain("<getlastmodified></getlastmodified>");
+    expect(reply.text).toContain("<displayname></displayname>");
     expect(reply.text).toContain("<mine></mine>");
     expect(reply.text).toContain("<cannot-modify-protected-property>");
   });
@@ -726,6 +726,80 @@ describe("PROPPATCH", () => {
       body: `<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:a/></D:prop></D:set></D:propertyupdate>`,
     });
     expect(reply.status).toBe(404);
+  });
+
+  it("stores getlastmodified through utimes, which is the one property it can", async () => {
+    const when = "Sun, 06 Nov 1994 08:49:37 GMT";
+    const reply = await request(session, "PROPPATCH", "/dir/file.txt", {
+      body:
+        `<D:propertyupdate xmlns:D="DAV:">` +
+        `<D:set><D:prop><D:getlastmodified>${when}</D:getlastmodified></D:prop></D:set>` +
+        `</D:propertyupdate>`,
+    });
+    expect(reply.status).toBe(207);
+    expect(statuses(reply.text)).toEqual([200]);
+    expect(reply.text).not.toContain("cannot-modify-protected-property");
+    // The driver really has it, and a GET reports it back.
+    expect((await driver.stat("/dir/file.txt")).mtimeMs).toBe(Date.parse(when));
+    expect((await request(session, "HEAD", "/dir/file.txt")).headers["last-modified"]).toBe(when);
+  });
+
+  it("is 409 for a value that is not an HTTP-date (§9.2.1)", async () => {
+    const reply = await request(session, "PROPPATCH", "/dir/file.txt", {
+      body:
+        `<D:propertyupdate xmlns:D="DAV:">` +
+        `<D:set><D:prop><D:getlastmodified>last Tuesday</D:getlastmodified></D:prop></D:set>` +
+        `</D:propertyupdate>`,
+    });
+    expect(statuses(reply.text)).toEqual([409]);
+    expect((await driver.stat("/dir/file.txt")).mtimeMs).not.toBe(Number.NaN);
+  });
+
+  it("is atomic: one failure makes the settable property 424 and writes nothing", async () => {
+    /* §9.2: "instructions MUST either all be executed or none executed", and
+       §9.2.1 spells out the reply — a property that would have succeeded
+       becomes 424 Failed Dependency. */
+    const before = (await driver.stat("/dir/file.txt")).mtimeMs;
+    const reply = await request(session, "PROPPATCH", "/dir/file.txt", {
+      body:
+        `<D:propertyupdate xmlns:D="DAV:">` +
+        `<D:set><D:prop>` +
+        `<D:getlastmodified>Sun, 06 Nov 1994 08:49:37 GMT</D:getlastmodified>` +
+        `<D:getetag>"whatever"</D:getetag>` +
+        `</D:prop></D:set>` +
+        `</D:propertyupdate>`,
+    });
+    expect(statuses(reply.text)).toEqual([424, 403]);
+    expect((await driver.stat("/dir/file.txt")).mtimeMs).toBe(before);
+  });
+
+  it("refuses getlastmodified on a driver that cannot keep it", async () => {
+    /* Declared-or-inferred, never faked: without `times` the property really is
+       protected here, and answering 200 would be storing nothing. */
+    const { utimes: _utimes, ...timeless } = driver as FsDriver & { utimes?: unknown };
+    const reply = await request(
+      new WebdavSession(timeless as FsDriver),
+      "PROPPATCH",
+      "/dir/file.txt",
+      {
+        body:
+          `<D:propertyupdate xmlns:D="DAV:">` +
+          `<D:set><D:prop><D:getlastmodified>Sun, 06 Nov 1994 08:49:37 GMT</D:getlastmodified></D:prop></D:set>` +
+          `</D:propertyupdate>`,
+      },
+    );
+    expect(statuses(reply.text)).toEqual([403]);
+    expect(reply.text).toContain("<cannot-modify-protected-property>");
+  });
+
+  it("removes nothing: a live property cannot be removed either", async () => {
+    const reply = await request(session, "PROPPATCH", "/dir/file.txt", {
+      body:
+        `<D:propertyupdate xmlns:D="DAV:">` +
+        `<D:remove><D:prop><D:getlastmodified/></D:prop></D:remove>` +
+        `</D:propertyupdate>`,
+    });
+    expect(statuses(reply.text)).toEqual([403]);
   });
 });
 

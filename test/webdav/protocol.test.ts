@@ -259,7 +259,7 @@ describe("parseProppatch", () => {
             `</D:propertyupdate>`,
         ),
       ),
-    ).toEqual({ set: ["displayname"], remove: ["mine"] });
+    ).toEqual({ set: [{ name: "displayname", text: "x" }], remove: ["mine"] });
   });
 
   it("ignores a child that is neither set nor remove", () => {
@@ -270,7 +270,7 @@ describe("parseProppatch", () => {
             `<set><prop><displayname/></prop></set></propertyupdate>`,
         ),
       ),
-    ).toEqual({ set: ["displayname"], remove: [] });
+    ).toEqual({ set: [{ name: "displayname", text: "" }], remove: [] });
   });
 
   it("refuses a body naming nothing", () => {

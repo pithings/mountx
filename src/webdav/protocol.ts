@@ -762,17 +762,34 @@ export function parsePropfind(body: Uint8Array): PropfindRequest {
   return { kind: "prop", names };
 }
 
+/** One `<set>` instruction: a property name and the value it was given. */
+export interface ProppatchSet {
+  name: string;
+  /**
+   * The element's text content, which is the whole value for every property
+   * this server can store — `getlastmodified` is an `HTTP-date` (§15.7) and
+   * nothing else is settable. A property whose value is *markup* keeps only its
+   * text here, which is enough to refuse it and not enough to store it; that is
+   * the same limit as "no dead properties" seen from the parser.
+   */
+  text: string;
+}
+
 /**
  * The properties a `PROPPATCH` body wants written or removed (RFC 4918 §9.2).
  *
- * Both lists are kept even though this server writes neither: the reply has to
- * name **every** property the request did, each with its own status, and a
+ * Both lists are kept whether or not this server can act on them: the reply has
+ * to name **every** property the request did, each with its own status, and a
  * `remove` that vanished from the reply would be a `207` that silently agreed
  * to it.
+ *
+ * The order is the document's, which §9.2 makes normative ("servers MUST
+ * process PROPPATCH instructions in document order (an exception to the normal
+ * rule that ordering is irrelevant)").
  */
 export interface ProppatchRequest {
-  /** Property names under `<set>`, in request order. */
-  set: string[];
+  /** Property names and values under `<set>`, in request order. */
+  set: ProppatchSet[];
   /** Property names under `<remove>`, in request order. */
   remove: string[];
 }
@@ -784,17 +801,22 @@ export interface ProppatchRequest {
  */
 export function parseProppatch(body: Uint8Array): ProppatchRequest {
   const root = parseDocument(body, "propertyupdate");
-  const set: string[] = [];
+  const set: ProppatchSet[] = [];
   const remove: string[] = [];
   for (const child of root.children) {
-    const into = child.name === "set" ? set : child.name === "remove" ? remove : undefined;
-    if (into === undefined) {
+    const setting = child.name === "set";
+    if (!setting && child.name !== "remove") {
       continue;
     }
     for (const prop of child.children) {
-      if (prop.name === "prop") {
-        for (const property of prop.children) {
-          into.push(property.name);
+      if (prop.name !== "prop") {
+        continue;
+      }
+      for (const property of prop.children) {
+        if (setting) {
+          set.push({ name: property.name, text: property.text });
+        } else {
+          remove.push(property.name);
         }
       }
     }
