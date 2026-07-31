@@ -100,8 +100,11 @@ rather than by accident.
 - **xattr and the rest of the `mountx.*` extension namespace** (byte-range
   locks, `fallocate`/`lseek`, cache-invalidation `notify`) — `ENOTSUP` until a
   real user needs one.
-- **NFS `CREATE` with `EXCLUSIVE`** — currently `NFS3ERR_NOTSUPP`; the verifier
-  would have to be stored somewhere that survives a retry.
+- **`suppattr_exclcreat` (75) is still unadvertised** in `src/nfs/v4/attr.ts`'s
+  `SUPPORTED_ATTRS`. Exclusive create shipped, and its verifier lives beside the
+  file rather than in an attribute, so the honest value is now the full settable
+  set — the attribute's "deliberately absent, it is the OPEN step's call" note
+  predates the OPEN step having made it.
 - **FUSE over io_uring** (Linux 6.14+) — would replace the read/reply loop with
   a shared ring and obsolete the threadpool discussion entirely; the transport
   layer should stay swappable so this is one file, not a rewrite.
@@ -119,17 +122,16 @@ rather than by accident.
   mounting one rather than serving one; the natural follow-up to the S3 gateway
   transport. It would reuse `test/s3/client.ts`'s signing client instead of
   writing a second one. Not started.
-- **Handle-table growth bound.** Neither NFS version has a `FORGET`, so nothing
-  tells the server a client is done with a handle. Half of this is closed:
-  `FileHandleTable.#detachPath` drops an entry once its last path is detached,
-  so create/delete churn under a mount no longer grows the table without bound.
-  What is left is genuinely bounded: **one entry per path a client currently has
-  a name for**, held for the life of the server however long ago the client
-  looked, plus the root entry, which is exempt from eviction because
-  `PUTROOTFH`/`PUTPUBFH`/`MNT` encode it from a field rather than from a lookup.
-  A generation-stamped LRU is the fix if a workload needs a bound on _that_ — it
-  is the only remaining growth, and the one an LRU can serve without breaking a
-  live client.
+- **A default for `maxHandles`.** The bound itself shipped — the handle table
+  evicts least-recently-used past the cap, root exempt — but the cap is opt-in,
+  so out of the box the table is still one entry per path a client currently has
+  a name for, held for the life of the server. It is opt-in because an eviction
+  costs an NFSv4.1 client more than a re-`LOOKUP`: `src/nfs/v4/session.ts` keys
+  open and lock state by entry id, so evicting a handle a client has open costs
+  it an `OPEN` as well. Pinning entries with live v4 state — and only then
+  picking a default — is what is left. A directly constructed `Nfs3Session` /
+  `Nfs4Session` also builds its own table and ignores the option; every public
+  path goes through the router, so this is the tests and the CLI only.
 - **Set-gid inheritance on the FUSE session.** The rule itself now exists —
   `src/ownership.ts`, a transcription of `inode_init_owner()` — and both NFS
   sessions apply it: a new entry in a set-gid directory takes the parent's
