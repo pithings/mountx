@@ -43,6 +43,8 @@ import {
   type NfsServerOptions,
 } from "../../src/nfs/server.ts";
 import {
+  NFS3_OK,
+  NFS3ERR_STALE,
   NFS_PROGRAM,
   NFS_V3,
   NFSPROC3_GETATTR,
@@ -292,6 +294,65 @@ describe("reply ordering", () => {
       expect(result.status).toBe(0);
     }
     expect(new Set(settled).size).toBe(slowNames.length + fastNames.length);
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+
+describe("the handle table bound", () => {
+  it("evicts a handle the client stopped using, and says `ESTALE` about it", async () => {
+    // The third bound, and the only one that is off by default: `maxRecord`
+    // bounds one record and `maxInFlight` bounds the answers in flight, but the
+    // handle table grows for the *life of the server*, one entry per path a
+    // client has a name for, and no NFS message ever says a name is finished
+    // with. What a cap costs is here rather than in `handles.test.ts`, because
+    // it is a cost paid by a client rather than by the table: a handle it kept
+    // stops working, and the recovery is the ordinary `ESTALE` one.
+    const driver = createMemoryDriver();
+    const loopback = createLoopback(driver);
+    for (let index = 0; index < 8; index++) {
+      await loopback.writeFile(`/f${index}.txt`, "x");
+    }
+    // The root plus two files, which the walk below overruns immediately.
+    const server = await serve(driver, { maxHandles: 3 });
+    const client = await connect(server);
+
+    const root = check(await client.mnt("/"), "mnt").fh!;
+    const kept = check(await client.lookup(root, "f0.txt"), "lookup").object!;
+    expect((await client.getattr(kept)).status).toBe(NFS3_OK);
+
+    for (let index = 1; index < 8; index++) {
+      check(await client.lookup(root, `f${index}.txt`), "lookup");
+    }
+
+    // The client still holds the handle; the server does not.
+    expect((await client.getattr(kept)).status).toBe(NFS3ERR_STALE);
+    // And the recovery a Linux client already performs for `ESTALE` — drop the
+    // dentry, look the name up again — gets it a working handle back.
+    const again = check(await client.lookup(root, "f0.txt"), "lookup").object!;
+    expect((await client.getattr(again)).status).toBe(NFS3_OK);
+    // The root is in that three, and is never the one evicted.
+    expect(server.session.handles.size).toBe(3);
+    expect((await client.getattr(root)).status).toBe(NFS3_OK);
+  }, 30_000);
+
+  it("keeps every handle it ever handed out when no cap is asked for", async () => {
+    const driver = createMemoryDriver();
+    const loopback = createLoopback(driver);
+    for (let index = 0; index < 8; index++) {
+      await loopback.writeFile(`/f${index}.txt`, "x");
+    }
+    const server = await serve(driver);
+    const client = await connect(server);
+
+    const root = check(await client.mnt("/"), "mnt").fh!;
+    const kept = check(await client.lookup(root, "f0.txt"), "lookup").object!;
+    for (let index = 1; index < 8; index++) {
+      check(await client.lookup(root, `f${index}.txt`), "lookup");
+    }
+
+    expect((await client.getattr(kept)).status).toBe(NFS3_OK);
+    expect(server.session.handles.size).toBe(9);
   }, 30_000);
 });
 

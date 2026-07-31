@@ -223,6 +223,161 @@ describe("path-less entries", () => {
   });
 });
 
+/**
+ * The other half of the growth story: an entry whose names are all still live.
+ *
+ * Nothing on the wire ever says a client is done with one, so a cap is the only
+ * bound there can be — and evicting one is visible to the client, unlike
+ * dropping a path-less entry. What these check is that it is visible as
+ * `ESTALE` and never as somebody else's file.
+ */
+describe("the handle-table bound", () => {
+  it("grows without limit unless a cap is asked for", () => {
+    const table = new FileHandleTable();
+    for (let index = 0; index < 200; index++) {
+      table.bind(`/f${index}`, stats(100 + index));
+    }
+    expect(table.size).toBe(201);
+    expect(table.pathCount).toBe(201);
+  });
+
+  it("evicts the least recently used, and only past the cap", () => {
+    // Root plus three.
+    const table = new FileHandleTable({ maxHandles: 4 });
+    const a = table.bind("/a", stats(2));
+    const b = table.bind("/b", stats(3));
+    const c = table.bind("/c", stats(4));
+    const gone = table.encode(b);
+    expect(table.size).toBe(4);
+
+    // Using `/a` makes `/b` the oldest, which is the whole point of stamping
+    // recency on `decode` rather than only on `bind`.
+    expect(table.decode(table.encode(a))).toBe(a);
+    table.bind("/d", stats(5));
+
+    expect(table.size).toBe(4);
+    expect(table.get(b.id)).toBeUndefined();
+    expect(table.at("/b")).toBeUndefined();
+    expect(table.get(a.id)).toBe(a);
+    expect(table.get(c.id)).toBe(c);
+    // What the client that still holds `/b`'s handle is told.
+    expect(() => table.decode(gone)).toThrow(
+      expect.objectContaining({ code: "ESTALE", errno: -116 }),
+    );
+    expect(() => table.decode(gone)).toThrow(/unknown file handle/);
+  });
+
+  it("leaves an evicted handle stale however the identities line up afterwards", () => {
+    const table = new FileHandleTable({ maxHandles: 2 });
+    const evicted = table.bind("/a", stats(5));
+    const gone = table.encode(evicted);
+    table.bind("/b", stats(6));
+    expect(table.get(evicted.id)).toBeUndefined();
+
+    // The same `(dev, ino)`, straight back from the driver, at the same path:
+    // the evicted entry must not be found by identity, and the id it had must
+    // not come round again.
+    const fresh = table.bind("/a", stats(5));
+    expect(fresh).not.toBe(evicted);
+    expect(fresh.id).not.toBe(evicted.id);
+    expect(() => table.decode(gone)).toThrow(/unknown file handle/);
+    expect(table.pathOf(fresh)).toBe("/a");
+  });
+
+  it("never evicts an entry the client is working with", () => {
+    const table = new FileHandleTable({ maxHandles: 3 });
+    const keep = table.bind("/keep", stats(2));
+    const kept = table.encode(keep);
+    // Churn far past the cap, touching `/keep` the way a client holding its
+    // handle would.
+    for (let index = 0; index < 50; index++) {
+      table.bind(`/tmp${index}`, stats(100 + index));
+      expect(table.resolve(kept)).toBe("/keep");
+    }
+    expect(table.size).toBe(3);
+    expect(table.get(keep.id)).toBe(keep);
+  });
+
+  it("counts reaching an entry by path as a use", () => {
+    const table = new FileHandleTable({ maxHandles: 3 });
+    const dir = table.bind("/dir", stats(2, 2, S_IFDIR | 0o755));
+    for (let index = 0; index < 20; index++) {
+      table.bind(`/dir/f${index}`, stats(100 + index));
+      // What a READDIR paging through a directory does with it: reach the entry
+      // by path rather than by the handle the client sent.
+      expect(table.at("/dir")).toBe(dir);
+    }
+    expect(table.get(dir.id)).toBe(dir);
+  });
+
+  it("never evicts the root, whose handle is handed out without a lookup", () => {
+    const table = new FileHandleTable({ maxHandles: 2 });
+    for (let index = 0; index < 20; index++) {
+      table.bind(`/f${index}`, stats(100 + index));
+    }
+    expect(table.size).toBe(2);
+    expect(table.decode(table.encode(table.root))).toBe(table.root);
+    expect(table.pathOf(table.root)).toBe("/");
+  });
+
+  it("keeps the root and the entry being bound however small the cap is", () => {
+    const table = new FileHandleTable({ maxHandles: 1 });
+    const entry = table.bind("/a", stats(2));
+    // Two is the floor: the caller is about to encode `entry` into a reply, and
+    // the root is never evictable at all.
+    expect(table.size).toBe(2);
+    expect(table.resolve(table.encode(entry))).toBe("/a");
+  });
+
+  it("takes a cap that is not a usable count as no cap", () => {
+    for (const maxHandles of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const table = new FileHandleTable({ maxHandles });
+      for (let index = 0; index < 10; index++) {
+        table.bind(`/f${index}`, stats(100 + index));
+      }
+      expect(table.size, `maxHandles: ${maxHandles}`).toBe(11);
+    }
+  });
+
+  it("leaves the path map agreeing with the id map after an eviction", () => {
+    const table = new FileHandleTable({ maxHandles: 4 });
+    // A hardlinked pair, so the evicted entry has two names to lose at once.
+    const linked = table.bind("/a", stats(5, 2));
+    table.bind("/b", stats(5, 2));
+    expect(table.size).toBe(2);
+    table.bind("/c", stats(6));
+    table.bind("/d", stats(7));
+    table.bind("/e", stats(8));
+
+    expect(table.get(linked.id)).toBeUndefined();
+    expect(table.at("/a")).toBeUndefined();
+    expect(table.at("/b")).toBeUndefined();
+    // One path per surviving entry, plus the root's `/`.
+    expect(table.size).toBe(4);
+    expect(table.pathCount).toBe(4);
+  });
+
+  it("restamps a renamed subtree, and moves it whole", () => {
+    const table = new FileHandleTable({ maxHandles: 5 });
+    const stale = table.bind("/old", stats(2));
+    const dir = table.bind("/dir", stats(3, 2, S_IFDIR | 0o755));
+    const file = table.bind("/dir/f", stats(4));
+    const deep = table.bind("/dir/sub/g", stats(5));
+
+    table.remap("/dir", "/moved");
+    expect(table.pathOf(dir)).toBe("/moved");
+    expect(table.pathOf(file)).toBe("/moved/f");
+    expect(table.pathOf(deep)).toBe("/moved/sub/g");
+
+    // The rename touched all three, so the entry nobody has named since it was
+    // created is the one that goes.
+    table.bind("/new", stats(6));
+    expect(table.get(stale.id)).toBeUndefined();
+    expect(table.size).toBe(5);
+    expect(table.resolve(table.encode(deep))).toBe("/moved/sub/g");
+  });
+});
+
 describe("rename", () => {
   it("moves a path and everything under it", () => {
     const table = new FileHandleTable();

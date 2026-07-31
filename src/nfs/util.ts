@@ -136,6 +136,15 @@ export interface NfsSessionOptions {
   useDriverIno?: boolean;
   /** Boot verifier for file handles. Default: random, so restarts invalidate handles. */
   verifier?: Uint8Array;
+  /**
+   * Most file handle table entries to keep, the least recently used going
+   * first past it. Default: no cap, which is what this server has always done.
+   *
+   * An eviction costs the client holding that handle an `ESTALE` and a
+   * re-lookup — and an NFSv4.1 client that had the file open rather more than
+   * that. See `./handles.ts` before setting it.
+   */
+  maxHandles?: number;
   /** Largest `READ` answered. */
   rtmax?: number;
   /** Largest `WRITE` accepted. */

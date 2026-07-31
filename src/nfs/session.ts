@@ -156,6 +156,7 @@ export class NfsSession {
       handles: new FileHandleTable({
         useDriverIno: options.useDriverIno,
         verifier: options.verifier,
+        maxHandles: options.maxHandles,
       }),
       lock: new PathLock(),
       stats: newSessionStats(),
