@@ -444,11 +444,16 @@ function main(): void {
       "that case for want of `symlinks` long before privilege is reached, so the absence of a " +
       "pass is not evidence about the run's uid. Every column is run with root when root is " +
       "reachable, including the five that do not need it. A `mountx.*` requirement is left out " +
-      "of this table entirely: " +
-      "the suite calls an extension by name through `fs.mountx`, which only the loopback column " +
-      "has, so a skip everywhere else is a fact about how the case is written and not about what " +
-      "the transport carries (all four sessions do carry `mknod` — see the per-case rows below, " +
-      "and the FUSE column's own `mkfifo`/`mknod`/`bind` case over a real mount).",
+      "of this table entirely: the suite calls an extension by name through `fs.mountx`, so a " +
+      "skip is a fact about whether that column's client offers the name, not about what the " +
+      "transport carries. Two columns do offer it — the loopback one directly, and the 9P one " +
+      "because `Tmknod` carries the whole `mode` and `p9Driver` can hand it over unchanged. The " +
+      "rest skip for reasons of their own: FUSE drives a real mount with `node:fs` as the " +
+      "client, and `node:fs` cannot `mknod(2)`; NFSv3 and NFSv4.1 carry the file type in " +
+      "`ftype3`/`nfs_ftype4` rather than in the mode, so a client there could not offer the " +
+      "whole extension without deciding part of it itself; S3 has no way to name a FIFO at all. " +
+      "All four sessions do carry `mknod` — see the per-case rows below, and the FUSE column's " +
+      "own `mkfifo`/`mknod`/`bind` case over a real mount.",
   );
   push();
   push(
@@ -470,9 +475,10 @@ function main(): void {
     const missing = [...(unmet.get(column.key) ?? [])];
     // `root` is an environment fact, reported in its own cell. A `mountx.*`
     // requirement is neither a capability nor a loss: the suite reaches an
-    // extension by name through `fs.mountx`, which only the loopback column
-    // has — every other column is a client on the far side of a wire, and the
-    // wire has no such handle. A skip there says nothing about whether the
+    // extension by name through `fs.mountx`, and whether a column's client
+    // offers that name is a fact about the client. The loopback and 9P columns
+    // do; the others skip for reasons that are theirs rather than the
+    // session's (see the preamble above). A skip says nothing about whether the
     // transport carries the *operation* (all four sessions carry `mknod`), so
     // calling it a loss would be a claim the run cannot make in either
     // direction. The per-case rows below still show the skips.

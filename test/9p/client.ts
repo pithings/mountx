@@ -1103,8 +1103,34 @@ export function p9Driver(client: P9Client, root: number): FsDriver {
 
   return {
     // A fid is server-side open state that outlives the name it was opened
-    // from, and `Trenameat` is one server operation.
+    // from, and `Trenameat` is one server operation. `extensions` is inferred
+    // from the keys of `mountx` below, so it is not here.
     capabilities: { handles: true, atomicRename: true },
+
+    mountx: {
+      /**
+       * `Tmknod`, which is the one place this adapter offers a `mountx.*`
+       * member by name.
+       *
+       * It is not the extension crossing the wire — it is the wire operation
+       * that already exists wearing the name the driver interface has for it.
+       * 9P2000.L carries the whole `mode`, type bits included, and
+       * `P9Session.#mknod` hands it to `mountx.mknod` unchanged, so every
+       * answer the case sees is the far side's: the memory driver's own
+       * `EEXIST`, `ENOENT` and `EPERM`-for-a-directory, arriving as `Rlerror`.
+       * Nothing is decided here.
+       *
+       * `dev` comes apart the way `P9Session` puts it back together — one
+       * 8-bit split across the project — which is what makes the round trip
+       * through `major`/`minor` and back out of `Rgetattr`'s single `rdev[8]`
+       * worth testing at all.
+       */
+      async mknod(path, mode, dev) {
+        await withParent(path, "mknod", (fid, name) =>
+          client.mknod(fid, name, { mode, major: dev >>> 8, minor: dev & 0xff }),
+        );
+      },
+    },
 
     async stat(path) {
       return withFid(path, true, async (fid) => statsOf(await client.getattr(fid)));

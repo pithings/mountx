@@ -52,9 +52,16 @@ through its Tier-1 JS client, and FUSE contributes a real-mount column.
   passed a case naming it, not every one — the drivers sharing a column need not have
   the same capabilities now that `unstorage` runs beside `memory`. A `mountx.*`
   requirement is dropped from the "capabilities lost" table (not from the per-case
-  rows): the suite reaches an extension by name through `fs.mountx`, which only the
-  loopback column has, so a skip in a transport column is about how the case is
-  written and not about what the wire carries — all four sessions carry `mknod`.
+  rows): the suite reaches an extension by name through `fs.mountx`, and whether a
+  column's client offers that name is a fact about the client. Two do — the loopback
+  column directly, and the 9P one because `Tmknod` carries the whole `mode` and
+  `p9Driver.mountx.mknod` hands it over unchanged, so the special-files cases run
+  there against the memory targets. The rest skip for their own reasons: FUSE's
+  client is `node:fs`, which cannot `mknod(2)` (its column covers special files by
+  its own case and by pjdfstest instead); NFSv3 and NFSv4.1 put the file type in
+  `ftype3`/`nfs_ftype4` rather than in the mode, so a client there cannot offer the
+  whole extension without deciding part of it itself; S3 cannot name a FIFO. All
+  four sessions carry `mknod` either way.
 
 ## Per area
 
