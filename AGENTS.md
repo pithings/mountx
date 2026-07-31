@@ -125,7 +125,7 @@ install && pnpm dev` **from inside it**.
 | `architecture.md`          | the per-file map and the design reasoning behind it                         |
 | `invariants.md`            | the list above, in full, with the "why"                                     |
 | `testing.md`               | tiers, the conformance matrix, per-area test layout, known gaps             |
-| `roadmap.md`               | open work only: the decisions still binding, deferred work                  |
+| `roadmap.md`               | open work only: the decisions still binding, then open work by area         |
 | `environment.md`           | verified host facts (FUSE, 9P, VM guests, rclone, macOS) and wedge recovery |
 | `conformance-matrix.md`    | generated per-transport conformance table (`pnpm matrix`)                   |
 | `benchmarks.md`            | generated performance numbers and their interpretation (`pnpm bench`)       |
