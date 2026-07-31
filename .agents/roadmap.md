@@ -37,8 +37,10 @@ area whose code it changes, not the area that motivated it.
 - **`mountx/auto` never falls back after a mount failure**, and never probes
   when a transport is named. The probe decides from host facts, once — a silent
   second attempt would hand back different semantics than the error nobody saw.
-- **The S3 gateway stays out of `mountx/auto`.** Auto's whole contract is a
-  mountpoint and that transport never produces one.
+- **The two HTTP transports stay out of `mountx/auto`.** Auto's whole contract
+  is a mountpoint, and neither `mountx/s3` nor `mountx/webdav` produces one —
+  even though a WebDAV _client_ (`davfs2`, `mount_webdav`) can, which is a fact
+  about the host's tooling rather than something this package does.
 - **NLM byte-range locking is out of scope**, hence NFS mounts use `nolock`.
 - **Per-call caller credentials are not going into `FsDriver`.** The shape would
   be a `mountx.*` extension carrying the caller's uid/gid/groups into each
@@ -239,6 +241,48 @@ area whose code it changes, not the area that motivated it.
   attribute's "deliberately absent, it is the OPEN step's call" note predates
   the OPEN step making that call.
 
+## WebDAV
+
+- **No `LOCK`/`UNLOCK`, so the share is class 1.** This is the one gap with a
+  visible cost rather than a theoretical one: macOS's `mount_webdav` mounts a
+  class-1 share **read-only**, and the Windows redirector has its own
+  objections, so the transport that exists to be the unprivileged mount path
+  cannot yet be an unprivileged _writable_ mount path on either. What it needs
+  is a lock table (tokens, timeouts, depth-0 and depth-infinity scope) plus the
+  `If` header, which is the other half — a request proves it holds a lock by
+  carrying the token there, and implementing `If` without locks would be
+  answering a question nothing can ask. `src/9p/locks.ts` is the nearest
+  precedent for the table, though the semantics are not the same: 9P's are POSIX
+  byte ranges owned by a client/proc pair, WebDAV's are whole-resource (or
+  whole-subtree) and owned by a token the server minted.
+- **Requested properties lose their namespace.** `src/s3/xml.ts`'s parser
+  reports an element's local name and drops its prefix, which is right for the
+  grammar and wrong for a property in a namespace other than `DAV:` — Finder's
+  and Office's `Win32*` properties come back as bare local names in `DAV:`,
+  inside the `404` propstat. Bounded to properties this server does not have,
+  and fixing it means teaching that parser to track `xmlns` bindings, which is a
+  change to a module the S3 gateway depends on.
+- **No conditional requests.** `If-Match`, `If-None-Match`, `If-Modified-Since`
+  and `If-Unmodified-Since` are ignored rather than half-honoured. `mountx/s3`
+  implements RFC 9110's four over the same derived ETag, so the codec is
+  written; what is deliberate is the _timing_ — doing these without `If` would
+  leave the one header WebDAV adds as the conspicuous hole, so they arrive with
+  the locking work above.
+- **`PROPPATCH` cannot store anything.** Every property is refused with `403
+cannot-modify-protected-property`, which is truthful for a server whose
+  properties are all live, and is also what makes a client that sets
+  `Win32LastModifiedTime` (Finder, Explorer) report a failure it did not expect.
+  The cheap half is `getlastmodified` → `driver.utimes()` for a driver
+  declaring `times`; the expensive half is dead properties, which need a store
+  the driver interface does not have — a sidecar file would show up in every
+  listing.
+- **The two HTTP servers duplicate their transport mechanics.**
+  `src/webdav/server.ts` and `src/s3/server.ts` track connections, drain on
+  `close()` and write a streaming reply the same way, deliberately not shared
+  yet: the bind refusal's wording, the fallback error reply and the
+  authentication are each transport's own. If a third HTTP-shaped transport
+  appears, this is the duplication to remove first.
+
 ## Platforms
 
 - **AppleDouble sidecars are undocumented in `docs/`.** macOS tags every new
@@ -256,6 +300,10 @@ area whose code it changes, not the area that motivated it.
   into `kNetFSAlternatePortKey` and then never reads it — it goes to port 111
   and fails `ECONNREFUSED`, fatal for a server with no portmapper. Worth it only
   if someone actually needs the volume to appear where Finder puts one.
-- **WebDAV and Windows support.** Not designed against; WebDAV is the
-  unprivileged, zero-native-code path for macOS/Windows. Windows also has no
-  `mount(8)`, so it stays out of the NFS transport's platform switch.
+- **Windows is still not designed against.** `mountx/webdav` is the
+  unprivileged, zero-native-code path that could reach it — the Windows
+  redirector mounts a WebDAV share with no kernel module and no root — but
+  nothing here has been run on Windows, and the redirector wants class-2
+  locking before it will write (see the WebDAV section). Windows also has no
+  `mount(8)`, so it stays out of the NFS transport's platform switch either
+  way.

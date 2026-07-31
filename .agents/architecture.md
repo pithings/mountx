@@ -36,6 +36,7 @@ Deviations are noted per area below.
 | `lock.ts`      | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                 |
 | `subtree.ts`   | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                     |
 | `ownership.ts` | who a new entry belongs to: `inode_init_owner()`'s set-gid rule, plus the `lchown`/`chmod` that applies it. Internal; used by the two NFS sessions' `#claim`  |
+| `http.ts`      | RFC 9110's `HTTP-date`, `Range` and `ETag` quoting — the one copy, shared by the two HTTP transports; `mountx/s3` re-exports every symbol under its own name  |
 | `auto.ts`      | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                     |
 
 ### Drivers (`src/drivers/`)
@@ -122,6 +123,25 @@ is no RFC; everything is transcribed from Amazon's docs and named where it is us
 | `session.ts`   | one request in, one reply out, streaming **both ways**. Derived ETags, multipart staged under a reserved prefix                                                  |
 | `server.ts`    | loopback-only without credentials; ordered drain on `close()`                                                                                                    |
 
+## WebDAV (`src/webdav/`, exported as `mountx/webdav`)
+
+The other transport that is not a mount, and the one a kernel can mount anyway
+without root or native code (`davfs2`, `mount_webdav`, the Windows redirector).
+**RFC 4918 class 1** — every method but `LOCK`/`UNLOCK` — transcribed from the RFC,
+with RFC 9110 for the HTTP it rides on and RFC 4331 for the quota pair.
+
+| File           | What                                                                                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `constants.ts` | the errno → HTTP status table, typed **total** over `ErrnoCode` (the same shape as `s3/constants.ts`'s), the protocol's literals, and the `propstat` phrases |
+| `protocol.ts`  | pure: target ↔ `href` (decoded and encoded **per segment**), `Depth`/`Overwrite`/`Destination`, the two request grammars, `multistatus` and `error`          |
+| `session.ts`   | method semantics over one driver. No handle table and no `PathLock` — HTTP carries no per-connection state, so a request resolves its own paths and is done  |
+| `server.ts`    | the socket, and the only file here that imports `node:http`. Loopback-only without credentials; HTTP Basic with them                                         |
+
+The deliberate gaps, each recorded at its own definition: no locking (so the `DAV`
+header says `1, 3`, never `1, 2, 3`), no dead properties (`PROPPATCH` answers `403
+cannot-modify-protected-property` — a driver has nowhere to keep one), and no
+conditional requests (they arrive with `If`, which exists to carry lock tokens).
+
 ## CLI (`src/cli/`, the `mountx` bin, `pnpm mountx` from source)
 
 A demo and a test bench, not a mount tool: it mounts this package's own `README.md`
@@ -197,10 +217,24 @@ The facts no single file's header can own.
   after a failure, and no probe when a transport is named. `p9ModuleRefusal` lives
   there rather than in `9p/probe.ts` because it is a judgement call the no-fallback
   rule forces, not a fact about the host.
-- **`mountx/s3` is outside `auto` on purpose** — `auto`'s contract is a mountpoint,
-  and the gateway never produces one.
+- **`mountx/s3` and `mountx/webdav` are outside `auto` on purpose** — `auto`'s
+  contract is a mountpoint, and neither serving transport produces one. WebDAV is
+  the one whose _client_ can produce one (`davfs2`, `mount_webdav`), which is a fact
+  about the host's tooling rather than something this package does.
+- **`src/webdav/protocol.ts` imports `src/s3/xml.ts`.** The second deliberate
+  cross-transport dependency, after 9P→`fuse/flags.ts`, and the same argument: a
+  bounded XML encoder and a copying, DOCTYPE-refusing parser are facts about XML, not
+  about S3, and a second hardened parser is a second thing to get wrong. What it
+  costs is namespaces — the parser reports local names — which `webdav/protocol.ts`
+  documents in full at its header. `xml.ts` pulls in only `s3/constants.ts`, so
+  `mountx/webdav` does not load a signature or a chunked decoder.
+- **`src/http.ts` is the HTTP the two HTTP transports share** — `formatHttpDate` /
+  `parseHttpDate`, `parseRange` and the `Content-Range`/`ETag` spellings, all
+  RFC 9110. It was `src/s3/protocol.ts`'s until WebDAV needed the same three;
+  `s3/protocol.ts` re-exports every symbol under its old name, so `mountx/s3`'s
+  surface never moved.
 - **Platforms.** FUSE is Linux; 9P is Linux and root-only; NFS is Linux (root) and
-  macOS (no root, behind a consent gate); S3 is anywhere. macOS gets NFS by necessity
+  macOS (no root, behind a consent gate); S3 and WebDAV are anywhere. macOS gets NFS by necessity
   — macFUSE is a third-party kext with its own dialect, so `src/fuse/` cannot serve
   it.
 - **`memory.ts` is the only driver with `mountx.mknod`**, which is what keeps the

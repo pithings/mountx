@@ -50,6 +50,7 @@ describe("every entry point runs under node's type stripping", () => {
       "src/nfs/index.ts",
       "src/9p/index.ts",
       "src/s3/index.ts",
+      "src/webdav/index.ts",
       "src/drivers/memory.ts",
       "src/drivers/node-fs.ts",
       "src/drivers/unstorage.ts",

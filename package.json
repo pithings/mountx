@@ -44,6 +44,10 @@
       "types": "./dist/s3/index.d.mts",
       "default": "./dist/s3/index.mjs"
     },
+    "./webdav": {
+      "types": "./dist/webdav/index.d.mts",
+      "default": "./dist/webdav/index.mjs"
+    },
     "./drivers/memory": {
       "types": "./dist/drivers/memory.d.mts",
       "default": "./dist/drivers/memory.mjs"

@@ -98,6 +98,20 @@ test:9p:mount` / `pnpm test:root`) — 9P has no unprivileged route on any host,
   `oracle.test.ts` — a real `rclone`/`curl` against the gateway, gated on `command -v
 rclone`/`curl` and needing no root, so it runs as part of `pnpm test` and skips
   clean when either binary is absent.
+- `test/webdav/` — Tier 0/1, all of it socket-optional: `protocol.test.ts` (the two
+  request grammars, the `multistatus`/`error` documents, and the target↔`href`
+  mapping round-tripped — the security-relevant half, since a name is the only thing
+  that decides which resource a request reaches), `session.test.ts` (in-process
+  against the memory driver, no sockets: RFC 4918's per-method semantics, the `207`
+  partial-failure shapes for `DELETE` and `COPY`, Basic auth, and the one-reply
+  discipline), and `server.test.ts` (real sockets driven with `fetch` plus one raw
+  one: the bind gate, keep-alive, an unread body drained, a short body taking the
+  connection with it, and an abandoned download releasing its handle), plus
+  `oracle.test.ts` — a real `rclone` and `curl` against the server, gated on
+  `command -v` and needing no root, so it runs as part of `pnpm test` and skips
+  clean when either binary is absent. That is the file that catches a symmetric
+  misreading of RFC 4918, the same role rclone plays for the S3 gateway. **No
+  conformance column yet** — see Known gaps.
 - `test/auto.test.ts` — Tier 0 for `mountx/auto`: the preference order and the
   ruled-out reasons, answered for darwin and win32 from any host via the `platform`
   override. `test/auto-mount.test.ts` — Tier 2, whichever transport this host chose.
@@ -108,6 +122,14 @@ rclone`/`curl` and needing no root, so it runs as part of `pnpm test` and skips
   (gitignored) against a real mount and write `.agents/pjdfstest-results.md`.
 
 ## Known gaps
+
+- **No WebDAV conformance column.** `test/webdav/` pins the protocol thoroughly but
+  does not run the shared suite, because that needs an `FsDriver` built over the
+  WebDAV session the way `test/s3/client.ts` is over the S3 one — and a WebDAV client
+  can offer no `handles`, no `symlinks`, no `permissions` and no `truncate`, so most
+  of what the column would report is already known from the protocol. It is worth
+  writing anyway, for the same reason the S3 column was: the rows nobody predicted
+  are the point. Until then `pnpm matrix` has five columns, not six.
 
 - **No real-mount NFSv4.1 column.** Tier-2 `test/nfs/mount.test.ts` is v3-only; the
   dev host has no `mount.nfs` to write a v4.1 one against. The protocol is not

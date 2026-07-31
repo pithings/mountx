@@ -73,6 +73,7 @@ npx mountx
 - [Troubleshooting](https://mountx.vercel.app/guide/troubleshooting) — the things that will bite you, and how to recover.
 - [Transports](https://mountx.vercel.app/transports) — FUSE, 9P and NFS, what each costs, and how to pin one.
 - [S3 Gateway](https://mountx.vercel.app/transports/s3) — serve a driver as an S3-compatible bucket for `rclone`, the AWS CLI or an SDK, no mount involved.
+- [WebDAV](https://mountx.vercel.app/transports/webdav) — serve a driver over RFC 4918 to `rclone`, `curl` or `davfs2`, no mount involved either.
 - [Reference](https://mountx.vercel.app/reference) — every entry point, option and type.
 
 ## Development
