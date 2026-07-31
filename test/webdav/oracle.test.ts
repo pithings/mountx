@@ -309,17 +309,18 @@ describe.skipIf(curl === undefined)("curl against mountx/webdav", () => {
   );
 
   it(
-    "advertises class 1 and 3, and says so to an unauthenticated client too",
+    "advertises classes 1, 2 and 3, and says so to an unauthenticated client too",
     async () => {
       /* Field names go out lowercase — RFC 9110 §5.1 makes them
          case-insensitive and HTTP/2 requires lowercase, which is also what the
          S3 gateway sends — so the assertion is on the name as sent, not on a
          canonical casing nothing promises. */
       const headers = await curlRun("-i", "-o", "-", "-X", "OPTIONS", `${server.url}/`);
-      expect(headers.toLowerCase()).toContain("dav: 1, 3");
+      expect(headers.toLowerCase()).toContain("dav: 1, 2, 3");
       expect(headers.toLowerCase()).toContain("ms-author-via: dav");
-      // Class 2 is not advertised, and the method list says the same thing.
-      expect(headers).not.toContain("LOCK");
+      // Class 2 is advertised, and the method list says the same thing.
+      expect(headers).toContain("LOCK");
+      expect(headers).toContain("UNLOCK");
 
       const { stdout } = await run(
         curl as string,

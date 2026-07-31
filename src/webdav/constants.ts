@@ -29,18 +29,23 @@ import type { ErrnoCode } from "../errors.ts";
 export const DAV_NS = "DAV:";
 
 /**
- * The `DAV` response header this server sends: **class 1 and class 3**
+ * The `DAV` response header this server sends: **classes 1, 2 and 3**
  * (RFC 4918 §10.1, §18).
  *
- * Class 1 is "everything in RFC 4918 except locking". Class 3 is "this server
- * is RFC 4918 rather than RFC 2518", which is a statement about the *revision*
- * and is independent of locking. **Class 2 is deliberately absent**: there is
- * no `LOCK` here, and advertising a class whose methods answer `405` is exactly
- * the "capabilities are declared-or-inferred, never faked" rule (`AGENTS.md`,
- * invariant 5) applied to a protocol header. See `src/webdav/session.ts` for
- * which clients that costs.
+ * Class 1 is "everything in RFC 4918 except locking". Class 2 is `LOCK` and
+ * `UNLOCK` — the write locks of §6 and §7, both scopes, both depths, with the
+ * `If` header (§10.4) enforcing them. Class 3 is "this server is RFC 4918
+ * rather than RFC 2518", which is a statement about the *revision* and is
+ * independent of locking.
+ *
+ * Every one of those is answered rather than claimed: `supportedlock` lists the
+ * two lock entries §15.10 defines, `lockdiscovery` reports the locks that
+ * really are held, and a mutating request without the token it needs is `423`.
+ * That is the "capabilities are declared-or-inferred, never faked" rule
+ * (`AGENTS.md`, invariant 5) applied to a protocol header — which is why this
+ * said `1, 3` until the locks underneath it existed.
  */
-export const DAV_COMPLIANCE = "1, 3";
+export const DAV_COMPLIANCE = "1, 2, 3";
 
 /**
  * The header Microsoft's WebDAV redirector looks for before it will treat an
@@ -63,6 +68,8 @@ export const WEBDAV_METHODS = [
   "MOVE",
   "PROPFIND",
   "PROPPATCH",
+  "LOCK",
+  "UNLOCK",
 ] as const;
 
 /** One of {@link WEBDAV_METHODS}. */
@@ -109,6 +116,60 @@ export const MAX_XML_BYTES = 256 * 1024;
 export const READ_CHUNK_BYTES = 128 * 1024;
 
 // ---------------------------------------------------------------------------
+// locking
+// ---------------------------------------------------------------------------
+
+/**
+ * The URI scheme every lock token this server mints is written in
+ * (RFC 4918 §6.5, RFC 4122 §3).
+ *
+ * §6.5 requires a token to be unique "across all resources for all time" and
+ * *encourages* `urn:uuid:` over the older `opaquelocktoken:` scheme of
+ * RFC 2518 — so that is what is here, and it is also the form every example in
+ * §9.10 and §10.4 uses. A client must not interpret it either way (§6.5).
+ */
+export const LOCK_TOKEN_PREFIX = "urn:uuid:";
+
+/**
+ * The lease a lock gets when the client asks for nothing, in seconds. Ten
+ * minutes.
+ *
+ * §6.6 leaves the number entirely to the server ("the lifetime is suggested by
+ * the client ... but the server ultimately chooses the timeout value"), so what
+ * decides it is what a lock costs when its holder disappears: **this server has
+ * no administrative interface, and no principal but the one in
+ * `credentials`**, so a lock nobody unlocks is a resource nobody can write
+ * until it lapses. Ten minutes is long enough to edit a document through and
+ * short enough that a crashed client is not a locked share for the afternoon.
+ * A client that wants longer refreshes (§9.10.2), which is the mechanism the
+ * RFC provides for exactly this.
+ */
+export const DEFAULT_LOCK_TIMEOUT_SECONDS = 600;
+
+/**
+ * The longest lease this server grants, in seconds. One hour.
+ *
+ * The cap is what `Timeout: Infinite` becomes — §6.6 lets a server choose, and
+ * an unbounded lock here would be unbreakable for the reason above. §10.7 caps
+ * the *header's* value at 2^32-1; this is a policy well inside it, and the
+ * granted value always goes back in the reply's `timeout` element so a client
+ * never has to guess what it got.
+ */
+export const MAX_LOCK_TIMEOUT_SECONDS = 3600;
+
+/**
+ * Most locks one table holds at once. 4096.
+ *
+ * Locking is the one part of this protocol where a client leaves something
+ * behind on the server, so it is the one part with a bound. Expired locks are
+ * swept before the cap is consulted, so this is reached only by live locks —
+ * four thousand of them, which is far past any real client and far short of a
+ * memory problem. Past it a `LOCK` is `503`, which says "not now" rather than
+ * "never" and is the truthful shape of a full table.
+ */
+export const MAX_LOCKS = 4096;
+
+// ---------------------------------------------------------------------------
 // status codes
 // ---------------------------------------------------------------------------
 
@@ -119,8 +180,8 @@ export const READ_CHUNK_BYTES = 128 * 1024;
  * `Status-Line` as element text (RFC 4918 §14.28), so `HTTP/1.1 404 Not Found`
  * is a *value this module produces* rather than something `node:http` writes.
  *
- * `207` and `507` are RFC 4918's own; `508` is RFC 5842's; the rest are
- * RFC 9110 §15.
+ * `207`, `423` and `507` are RFC 4918's own (§11.1, §11.3, §11.5); `508` is
+ * RFC 5842's; the rest are RFC 9110 §15.
  */
 export const STATUS_TEXT: Record<number, string> = {
   200: "OK",
@@ -139,6 +200,7 @@ export const STATUS_TEXT: Record<number, string> = {
   414: "URI Too Long",
   415: "Unsupported Media Type",
   416: "Range Not Satisfiable",
+  423: "Locked",
   424: "Failed Dependency",
   500: "Internal Server Error",
   501: "Not Implemented",

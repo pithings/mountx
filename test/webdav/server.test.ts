@@ -228,7 +228,7 @@ describe("createWebdavServer: a client's session", () => {
 
     const options = await fetch(`${server.url}/`, { method: "OPTIONS" });
     expect(options.status).toBe(200);
-    expect(options.headers.get("dav")).toBe("1, 3");
+    expect(options.headers.get("dav")).toBe("1, 2, 3");
 
     expect((await fetch(`${server.url}/notes`, { method: "MKCOL" })).status).toBe(201);
 

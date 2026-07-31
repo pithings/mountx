@@ -10,38 +10,55 @@
  * its own paths and is done with them before it answers. That is the same
  * reason `mountx/s3` has neither.
  *
- * ## What "minimal" means here, exactly
+ * ## What this server implements, exactly
  *
- * **Class 1 of RFC 4918, complete; class 2 absent.** `OPTIONS`, `HEAD`, `GET`,
- * `PUT`, `DELETE`, `MKCOL`, `COPY`, `MOVE`, `PROPFIND` and `PROPPATCH` are
- * implemented against the driver. `LOCK` and `UNLOCK` are not, the `DAV` header
- * says `1, 3` rather than `1, 2, 3`, and the two methods answer `405` with an
- * `Allow` listing what is really there — declared-or-inferred, never faked
+ * **RFC 4918 classes 1, 2 and 3.** `OPTIONS`, `HEAD`, `GET`, `PUT`, `DELETE`,
+ * `MKCOL`, `COPY`, `MOVE`, `PROPFIND`, `PROPPATCH`, `LOCK` and `UNLOCK`, over
+ * one driver.
+ *
+ * Class 2 is the write locks of §6 and §7 — both scopes, both depths, leases
+ * that lapse, and the *locked empty resource* a `LOCK` on an unmapped URL
+ * creates (§7.3). The table behind them is `src/webdav/locks.ts`, which is
+ * pure, synchronous and clockless; this file is where the clock enters
+ * (`options.now`) and where a lock meets a driver. `supportedlock` and
+ * `lockdiscovery` report what is really granted and really held, which is what
+ * makes the `DAV: 1, 2, 3` header a statement rather than a claim
  * (`AGENTS.md`, invariant 5).
  *
- * That is a decision with a visible cost, so it is written down rather than
- * discovered: **macOS's `mount_webdav` mounts a class-1 share read-only**, and
- * the Windows redirector is unhappy in its own ways. A client that speaks the
- * protocol rather than the mount — `rclone`, `curl`, `cadaver`, a browser, most
- * Linux clients under `davfs2` — reads and writes normally. Locking is the next
- * piece of work, not an oversight; see `.agents/roadmap.md`.
- *
- * The other deliberate gaps, each because the driver interface has no answer
- * for them rather than because they were forgotten:
+ * The deliberate gaps, each because the driver interface has no answer for them
+ * rather than because they were forgotten:
  *
  * - **No dead properties.** A driver stores bytes and inode metadata; there is
  *   nowhere to keep an arbitrary XML property without inventing a sidecar file
  *   that would then show up in every listing. `PROPPATCH` therefore answers
  *   `403 cannot-modify-protected-property` for everything, which is the
  *   truthful answer for a server whose properties are all live and all derived.
- * - **No conditional requests.** `If`, `If-Match`, `If-None-Match` and the two
- *   date forms are ignored rather than half-honoured. `mountx/s3` implements
- *   RFC 9110's four; doing the same here without `LOCK` would leave `If` — the
- *   one WebDAV adds, and the one that exists to carry lock tokens — as the
- *   conspicuous hole. They arrive together.
+ * - **No conditional requests.** `If-Match`, `If-None-Match` and the two date
+ *   forms are ignored rather than half-honoured. `mountx/s3` implements
+ *   RFC 9110's four over the same derived ETag; they arrive here next.
  * - **`GET` of a collection is `405`.** A collection has no body in RFC 4918;
  *   the HTML index other servers answer with is a user interface, and
  *   `PROPFIND` is the protocol's own way to list one.
+ *
+ * ## Locks, and what a token is for
+ *
+ * A lock is state a *client* left behind: it survives the connection, the
+ * request and — up to its lease — the client itself. Three rules of §6 and §7
+ * are worth having in front of you, because each one is a place this file does
+ * something that looks surprising:
+ *
+ * - **A lock never follows its resource** (§7.6). A `MOVE` of a lock root
+ *   destroys the lock rather than carrying it, because §6.1 point 8 deletes any
+ *   lock whose root became unmapped — so `#discardUnmapped` runs after every
+ *   `DELETE`, `MOVE` and `COPY`, and checks each root rather than assuming it.
+ * - **A lock on an unmapped URL creates a real, empty file** (§7.3), which
+ *   outlives the lock. RFC 2518's lock-null resources are the alternative that
+ *   §7.3 permits and this server does not implement: a resource that is neither
+ *   present nor absent has no representation in a driver that stores files.
+ * - **The token is the whole of ownership.** There is one principal here at
+ *   most (`credentials`), so §6.4's "check that the authenticated principal
+ *   matches the lock creator" reduces to holding the token — which is why
+ *   `UNLOCK` needs nothing else, and why a token in an `If` header is proof.
  *
  * ## Symbolic links: followed for bytes, never walked
  *
@@ -61,10 +78,11 @@
  *
  * ## The properties this server has
  *
- * All live, all derived from one `stat`, and none of them stored:
- * `creationdate`, `displayname`, `getcontentlength`, `getcontenttype`,
- * `getetag`, `getlastmodified`, `resourcetype`, `supportedlock` (empty — see
- * above) and `lockdiscovery` (empty, and always will be). RFC 4331's
+ * All live, all derived from one `stat` or from the lock table, and none of
+ * them stored: `creationdate`, `displayname`, `getcontentlength`,
+ * `getcontenttype`, `getetag`, `getlastmodified`, `resourcetype`,
+ * `supportedlock` (the two entries §15.10 defines) and `lockdiscovery` (the
+ * locks covering the resource, indirect ones included). RFC 4331's
  * `quota-available-bytes` and `quota-used-bytes` are answered from `statfs`
  * when a driver has one, and only when a request names them: RFC 4331 §3 keeps
  * them out of `allprop`, and a driver without `statfs` answers `ENOSYS`, which
@@ -106,22 +124,34 @@ import {
   READ_CHUNK_BYTES,
   RESOURCE_CONTENT_TYPE,
 } from "./constants.ts";
+import { DavLockTable, type DavLock, type DavLockTableOptions, type LockDepth } from "./locks.ts";
 import {
   collectBody,
+  encodeLockResponse,
   encodeMultistatus,
   faultResponse,
+  formatLockToken,
   hrefOf,
+  lockDiscoveryNode,
   NO_BODY,
   parseDepth,
   parseDestination,
+  parseIf,
+  parseLockInfo,
+  parseLockToken,
   parseOverwrite,
   parsePropfind,
   parseProppatch,
   parseTargetPath,
+  parseTimeout,
   refuse,
   statusOfError,
+  submittedTokens,
+  supportedLockNode,
   xmlBody,
+  type DavFault,
   type Depth,
+  type IfList,
   type MultistatusEntry,
   type Propstat,
   type WebdavRequestHead,
@@ -204,6 +234,21 @@ export interface WebdavSessionOptions {
    * and a driver that runs out answers `ENOSPC`, which is already `507`.
    */
   maxBodyBytes?: number;
+  /**
+   * The clock, in milliseconds. Default `Date.now`.
+   *
+   * The **one** impure default in this file, and the same boundary
+   * `S3SessionOptions.now` draws: a lock's lease is a fact about now, and every
+   * module below this one — `src/http.ts`, `src/webdav/locks.ts` — takes its
+   * time as an argument on purpose. Pass one and a whole lock lifecycle,
+   * expiry included, is deterministic.
+   */
+  now?: () => number;
+  /**
+   * Lock-table policy: the default and maximum lease, the cap on live locks,
+   * and the token minter. See `src/webdav/locks.ts` for what each one costs.
+   */
+  locks?: DavLockTableOptions;
   /** Run the reply-exactly-once assertions. Default on outside production. */
   debug?: boolean;
   /** Called for every request that ends in an error reply. */
@@ -252,6 +297,16 @@ interface Failure {
 export class WebdavSession {
   /** The driver, wrapped so paths are normalized and gaps answer `ENOSYS`. */
   readonly driver: Loopback;
+  /**
+   * Every write lock this share holds (RFC 4918 §6).
+   *
+   * Public because it is the only server state a caller can reasonably want to
+   * see — how many locks are out, and on what — and because a test that drives
+   * the lease has to be able to read it. It is the session's own: HTTP gives
+   * every request the same session, so unlike 9P's table there is no second
+   * connection to share it with.
+   */
+  readonly locks: DavLockTable;
   readonly options: WebdavSessionOptions;
   readonly stats: WebdavSessionStats = {
     requests: 0,
@@ -265,6 +320,7 @@ export class WebdavSession {
 
   readonly #readChunkBytes: number;
   readonly #maxXmlBytes: number;
+  readonly #now: () => number;
   readonly #debug: boolean;
   /** Requests not answered yet, by internal ticket — see `S3Session`'s. */
   readonly #inflight = new Set<number>();
@@ -275,6 +331,8 @@ export class WebdavSession {
     this.options = options;
     this.#readChunkBytes = options.readChunkBytes ?? READ_CHUNK_BYTES;
     this.#maxXmlBytes = options.maxXmlBytes ?? MAX_XML_BYTES;
+    this.#now = options.now ?? Date.now;
+    this.locks = new DavLockTable(options.locks);
     this.#debug = options.debug ?? process.env.NODE_ENV !== "production";
   }
 
@@ -367,10 +425,16 @@ export class WebdavSession {
       case "PROPPATCH": {
         return await this.#proppatch(path, body);
       }
+      case "LOCK": {
+        return await this.#lock(head, path, body);
+      }
+      case "UNLOCK": {
+        return this.#unlock(head, path);
+      }
       default: {
-        /* Everything else, `LOCK` and `UNLOCK` included: the `Allow` header is
-           the honest list, and a client reading it learns this is a class-1
-           server without having to parse the `DAV` header. */
+        /* `REPORT`, `PATCH`, `SEARCH`, anything else: the `Allow` header is the
+           honest list, and a client reading it learns what this server has
+           without having to parse the `DAV` header. */
         throw refuse(405, { headers: { allow: ALLOW_HEADER } });
       }
     }
@@ -612,9 +676,13 @@ export class WebdavSession {
     }
     if (!stats.isDirectory()) {
       await this.driver.unlink(path);
+      await this.#discardUnmapped(path, this.#now());
       return { status: 204, headers: { "content-length": "0" } };
     }
     const failures = await this.#deleteTree(path);
+    /* Whatever went, went: the locks rooted on it die with it (§6.1 point 8),
+       and a partial delete leaves the locks whose roots survived. */
+    await this.#discardUnmapped(path, this.#now());
     return failures.length === 0
       ? { status: 204, headers: { "content-length": "0" } }
       : this.#multistatus(failures);
@@ -764,9 +832,17 @@ export class WebdavSession {
     }
     if (move) {
       await this.driver.rename(path, destination);
+      /* §7.6: the lock does not travel with the resource. The source's locks
+         are unmapped and die (§6.1 point 8); at the destination only a lock
+         root the move did not recreate does. */
+      const at = this.#now();
+      await this.#discardUnmapped(path, at);
+      await this.#discardUnmapped(destination, at);
       return { status: existing === undefined ? 201 : 204, headers: { "content-length": "0" } };
     }
     const failures = await this.#copyTree(path, destination, stats, depth === "infinity");
+    // The source keeps every lock it had (§7.6: "a COPY ... MUST NOT duplicate any write locks").
+    await this.#discardUnmapped(destination, this.#now());
     return failures.length > 0
       ? this.#multistatus(failures)
       : { status: existing === undefined ? 201 : 204, headers: { "content-length": "0" } };
@@ -911,10 +987,13 @@ export class WebdavSession {
     }
     const request = parsePropfind(await collectBody(body, this.#maxXmlBytes));
     const stats = await this.#stat(path);
+    /* One `now` for the whole document: two resources described by one reply
+       must not report leases read off two different clocks. */
+    const now = this.#now();
     const entries: MultistatusEntry[] = [
       {
         href: hrefOf(path, stats.isDirectory()),
-        propstat: await this.#propstats(path, stats, request),
+        propstat: await this.#propstats(path, stats, request, now),
       },
     ];
     if (depth === 1 && stats.isDirectory()) {
@@ -926,7 +1005,7 @@ export class WebdavSession {
         }
         entries.push({
           href: hrefOf(child, childStats.isDirectory()),
-          propstat: await this.#propstats(child, childStats, request),
+          propstat: await this.#propstats(child, childStats, request, now),
         });
       }
     }
@@ -952,13 +1031,14 @@ export class WebdavSession {
     path: string,
     stats: StatsLike,
     request: ReturnType<typeof parsePropfind>,
+    now: number,
   ): Promise<Propstat[]> {
     const explicit = request.kind === "prop";
     const names = explicit ? request.names : [...ALLPROP_NAMES];
     const found: XmlNode[] = [];
     const missing: XmlNode[] = [];
     for (const name of names) {
-      const node = await this.#property(name, path, stats);
+      const node = await this.#property(name, path, stats, now);
       if (node === undefined) {
         if (explicit) {
           missing.push({ name });
@@ -985,7 +1065,12 @@ export class WebdavSession {
    * only: RFC 4918 §15.4 defines the first as the `Content-Length` a `GET`
    * would carry, and a `GET` of a collection here is `405`.
    */
-  async #property(name: string, path: string, stats: StatsLike): Promise<XmlNode | undefined> {
+  async #property(
+    name: string,
+    path: string,
+    stats: StatsLike,
+    now: number,
+  ): Promise<XmlNode | undefined> {
     const collection = stats.isDirectory();
     switch (name) {
       case "creationdate": {
@@ -1013,12 +1098,17 @@ export class WebdavSession {
       case "resourcetype": {
         return { name, children: collection ? [{ name: "collection" }] : [] };
       }
-      case "supportedlock":
+      case "supportedlock": {
+        /* The same two entries for every resource, collection or not: what a
+           `LOCK` here accepts does not depend on what it is aimed at (§15.10). */
+        return supportedLockNode();
+      }
       case "lockdiscovery": {
-        /* Both empty, and both truthful: no lock type is supported and no lock
-           is ever held. Sending them at all is what tells a client it need not
-           ask. */
-        return { name };
+        /* Every lock whose scope covers this resource, which includes the
+           depth-infinity one rooted above it — §15.8 describes "the active
+           locks on a resource", and an indirectly locked member is locked.
+           Empty, with the element still sent, when there are none. */
+        return lockDiscoveryNode(this.locks.covering(path, now), now);
       }
       case "quota-available-bytes":
       case "quota-used-bytes": {
@@ -1091,6 +1181,216 @@ export class WebdavSession {
         },
       ]),
     );
+  }
+
+  // -------------------------------------------------------------------------
+  // LOCK / UNLOCK
+  // -------------------------------------------------------------------------
+
+  /**
+   * Take a write lock, or refresh one (RFC 4918 §9.10).
+   *
+   * The body decides which: one that holds a `lockinfo` creates a lock, and an
+   * **empty** one refreshes the lock its `If` header names (§7.7 — "a server
+   * receiving a LOCK request with no body MUST NOT create a new lock"). The
+   * two share almost nothing, so they are two methods below this one.
+   *
+   * `200` for a lock on a resource that was there, `201` for one on a URL that
+   * was not — §7.3's *locked empty resource*, a real empty file created by this
+   * request that outlives the lock, because "clients must therefore be
+   * responsible for cleaning up their own mess". RFC 2518's lock-null resources
+   * are the alternative §7.3 permits and are deliberately not implemented: a
+   * resource that is neither there nor absent has no representation in a driver
+   * that stores files.
+   */
+  async #lock(
+    head: WebdavRequestHead,
+    path: string,
+    body: AsyncIterable<Uint8Array>,
+  ): Promise<WebdavResponse> {
+    const info = parseLockInfo(await collectBody(body, this.#maxXmlBytes));
+    const now = this.#now();
+    const timeout = parseTimeout(head.headers["timeout"]);
+    if (info === undefined) {
+      return this.#refreshLock(head, path, timeout, now);
+    }
+    /* §9.10.3: `0` or `infinity` and nothing else — `1` is a depth the lock
+       model has no meaning for — and an absent header is `infinity`. */
+    const depth = parseDepth(head.headers["depth"], "infinity");
+    if (depth === undefined || depth === 1) {
+      throw refuse(400, { message: "LOCK is Depth: 0 or infinity (RFC 4918 §9.10.3)" });
+    }
+    const existing = await this.#statOrAbsent(path);
+    /* The conflict is checked before the empty resource is created, so a
+       refused LOCK on an unmapped URL leaves the namespace as it found it. The
+       authoritative check is still the one inside `create` — it is the one with
+       no `await` between the test and the grant. */
+    const blocking = this.locks.conflict(path, depth as LockDepth, info.exclusive, now);
+    if (blocking !== undefined) {
+      throw this.#conflictingLock(blocking);
+    }
+    const collection = existing?.isDirectory() ?? false;
+    if (existing === undefined) {
+      /* §9.10.6's `409`: "a resource cannot be created at the destination until
+         one or more intermediate collections have been created. The server MUST
+         NOT create those intermediate collections automatically." */
+      await this.#requireCollection(dirname(path));
+      await (await this.driver.open(path, "w", 0o666)).close();
+    }
+    const grant = this.locks.create(
+      {
+        path,
+        collection,
+        depth: depth as LockDepth,
+        exclusive: info.exclusive,
+        owner: info.owner,
+        timeoutSeconds: timeout,
+      },
+      now,
+    );
+    if (grant.kind === "conflict") {
+      /* Lost a race with another request between the check above and here. The
+         empty resource a `201` would have created stays, which is §7.3's own
+         rule that it "SHOULD NOT disappear when its lock goes away". */
+      throw this.#conflictingLock(grant.lock);
+    }
+    if (grant.kind === "full") {
+      throw refuse(503, { message: "this share is holding as many locks as it will hold" });
+    }
+    return xmlBody(existing === undefined ? 201 : 200, encodeLockResponse(grant.lock, now), {
+      "lock-token": formatLockToken(grant.lock.token),
+    });
+  }
+
+  /**
+   * Restart a lock's lease (RFC 4918 §9.10.2).
+   *
+   * The request names the lock in its `If` header and nowhere else — "this
+   * request MUST NOT have a body and it MUST specify which lock to refresh by
+   * using the 'If' header with a single lock token" — so a refresh with no `If`
+   * is a `400`, and one whose token names no lock **whose scope covers this
+   * URL** is the `412 lock-token-matches-request-uri` §9.10.6 defines for
+   * exactly that ("the Request-URI did not fall within the scope of the lock
+   * identified by the token ... or the lock could have disappeared, or the
+   * token may be invalid" — one status for all three, because the client's next
+   * move is the same).
+   *
+   * `Depth` is ignored, which §9.10.2 requires. There is no `Lock-Token`
+   * response header: §9.10.2 says it "is not returned in the response for a
+   * successful refresh", since no token was created.
+   */
+  #refreshLock(
+    head: WebdavRequestHead,
+    path: string,
+    timeout: number | "infinite" | undefined,
+    now: number,
+  ): WebdavResponse {
+    const lists = this.#ifLists(head);
+    if (lists === undefined) {
+      throw refuse(400, { message: "a LOCK with no body refreshes a lock and needs an If header" });
+    }
+    /* The first submitted token that names a live lock covering this URL. More
+       than one is a request §9.10.2 does not define ("only one lock may be
+       refreshed at a time"); refreshing the first is the reading that does
+       something rather than nothing, and a client that meant the other one gets
+       a `timeout` element saying which lock it actually refreshed. */
+    for (const token of submittedTokens(lists)) {
+      const lock = this.locks.find(token, now);
+      if (lock !== undefined && DavLockTable.inScope(lock, path)) {
+        const refreshed = this.locks.refresh(token, timeout, now);
+        /* v8 ignore next 3 -- `find` just answered for this token and nothing
+           awaits in between, so `refresh` cannot miss it. */
+        if (refreshed === undefined) {
+          break;
+        }
+        return xmlBody(200, encodeLockResponse(refreshed, now));
+      }
+    }
+    throw refuse(412, { condition: "lock-token-matches-request-uri" });
+  }
+
+  /**
+   * Delete a lock (RFC 4918 §9.11).
+   *
+   * The token comes from the `Lock-Token` header rather than from `If`, which
+   * §9.11 notes is inconsistent with every other state-changing method and is
+   * the protocol's own choice. `204` on success — "rather than 200 OK, since
+   * 200 OK would imply a response body" — `400` when no token was provided, and
+   * `409 lock-token-matches-request-uri` when the token names no live lock or
+   * names one whose scope does not cover this URL.
+   *
+   * Unlocking is not itself lock-protected: a client holding the token *is* the
+   * proof, and requiring the same token twice — once in `Lock-Token` and once
+   * in `If` — is not something §9.11 asks for.
+   */
+  #unlock(head: WebdavRequestHead, path: string): WebdavResponse {
+    const token = parseLockToken(head.headers["lock-token"]);
+    if (token === undefined) {
+      throw refuse(400, { message: "UNLOCK needs a Lock-Token header holding a Coded-URL" });
+    }
+    const now = this.#now();
+    const lock = this.locks.find(token, now);
+    if (lock === undefined || !DavLockTable.inScope(lock, path)) {
+      throw refuse(409, { condition: "lock-token-matches-request-uri" });
+    }
+    this.locks.remove(token);
+    return { status: 204, headers: { "content-length": "0" } };
+  }
+
+  /** The `423` a conflicting lock earns, naming the lock that is in the way. */
+  #conflictingLock(lock: DavLock): DavFault {
+    /* §16 on `no-conflicting-lock`: "a lock can be in conflict although the
+       resource to which the request was directed is only indirectly locked. In
+       this case, the precondition code can be used to inform the client about
+       the resource that is the root of the conflicting lock, avoiding a
+       separate lookup of the lockdiscovery property." */
+    return refuse(423, {
+      condition: "no-conflicting-lock",
+      hrefs: [hrefOf(lock.path, lock.collection)],
+      message: `${lock.path} is already locked`,
+    });
+  }
+
+  /**
+   * The `If` header's lists, or `undefined` when there is no header.
+   *
+   * @throws {DavFault} `400` for a header that is not §10.4.2's grammar.
+   */
+  #ifLists(head: WebdavRequestHead): IfList[] | undefined {
+    const header = head.headers["if"];
+    if (header === undefined) {
+      return undefined;
+    }
+    const lists = parseIf(header, head.headers["host"]);
+    if (lists === undefined) {
+      throw refuse(400, { message: "the If header is not RFC 4918 §10.4.2's grammar" });
+    }
+    return lists;
+  }
+
+  /**
+   * Delete every lock under `path` whose root stopped existing (§6.1 point 8).
+   *
+   * "If a request causes the lock-root of any lock to become an unmapped URL,
+   * then the lock MUST also be deleted by that request" — so a `DELETE` and the
+   * source side of a `MOVE` destroy the locks they unmap, and a lock never
+   * follows its resource (§7.6).
+   *
+   * The roots are **checked rather than assumed**, with one `stat` per lock
+   * under the path and none at all in the overwhelmingly common case of no
+   * locks there. That is what makes the same helper right at both ends of a
+   * `MOVE`: at the source every root really has gone, while at an overwritten
+   * destination the root itself was remapped by this very request — §7.6's "if
+   * there is an existing lock at the destination, the server MUST add the moved
+   * resource to the destination lock scope" — and only the members that were
+   * not recreated are unmapped.
+   */
+  async #discardUnmapped(path: string, now: number): Promise<void> {
+    for (const lock of this.locks.within(path, now)) {
+      if ((await this.#statOrAbsent(lock.path)) === undefined) {
+        this.locks.remove(lock.token);
+      }
+    }
   }
 
   // -------------------------------------------------------------------------

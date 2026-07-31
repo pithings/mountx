@@ -103,12 +103,13 @@ beforeEach(async () => {
 // ---------------------------------------------------------------------------
 
 describe("OPTIONS", () => {
-  it("advertises class 1 and 3, and never class 2", async () => {
+  it("advertises classes 1, 2 and 3, each of which is answered", async () => {
     const reply = await request(session, "OPTIONS", "/");
     expect(reply.status).toBe(200);
-    expect(reply.headers["dav"]).toBe("1, 3");
+    expect(reply.headers["dav"]).toBe("1, 2, 3");
     expect(reply.headers["allow"]).toContain("PROPFIND");
-    expect(reply.headers["allow"]).not.toContain("LOCK");
+    expect(reply.headers["allow"]).toContain("LOCK");
+    expect(reply.headers["allow"]).toContain("UNLOCK");
     expect(reply.headers["ms-author-via"]).toBe("DAV");
   });
 
@@ -121,7 +122,7 @@ describe("OPTIONS", () => {
 
 describe("an unimplemented method", () => {
   it("is 405 with an Allow that tells the truth", async () => {
-    for (const method of ["LOCK", "UNLOCK", "PATCH", "REPORT"]) {
+    for (const method of ["PATCH", "REPORT", "SEARCH", "BREW"]) {
       const reply = await request(session, method, "/dir/file.txt");
       expect(reply.status, method).toBe(405);
       expect(reply.headers["allow"], method).toContain("PROPFIND");
@@ -725,6 +726,339 @@ describe("PROPPATCH", () => {
       body: `<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:a/></D:prop></D:set></D:propertyupdate>`,
     });
     expect(reply.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LOCK / UNLOCK
+// ---------------------------------------------------------------------------
+
+/* One base moment and a clock the test moves by hand: a lease is the one thing
+   in this protocol that passes on its own, and waiting for it is not a test. */
+const LOCK_START = 1_700_000_000_000;
+
+/** A session with a clock a test drives and tokens a test can write down. */
+function lockingSession(base: FsDriver = driver): {
+  session: WebdavSession;
+  advance: (seconds: number) => void;
+} {
+  let clock = LOCK_START;
+  let minted = 0;
+  const built = new WebdavSession(base, {
+    now: () => clock,
+    locks: { newToken: () => `urn:uuid:token-${++minted}` },
+  });
+  return { session: built, advance: (seconds) => (clock += seconds * 1000) };
+}
+
+const LOCKINFO =
+  `<D:lockinfo xmlns:D="DAV:">` +
+  `<D:lockscope><D:exclusive/></D:lockscope>` +
+  `<D:locktype><D:write/></D:locktype>` +
+  `<D:owner><D:href>mailto:ada@example.com</D:href></D:owner>` +
+  `</D:lockinfo>`;
+
+const SHARED_LOCKINFO =
+  `<D:lockinfo xmlns:D="DAV:">` +
+  `<D:lockscope><D:shared/></D:lockscope>` +
+  `<D:locktype><D:write/></D:locktype>` +
+  `</D:lockinfo>`;
+
+/** `LOCK` a path and answer the token the reply minted. */
+async function lockOf(
+  target: WebdavSession,
+  path: string,
+  options: { headers?: Record<string, string>; body?: string } = {},
+): Promise<string> {
+  const reply = await request(target, "LOCK", path, {
+    headers: options.headers,
+    body: options.body ?? LOCKINFO,
+  });
+  const token = /<locktoken><href>([^<]+)<\/href>/.exec(reply.text)?.[1];
+  if (token === undefined) {
+    throw new Error(`LOCK ${path} answered ${reply.status} and no token`);
+  }
+  return token;
+}
+
+describe("LOCK", () => {
+  it("answers 200, a Lock-Token header and §9.10.1's body for a resource that is there", async () => {
+    const { session: locking } = lockingSession();
+    const reply = await request(locking, "LOCK", "/dir/file.txt", { body: LOCKINFO });
+    expect(reply.status).toBe(200);
+    expect(reply.headers["lock-token"]).toBe("<urn:uuid:token-1>");
+    expect(reply.headers["content-type"]).toBe(`application/xml; charset="utf-8"`);
+    expect(reply.text).toContain(`<prop xmlns="DAV:"><lockdiscovery><activelock>`);
+    expect(reply.text).toContain(`<lockscope><exclusive></exclusive></lockscope>`);
+    expect(reply.text).toContain(`<depth>infinity</depth>`);
+    expect(reply.text).toContain(`<owner><href>mailto:ada@example.com</href></owner>`);
+    expect(reply.text).toContain(`<timeout>Second-600</timeout>`);
+    expect(reply.text).toContain(`<locktoken><href>urn:uuid:token-1</href></locktoken>`);
+    expect(reply.text).toContain(`<lockroot><href>/dir/file.txt</href></lockroot>`);
+    expect(locking.locks.all(LOCK_START)).toHaveLength(1);
+  });
+
+  it("creates the locked empty resource §7.3 requires, and answers 201", async () => {
+    const { session: locking } = lockingSession();
+    const reply = await request(locking, "LOCK", "/dir/reserved.txt", { body: LOCKINFO });
+    expect(reply.status).toBe(201);
+    expect(reply.headers["lock-token"]).toBe("<urn:uuid:token-1>");
+    // A real, empty, readable resource — not a lock-null one.
+    expect((await driver.stat("/dir/reserved.txt")).size).toBe(0);
+    expect((await request(locking, "GET", "/dir/reserved.txt")).status).toBe(200);
+  });
+
+  it("is 409 when the collection above the new resource does not exist", async () => {
+    /* §9.10.6: "a resource cannot be created at the destination until one or
+       more intermediate collections have been created. The server MUST NOT
+       create those intermediate collections automatically." */
+    const { session: locking } = lockingSession();
+    expect((await request(locking, "LOCK", "/nope/deep.txt", { body: LOCKINFO })).status).toBe(409);
+    await expect(driver.stat("/nope")).rejects.toThrow();
+  });
+
+  it("takes Depth 0 or infinity and refuses 1 (§9.10.3)", async () => {
+    const { session: locking } = lockingSession();
+    const zero = await request(locking, "LOCK", "/dir", {
+      headers: { depth: "0" },
+      body: LOCKINFO,
+    });
+    expect(zero.status).toBe(200);
+    expect(zero.text).toContain("<depth>0</depth>");
+    expect(zero.text).toContain(`<lockroot><href>/dir/</href></lockroot>`);
+    const one = await request(locking, "LOCK", "/dir/file.txt", {
+      headers: { depth: "1" },
+      body: LOCKINFO,
+    });
+    expect(one.status).toBe(400);
+  });
+
+  it("honours the Timeout header, and answers Infinite with the cap it will grant", async () => {
+    const { session: locking } = lockingSession();
+    const asked = await request(locking, "LOCK", "/dir/file.txt", {
+      headers: { timeout: "Second-90" },
+      body: LOCKINFO,
+    });
+    expect(asked.text).toContain("<timeout>Second-90</timeout>");
+    const forever = await request(locking, "LOCK", "/dir", {
+      headers: { timeout: "Infinite, Second-4100000000", depth: "0" },
+      body: SHARED_LOCKINFO,
+    });
+    expect(forever.text).toContain("<timeout>Second-3600</timeout>");
+  });
+
+  it("is 423 no-conflicting-lock, naming the lock in the way (§9.10.5, §16)", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir", { headers: { depth: "infinity" } });
+    const reply = await request(locking, "LOCK", "/dir/file.txt", { body: LOCKINFO });
+    expect(reply.status).toBe(423);
+    expect(reply.text).toContain(`<no-conflicting-lock><href>/dir/</href></no-conflicting-lock>`);
+  });
+
+  it("refuses a depth-infinity lock over a subtree that already holds one (§7.4)", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir/file.txt");
+    const reply = await request(locking, "LOCK", "/dir", { body: LOCKINFO });
+    expect(reply.status).toBe(423);
+    expect(reply.text).toContain(`<href>/dir/file.txt</href>`);
+  });
+
+  it("grants two shared locks on one resource", async () => {
+    const { session: locking } = lockingSession();
+    const first = await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
+    const second = await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
+    expect(second).not.toBe(first);
+    expect(locking.locks.covering("/dir/file.txt", LOCK_START)).toHaveLength(2);
+  });
+
+  it("is 503 rather than a new lock when the table is full", async () => {
+    const full = new WebdavSession(driver, { now: () => LOCK_START, locks: { maxLocks: 1 } });
+    expect((await request(full, "LOCK", "/dir/file.txt", { body: SHARED_LOCKINFO })).status).toBe(
+      200,
+    );
+    const reply = await request(full, "LOCK", "/dir", {
+      headers: { depth: "0" },
+      body: SHARED_LOCKINFO,
+    });
+    expect(reply.status).toBe(503);
+  });
+
+  it("refuses a body that is not a lockinfo this server can serve", async () => {
+    const { session: locking } = lockingSession();
+    for (const body of [
+      `<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope></D:lockinfo>`,
+      `<D:lockinfo xmlns:D="DAV:"><D:locktype><D:write/></D:locktype></D:lockinfo>`,
+      `<D:propfind xmlns:D="DAV:"/>`,
+    ]) {
+      expect((await request(locking, "LOCK", "/dir/file.txt", { body })).status).toBe(400);
+    }
+  });
+
+  it("lapses on its own once the lease runs out, with no timer anywhere", async () => {
+    const { session: locking, advance } = lockingSession();
+    await lockOf(locking, "/dir/file.txt", { headers: { timeout: "Second-60" } });
+    advance(59);
+    expect(locking.locks.all(LOCK_START + 59_000)).toHaveLength(1);
+    advance(1);
+    // And the resource takes an exclusive lock again, which is what expiry is for.
+    expect((await request(locking, "LOCK", "/dir/file.txt", { body: LOCKINFO })).status).toBe(200);
+  });
+});
+
+describe("LOCK refresh", () => {
+  it("restarts the lease and answers no Lock-Token (§9.10.2)", async () => {
+    const { session: locking, advance } = lockingSession();
+    const token = await lockOf(locking, "/dir/file.txt", { headers: { timeout: "Second-600" } });
+    advance(300);
+    const reply = await request(locking, "LOCK", "/dir/file.txt", {
+      headers: { if: `(<${token}>)`, timeout: "Second-120", depth: "1" },
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.headers["lock-token"]).toBeUndefined();
+    expect(reply.text).toContain(`<timeout>Second-120</timeout>`);
+    expect(reply.text).toContain(`<locktoken><href>${token}</href></locktoken>`);
+    // `Depth: 1` above is ignored on a refresh, which §9.10.2 requires.
+    expect(reply.text).toContain(`<depth>infinity</depth>`);
+    expect(locking.locks.all(LOCK_START + 300_000)).toHaveLength(1);
+  });
+
+  it("refreshes through any URL inside the lock's scope", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir");
+    const reply = await request(locking, "LOCK", "/dir/file.txt", {
+      headers: { if: `(<${token}>)` },
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.text).toContain(`<lockroot><href>/dir/</href></lockroot>`);
+  });
+
+  it("needs an If header, since that is the only thing naming the lock", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir/file.txt");
+    expect((await request(locking, "LOCK", "/dir/file.txt")).status).toBe(400);
+  });
+
+  it("is 412 lock-token-matches-request-uri for a token that names no lock here", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir/file.txt");
+    // A token that never existed.
+    const unknown = await request(locking, "LOCK", "/dir/file.txt", {
+      headers: { if: `(<urn:uuid:nobody>)` },
+    });
+    expect(unknown.status).toBe(412);
+    expect(unknown.text).toContain("<lock-token-matches-request-uri>");
+    // A real token, on a resource outside its depth-0 scope.
+    const outside = await request(locking, "LOCK", "/dir", { headers: { if: `(<${token}>)` } });
+    expect(outside.status).toBe(412);
+  });
+
+  it("is 400 for an If header that is not §10.4.2's grammar", async () => {
+    const { session: locking } = lockingSession();
+    expect(
+      (await request(locking, "LOCK", "/dir/file.txt", { headers: { if: "(<unterminated" } }))
+        .status,
+    ).toBe(400);
+  });
+});
+
+describe("UNLOCK", () => {
+  it("deletes the lock and answers 204 with no body (§9.11.1)", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir/file.txt");
+    const reply = await request(locking, "UNLOCK", "/dir/file.txt", {
+      headers: { "lock-token": `<${token}>` },
+    });
+    expect(reply.status).toBe(204);
+    expect(reply.text).toBe("");
+    expect(locking.locks.all(LOCK_START)).toEqual([]);
+  });
+
+  it("unlocks through any URL inside the scope, and refuses one outside it", async () => {
+    const { session: locking } = lockingSession();
+    const token = await lockOf(locking, "/dir");
+    const outside = await request(locking, "UNLOCK", "/", {
+      headers: { "lock-token": `<${token}>` },
+    });
+    expect(outside.status).toBe(409);
+    expect(outside.text).toContain("<lock-token-matches-request-uri>");
+    expect(
+      (
+        await request(locking, "UNLOCK", "/dir/file.txt", {
+          headers: { "lock-token": `<${token}>` },
+        })
+      ).status,
+    ).toBe(204);
+  });
+
+  it("is 400 with no token and 409 with one that names no lock", async () => {
+    const { session: locking } = lockingSession();
+    expect((await request(locking, "UNLOCK", "/dir/file.txt")).status).toBe(400);
+    expect(
+      (await request(locking, "UNLOCK", "/dir/file.txt", { headers: { "lock-token": "nope" } }))
+        .status,
+    ).toBe(400);
+    expect(
+      (
+        await request(locking, "UNLOCK", "/dir/file.txt", {
+          headers: { "lock-token": "<urn:uuid:nobody>" },
+        })
+      ).status,
+    ).toBe(409);
+  });
+});
+
+describe("locks and the resources under them", () => {
+  it("reports supportedlock and lockdiscovery as what is really there (§15.8, §15.10)", async () => {
+    const { session: locking } = lockingSession();
+    const empty = await request(locking, "PROPFIND", "/dir/file.txt", {
+      headers: { depth: "0" },
+      body: `<D:propfind xmlns:D="DAV:"><D:prop><D:supportedlock/><D:lockdiscovery/></D:prop></D:propfind>`,
+    });
+    expect(empty.text).toContain("<lockdiscovery></lockdiscovery>");
+    expect(empty.text).toContain("<lockentry><lockscope><exclusive></exclusive></lockscope>");
+    const token = await lockOf(locking, "/dir");
+    const held = await request(locking, "PROPFIND", "/dir/file.txt", {
+      headers: { depth: "0" },
+      body: `<D:propfind xmlns:D="DAV:"><D:prop><D:lockdiscovery/></D:prop></D:propfind>`,
+    });
+    /* An indirectly locked member reports the ancestor's lock: §15.8 describes
+       "the active locks on a resource", and this resource is locked. */
+    expect(held.text).toContain(`<locktoken><href>${token}</href></locktoken>`);
+    expect(held.text).toContain(`<lockroot><href>/dir/</href></lockroot>`);
+    expect(statuses(held.text)).toEqual([200]);
+  });
+
+  it("destroys the locks a DELETE unmaps, and leaves the ones above it (§6.1)", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/", { headers: { depth: "0" }, body: SHARED_LOCKINFO });
+    await lockOf(locking, "/dir/file.txt", { body: SHARED_LOCKINFO });
+    expect(locking.locks.all(LOCK_START)).toHaveLength(2);
+    expect((await request(locking, "DELETE", "/dir/file.txt")).status).toBe(204);
+    expect(locking.locks.all(LOCK_START).map((lock) => lock.path)).toEqual(["/"]);
+  });
+
+  it("does not move a lock with the resource it locks (§7.6)", async () => {
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir/file.txt");
+    const reply = await request(locking, "MOVE", "/dir/file.txt", {
+      headers: { destination: "/moved.txt" },
+    });
+    expect(reply.status).toBe(201);
+    expect(locking.locks.all(LOCK_START)).toEqual([]);
+  });
+
+  it("keeps a destination's own lock across an overwriting MOVE (§7.6)", async () => {
+    /* "If there is an existing lock at the destination, the server MUST add the
+       moved resource to the destination lock scope" — the lock stays put and
+       the arriving resource joins it. */
+    const { session: locking } = lockingSession();
+    await (await driver.open("/dir/other.txt", "w")).close();
+    const token = await lockOf(locking, "/dir/other.txt", { body: SHARED_LOCKINFO });
+    const reply = await request(locking, "MOVE", "/dir/file.txt", {
+      headers: { destination: "/dir/other.txt" },
+    });
+    expect(reply.status).toBe(204);
+    expect(locking.locks.all(LOCK_START).map((lock) => lock.token)).toEqual([token]);
   });
 });
 

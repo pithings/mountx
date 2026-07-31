@@ -4,8 +4,9 @@
  * Three kinds of fact live here, and they are checked against different
  * sources:
  *
- * - **RFC 4918's grammars** — `Depth`, `Overwrite`, `Destination`, the two
- *   request bodies, and the two response documents. The section is named at the
+ * - **RFC 4918's grammars** — `Depth`, `Overwrite`, `Destination`, `Timeout`,
+ *   `Lock-Token`, the `If` header's disjunction-of-conjunctions, the three
+ *   request bodies, and the response documents. The section is named at the
  *   assertion wherever the rule is not obvious from the shape.
  * - **The path mapping**, in both directions and round-tripped. This is the
  *   security-relevant half: a target that escapes the driver root, a segment
@@ -20,23 +21,35 @@
 
 import { describe, expect, it } from "vitest";
 import { statusLine, STATUS_TEXT, statusOf } from "../../src/webdav/constants.ts";
+import { DavLockTable } from "../../src/webdav/locks.ts";
 import {
+  activeLockNode,
   collectBody,
   DavFault,
   encodeErrorDocument,
+  encodeLockResponse,
   encodeMultistatus,
   faultResponse,
+  formatLockToken,
   hrefOf,
   isDavFault,
+  lockDiscoveryNode,
   parseDepth,
   parseDestination,
+  parseIf,
+  parseLockInfo,
+  parseLockToken,
   parseOverwrite,
   parsePropfind,
   parseProppatch,
   parseTargetPath,
+  parseTimeout,
   refuse,
   statusOfError,
+  submittedTokens,
+  supportedLockNode,
 } from "../../src/webdav/protocol.ts";
+import { xmlDocument } from "../../src/s3/xml.ts";
 
 /** The status a call refused with, or `undefined` if it did not refuse. */
 function refusedWith(fn: () => unknown): number | undefined {
@@ -385,6 +398,272 @@ describe("encodeErrorDocument", () => {
     expect(encodeErrorDocument("lock-token-submitted")).toBe(
       `<?xml version="1.0" encoding="UTF-8"?>` +
         `<error xmlns="DAV:"><lock-token-submitted></lock-token-submitted></error>`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the locking headers
+// ---------------------------------------------------------------------------
+
+describe("parseTimeout", () => {
+  it("reads the first TimeType of §10.7's list", () => {
+    expect(parseTimeout("Second-3600")).toBe(3600);
+    expect(parseTimeout("Infinite")).toBe("infinite");
+    expect(parseTimeout("second-90")).toBe(90);
+    // §9.10.7's own header: the first entry is the one that is read.
+    expect(parseTimeout("Infinite, Second-4100000000")).toBe("infinite");
+    expect(parseTimeout(" Second-5 , Infinite ")).toBe(5);
+  });
+
+  it("ignores an absent or unreadable suggestion rather than refusing it", () => {
+    /* §6.6 makes the value a suggestion the server may ignore entirely, so a
+       malformed one is one more thing to ignore. */
+    for (const value of [undefined, "", "Seconds-30", "Second-", "Second-1x", "forever"]) {
+      expect(parseTimeout(value), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+});
+
+describe("the Lock-Token header", () => {
+  it("is a Coded-URL in both directions (§10.5)", () => {
+    expect(parseLockToken("<urn:uuid:e71d4fae-5dec-22d6-fea5-00a0c91e6be4>")).toBe(
+      "urn:uuid:e71d4fae-5dec-22d6-fea5-00a0c91e6be4",
+    );
+    expect(parseLockToken(" <urn:uuid:a> ")).toBe("urn:uuid:a");
+    expect(formatLockToken("urn:uuid:a")).toBe("<urn:uuid:a>");
+  });
+
+  it("is undefined for anything that is not one", () => {
+    for (const value of [undefined, "", "urn:uuid:a", "<a", "a>", "<>", "<a><b>"]) {
+      expect(parseLockToken(value), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+});
+
+describe("parseIf", () => {
+  const host = "example.com";
+
+  it("reads §10.4.6's no-tag production as OR over AND", () => {
+    expect(parseIf(`(<urn:uuid:181d4fae> ["I am an ETag"]) (["I am another ETag"])`, host)).toEqual(
+      [
+        {
+          resource: undefined,
+          foreign: false,
+          conditions: [
+            { negated: false, token: "urn:uuid:181d4fae" },
+            { negated: false, etag: `"I am an ETag"` },
+          ],
+        },
+        {
+          resource: undefined,
+          foreign: false,
+          conditions: [{ negated: false, etag: `"I am another ETag"` }],
+        },
+      ],
+    );
+  });
+
+  it("applies Not to the one condition after it (§10.4.7)", () => {
+    expect(parseIf(`(Not <urn:uuid:181d4fae> <urn:uuid:58f202ac>)`, host)?.[0]?.conditions).toEqual(
+      [
+        { negated: true, token: "urn:uuid:181d4fae" },
+        { negated: false, token: "urn:uuid:58f202ac" },
+      ],
+    );
+  });
+
+  it("carries a Resource-Tag forward to every list until the next one", () => {
+    const lists = parseIf(`</one> (<urn:uuid:a>) (<urn:uuid:b>) </two/deep> (<urn:uuid:c>)`, host);
+    expect(lists?.map((list) => [list.resource, list.conditions[0]?.token])).toEqual([
+      ["/one", "urn:uuid:a"],
+      ["/one", "urn:uuid:b"],
+      ["/two/deep", "urn:uuid:c"],
+    ]);
+  });
+
+  it("takes an absolute URI on this origin, and decodes it per segment", () => {
+    expect(parseIf(`<http://example.com/a%20b> (<urn:uuid:a>)`, host)?.[0]?.resource).toBe("/a b");
+  });
+
+  it("marks another origin foreign rather than refusing it (§10.4.4)", () => {
+    /* A URL this server does not serve is a resource whose state it cannot
+       know, which is the "handling unmapped URLs" case rather than an error. */
+    for (const tag of ["http://elsewhere.example/x", "not a uri", "http:"]) {
+      const list = parseIf(`<${tag}> (<urn:uuid:a>)`, host)?.[0];
+      expect(list, tag).toMatchObject({ resource: undefined, foreign: true });
+    }
+    // No `Host` to compare against: an absolute URI cannot be shown to be local.
+    expect(parseIf(`<http://example.com/x> (<urn:uuid:a>)`, undefined)?.[0]?.foreign).toBe(true);
+  });
+
+  it("accepts tagged and untagged lists in one header", () => {
+    /* §10.4.2 says they cannot be mixed, and says why it costs nothing to read
+       one that does: an untagged list is shorthand for a tagged one naming the
+       request URI. */
+    expect(
+      parseIf(`(<urn:uuid:a>) </x> (<urn:uuid:b>)`, host)?.map((list) => list.resource),
+    ).toEqual([undefined, "/x"]);
+  });
+
+  it("keeps an entity tag as it was sent, weakness marker and brackets included", () => {
+    const lists = parseIf(`(<urn:uuid:a> [W/"weak"]) ([")]("])`, host);
+    expect(lists?.[0]?.conditions[1]).toEqual({ negated: false, etag: `W/"weak"` });
+    // A `]` inside the quoted value does not end the tag.
+    expect(lists?.[1]?.conditions[0]).toEqual({ negated: false, etag: `")]("` });
+  });
+
+  it("is undefined for anything that is not §10.4.2's grammar", () => {
+    for (const value of [
+      "",
+      "   ",
+      "(<urn:uuid:a>",
+      "()",
+      "<urn:uuid:a>",
+      "(<urn:uuid:a)",
+      "(garbage)",
+      `(["unterminated)`,
+      "<no-close (<urn:uuid:a>)",
+    ]) {
+      expect(parseIf(value, host), JSON.stringify(value)).toBeUndefined();
+    }
+  });
+
+  it("submits every positive state token, once, and never a negated one", () => {
+    /* §10.4.1: a token counts as submitted whatever the list evaluated to —
+       but `Not <token>` asserts the resource is *not* held by it, which is the
+       opposite of a claim, and is what makes §10.4.8's `(Not <DAV:no-lock>)`
+       idiom a tautology rather than a claim on a lock. */
+    const lists = parseIf(
+      `(<urn:uuid:a> ["etag"]) (<urn:uuid:a>) </x> (<urn:uuid:b>) (Not <DAV:no-lock>)`,
+      host,
+    );
+    expect(submittedTokens(lists ?? [])).toEqual(["urn:uuid:a", "urn:uuid:b"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the lock bodies and documents
+// ---------------------------------------------------------------------------
+
+describe("parseLockInfo", () => {
+  const lockinfo = (inner: string): Uint8Array =>
+    utf8(`<D:lockinfo xmlns:D="DAV:">${inner}</D:lockinfo>`);
+
+  it("reads §9.10.7's request", () => {
+    expect(
+      parseLockInfo(
+        lockinfo(
+          `<D:lockscope><D:exclusive/></D:lockscope>` +
+            `<D:locktype><D:write/></D:locktype>` +
+            `<D:owner><D:href>http://example.org/~ejw/contact.html</D:href></D:owner>`,
+        ),
+      ),
+    ).toEqual({
+      exclusive: true,
+      owner: {
+        name: "owner",
+        text: undefined,
+        children: [{ name: "href", text: "http://example.org/~ejw/contact.html", children: [] }],
+      },
+    });
+  });
+
+  it("reads a shared lock, and an owner that is text", () => {
+    expect(
+      parseLockInfo(
+        lockinfo(
+          `<D:lockscope><D:shared/></D:lockscope><D:locktype><D:write/></D:locktype>` +
+            `<D:owner>Ada Lovelace</D:owner>`,
+        ),
+      ),
+    ).toEqual({
+      exclusive: false,
+      owner: { name: "owner", text: "Ada Lovelace", children: [] },
+    });
+  });
+
+  it("is undefined for the empty body that means refresh (§7.7)", () => {
+    expect(parseLockInfo(new Uint8Array(0))).toBeUndefined();
+  });
+
+  it("refuses a scope or a type this server has no meaning for", () => {
+    expect(
+      refusedWith(() => parseLockInfo(lockinfo(`<D:lockscope><D:sideways/></D:lockscope>`))),
+    ).toBe(400);
+    expect(
+      refusedWith(() =>
+        parseLockInfo(
+          lockinfo(`<D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:read/></D:locktype>`),
+        ),
+      ),
+    ).toBe(400);
+    expect(refusedWith(() => parseLockInfo(utf8("<propfind/>")))).toBe(400);
+    expect(refusedWith(() => parseLockInfo(utf8("<lockinfo")))).toBe(400);
+  });
+});
+
+describe("the lock documents", () => {
+  const now = 1_700_000_000_000;
+  const table = new DavLockTable({ newToken: () => "urn:uuid:fixed-token" });
+  const grant = table.create(
+    {
+      path: "/a b/notes",
+      collection: true,
+      depth: "infinity",
+      exclusive: true,
+      owner: { name: "owner", children: [{ name: "href", text: "mailto:ada@example.com" }] },
+      timeoutSeconds: 120,
+    },
+    now,
+  );
+  const lock = grant.kind === "granted" ? grant.lock : undefined;
+
+  it("writes §14.1's children in the DTD's order", () => {
+    expect(xmlDocument(activeLockNode(lock!, now + 5000))).toBe(
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<activelock>` +
+        `<lockscope><exclusive></exclusive></lockscope>` +
+        `<locktype><write></write></locktype>` +
+        `<depth>infinity</depth>` +
+        `<owner><href>mailto:ada@example.com</href></owner>` +
+        `<timeout>Second-115</timeout>` +
+        `<locktoken><href>urn:uuid:fixed-token</href></locktoken>` +
+        `<lockroot><href>/a%20b/notes/</href></lockroot>` +
+        `</activelock>`,
+    );
+  });
+
+  it("is the whole §9.10.1 body: a prop holding one lockdiscovery", () => {
+    expect(encodeLockResponse(lock!, now)).toBe(
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<prop xmlns="DAV:"><lockdiscovery>${xmlDocument(activeLockNode(lock!, now)).slice(
+          `<?xml version="1.0" encoding="UTF-8"?>`.length,
+        )}</lockdiscovery></prop>`,
+    );
+  });
+
+  it("is an empty lockdiscovery when nothing is locked (§15.8)", () => {
+    expect(xmlDocument(lockDiscoveryNode([], now))).toContain(`<lockdiscovery></lockdiscovery>`);
+  });
+
+  it("advertises exactly the two lock entries §15.10 defines", () => {
+    expect(xmlDocument(supportedLockNode())).toBe(
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<supportedlock>` +
+        `<lockentry><lockscope><exclusive></exclusive></lockscope>` +
+        `<locktype><write></write></locktype></lockentry>` +
+        `<lockentry><lockscope><shared></shared></lockscope>` +
+        `<locktype><write></write></locktype></lockentry>` +
+        `</supportedlock>`,
+    );
+  });
+
+  it("names the locked resource inside the condition (§7.5.2, §16)", () => {
+    expect(encodeErrorDocument("lock-token-submitted", ["/locked/"])).toBe(
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<error xmlns="DAV:"><lock-token-submitted><href>/locked/</href>` +
+        `</lock-token-submitted></error>`,
     );
   });
 });

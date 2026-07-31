@@ -127,20 +127,22 @@ is no RFC; everything is transcribed from Amazon's docs and named where it is us
 
 The other transport that is not a mount, and the one a kernel can mount anyway
 without root or native code (`davfs2`, `mount_webdav`, the Windows redirector).
-**RFC 4918 class 1** — every method but `LOCK`/`UNLOCK` — transcribed from the RFC,
-with RFC 9110 for the HTTP it rides on and RFC 4331 for the quota pair.
+**RFC 4918 classes 1, 2 and 3** — every method the specification defines, write
+locks included — transcribed from the RFC, with RFC 9110 for the HTTP it rides on
+and RFC 4331 for the quota pair.
 
-| File           | What                                                                                                                                                         |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `constants.ts` | the errno → HTTP status table, typed **total** over `ErrnoCode` (the same shape as `s3/constants.ts`'s), the protocol's literals, and the `propstat` phrases |
-| `protocol.ts`  | pure: target ↔ `href` (decoded and encoded **per segment**), `Depth`/`Overwrite`/`Destination`, the two request grammars, `multistatus` and `error`          |
-| `session.ts`   | method semantics over one driver. No handle table and no `PathLock` — HTTP carries no per-connection state, so a request resolves its own paths and is done  |
-| `server.ts`    | the socket, and the only file here that imports `node:http`. Loopback-only without credentials; HTTP Basic with them                                         |
+| File           | What                                                                                                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `constants.ts` | the errno → HTTP status table, typed **total** over `ErrnoCode` (the same shape as `s3/constants.ts`'s), the protocol's literals, and the `propstat` phrases               |
+| `protocol.ts`  | pure: target ↔ `href` (decoded and encoded **per segment**), `Depth`/`Overwrite`/`Destination`/`Timeout`/`Lock-Token`/`If`, the three request grammars, and every document |
+| `locks.ts`     | the write-lock table (§6, §7): pure, synchronous, **clockless** — `now` is an argument. Scope is a prefix test; a lock never follows its resource                          |
+| `session.ts`   | method semantics over one driver. No handle table and no `PathLock` — HTTP carries no per-connection state, so a request resolves its own paths and is done                |
+| `server.ts`    | the socket, and the only file here that imports `node:http`. Loopback-only without credentials; HTTP Basic with them                                                       |
 
-The deliberate gaps, each recorded at its own definition: no locking (so the `DAV`
-header says `1, 3`, never `1, 2, 3`), no dead properties (`PROPPATCH` answers `403
-cannot-modify-protected-property` — a driver has nowhere to keep one), and no
-conditional requests (they arrive with `If`, which exists to carry lock tokens).
+The deliberate gaps, each recorded at its own definition: no dead properties
+(`PROPPATCH` answers `403 cannot-modify-protected-property` — a driver has nowhere
+to keep one), no conditional requests yet, and no lock-null
+resources (§7.3's _locked empty resource_ instead, which is a real file).
 
 ## CLI (`src/cli/`, the `mountx` bin, `pnpm mountx` from source)
 

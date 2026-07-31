@@ -35,7 +35,7 @@ any rule below that looks removable.
 | `src/9p/`        | `mountx/9p` — 9P2000.L, `trans=unix` by default, one session per connection                            |
 | `src/nfs/`       | `mountx/nfs` — a version router over `v3/` (RFC 1813 + MOUNT) and `v4/` (NFSv4.1); Linux and macOS     |
 | `src/s3/`        | `mountx/s3` — SigV4 gateway over HTTP, path-style, one bucket per driver                               |
-| `src/webdav/`    | `mountx/webdav` — RFC 4918 class 1 over HTTP; no locking, and the `DAV` header says so                 |
+| `src/webdav/`    | `mountx/webdav` — RFC 4918 classes 1, 2 and 3 over HTTP: every method, write locks, `If`               |
 | `src/cli/`       | the `mountx` bin — a demo and test bench that mounts this package's README                             |
 | `native/`        | the Zig Node-API addon and its generated embed (`prebuilt.mjs`)                                        |
 | `test/`          | Tier 0/1/2 suites and the shared conformance suite — see `.agents/testing.md`                          |
