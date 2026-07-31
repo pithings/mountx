@@ -32,11 +32,14 @@
  *   The lock exists to keep one client's path map consistent under its own
  *   traffic; two clients renaming the same subtree concurrently race in the
  *   driver, the way two processes racing on a local filesystem do.
- * - `Tlock`/`Tgetlock` grant unconditionally (see `P9Session`), which is honest
- *   for the local `trans=fd` mount this transport exists for — one client, and
- *   the client kernel doing its own POSIX-lock bookkeeping — and is *not*
- *   honest once a second client is attached. Serving several clients is
- *   supported here; byte-range locking between them is not.
+ * - Byte-range locks are the one exception to "per connection": one
+ *   {@link P9LockTable} is built here and handed to every session, because a
+ *   lock exists to be seen by the *other* client and every client has a
+ *   connection of its own. `Tlock` from one connection therefore blocks a
+ *   conflicting `Tlock` from another, and everything a connection holds is
+ *   released when it goes. See `locks.ts`; pass
+ *   {@link P9SessionOptions.locks} to share one table across two servers over
+ *   the same driver.
  *
  * **Who may connect.** A TCP listener binds `127.0.0.1` and drops any
  * connection from an address that is not loopback, because 9P's only
@@ -52,6 +55,7 @@ import * as net from "node:net";
 import { dirname, resolve as resolvePath } from "node:path";
 import type { Duplex } from "node:stream";
 import type { FsDriver } from "../types.ts";
+import { P9LockTable } from "./locks.ts";
 import { P9FrameAssembler, P9_DEFAULT_MAX_FRAME } from "./protocol.ts";
 import { P9Session, type P9SessionOptions } from "./session.ts";
 
@@ -629,6 +633,14 @@ class P9ServerImpl implements P9Server {
   readonly path: string | undefined;
 
   readonly #driver: FsDriver;
+  /**
+   * {@link P9Server.options} with this server's lock table in it.
+   *
+   * A second object rather than a mutation, because `options` is published as
+   * "the options it was made with, as given" and a table the caller did not
+   * pass is not one of those.
+   */
+  readonly #sessionOptions: P9ServerOptions;
   readonly #server: net.Server;
   readonly #connections = new Set<P9ConnectionImpl>();
   /** Every attached stream, so the same one cannot be attached twice. */
@@ -655,6 +667,11 @@ class P9ServerImpl implements P9Server {
     }
     this.#driver = driver;
     this.options = options;
+    // One lock table for every connection this server will ever take: a byte
+    // range is the one piece of state a *second* client has to be able to see,
+    // and each of them has a session of its own. A table the caller supplied
+    // wins, so two servers over one driver can share one.
+    this.#sessionOptions = { ...options, locks: options.locks ?? new P9LockTable() };
     this.host = options.host ?? "127.0.0.1";
     this.path = options.path;
     this.#port = options.port ?? 0;
@@ -711,7 +728,7 @@ class P9ServerImpl implements P9Server {
       stream.once("close", () => this.#owned.delete(stream));
     }
     const connection: P9ConnectionImpl = new P9ConnectionImpl({
-      options: this.options,
+      options: this.#sessionOptions,
       driver: this.#driver,
       stream,
       peer,

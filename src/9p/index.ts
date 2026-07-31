@@ -11,6 +11,9 @@
  * - `protocol.ts` — every 9P2000.L message encoded *and* decoded, plus framing
  *   (`P9FrameAssembler`) and dirent packing.
  * - `fids.ts` — the fid table: paths, open state, readdir cursors, qid identity.
+ * - `locks.ts` — the byte-range lock table `Tlock`/`Tgetlock` answer from: the
+ *   one piece of state shared by every connection to a server rather than held
+ *   per session.
  * - `session.ts` — bytes in, bytes out: the protocol over a driver, with no
  *   socket anywhere.
  * - `server.ts` — the socket (TCP, unix, or an attached duplex), and
@@ -25,6 +28,7 @@
 
 export * from "./constants.ts";
 export * from "./fids.ts";
+export * from "./locks.ts";
 // Everything from `mount.ts` **except** `parseMountTable`/`MountEntry`, which
 // are Linux's mount-table format rather than anything a consumer of this
 // package composes with. Same treatment, and same reason, as the NFS

@@ -73,7 +73,6 @@ import {
   P9_GETATTR_BASIC,
   P9_GETATTR_BTIME,
   P9_IOHDRSZ,
-  P9_LOCK_SUCCESS,
   P9_LOCK_TYPE_UNLCK,
   P9_MIN_MSIZE,
   P9_NOFID,
@@ -147,6 +146,7 @@ import {
   messageName,
 } from "./constants.ts";
 import { FidTable, qidVersion, walkStep, type Fid, type FidOpenState } from "./fids.ts";
+import { P9LockTable, type P9LockClient } from "./locks.ts";
 import {
   P9DirentPacker,
   encodeMessage,
@@ -347,6 +347,18 @@ export interface P9SessionOptions {
    */
   msize?: number;
   /**
+   * The byte-range lock table `Tlock`/`Tgetlock` answer from. Default: a
+   * private one, holding nothing but this session's own ranges.
+   *
+   * Locks are the one piece of state that is **not** per connection — a lock
+   * exists to be seen by another client, and every client has a connection of
+   * its own — so `createP9Server` builds one table and hands the same one to
+   * every session it makes. A session constructed by hand gets its own, which
+   * is the single-client `mount9p()` case: nothing else can be in it, so every
+   * request is granted. See `locks.ts`.
+   */
+  locks?: P9LockTable;
+  /**
    * Refuse every mutating request with `EROFS`. Default `false`.
    *
    * "Mutating" includes a `Tlopen` that asks for write access, `O_CREAT` or
@@ -416,6 +428,16 @@ export class P9Session {
    * directory's worth of them.
    */
   readonly fids: FidTable<string>;
+  /**
+   * This connection's handle on the byte-range lock table — `Tlock` and
+   * `Tgetlock`, and the releases that keep a dead client from holding a range
+   * forever.
+   *
+   * Not to be confused with `#lock`, the {@link PathLock} that serializes this
+   * session's path resolution against its own renames. Different thing, and the
+   * reason this one is named in the plural: see `locks.ts`.
+   */
+  readonly locks: P9LockClient;
   readonly stats: P9SessionStats = {
     requests: 0,
     replies: 0,
@@ -451,6 +473,7 @@ export class P9Session {
     this.driver = createLoopback(driver);
     this.options = options;
     this.fids = new FidTable<string>({ useDriverIno: options.useDriverIno });
+    this.locks = (options.locks ?? new P9LockTable()).client();
     this.#debug = options.debug ?? process.env.NODE_ENV !== "production";
   }
 
@@ -593,11 +616,18 @@ export class P9Session {
    * Both `Tversion` and {@link destroy} land here: the protocol says a version
    * exchange "aborts all outstanding I/O and clunks all fids", so a re-version
    * is a teardown that happens to be followed by more traffic.
+   *
+   * The byte-range locks go with the fids, and they must: the table can outlive
+   * this session (it is shared with every other connection to the same server),
+   * so a range left behind by a client that has gone would deny that file to
+   * everybody with nothing left able to release it. Released synchronously,
+   * before the first `await` below, so nothing can be granted into the gap.
    */
   async #reset(): Promise<void> {
     this.#generation++;
     const open = this.fids.openHandles();
     this.fids.clear();
+    this.locks.releaseAll();
     this.#users.clear();
     this.#msize = 0;
     for (const { handle } of open) {
@@ -1081,9 +1111,16 @@ export class P9Session {
    * destroys its side "even after a failed clunk". Reporting the failure as an
    * `Rlerror` would leave the two ends disagreeing about whether the fid still
    * exists, so it goes to `onError` instead.
+   *
+   * The fid's byte-range locks go with it. The client's own kernel already
+   * unlocks before it closes (`locks_remove_posix()` sends a `Tlock UNLCK`), so
+   * this is the guard rather than the mechanism — but a fid is the only handle
+   * on a lock this end has, and one that survived its fid could never be
+   * released.
    */
   async #clunk(header: P9Header, fid: number): Promise<Uint8Array> {
     const entry = this.fids.clunk(fid);
+    this.locks.releaseFid(fid);
     this.#users.delete(fid);
     const handle = entry.open?.handle;
     entry.open = undefined;
@@ -2169,11 +2206,16 @@ export class P9Session {
    * caller's: doing it here as well would detach an identity the remap has
    * already rebound to the moved file.
    *
+   * The byte-range locks move too, and table-wide rather than per session: the
+   * file that moved is the same file to every client holding a range on it, and
+   * a range left under the old name would guard whatever is created there next.
+   *
    * Runs as the path lock's writer; see the dispatch.
    */
   async #renameTo(from: string, to: string): Promise<void> {
     await this.driver.rename(from, to);
     this.fids.remap(from, to);
+    this.locks.renamed(from, to);
   }
 
   /** `Trename` — move what `fid` names to `name` under `dfid`. */
@@ -2231,6 +2273,7 @@ export class P9Session {
    */
   async #remove(header: P9Header, fid: number): Promise<Uint8Array> {
     const entry = this.fids.clunk(fid);
+    this.locks.releaseFid(fid);
     this.#users.delete(fid);
     const handle = entry.open?.handle;
     entry.open = undefined;
@@ -2253,9 +2296,15 @@ export class P9Session {
    * `qid.path` — serves the old file's data for the new one. `FidTable.release`
    * keeps a hardlinked file's identity until its last name goes, so this is
    * safe to call for every removal.
+   *
+   * The byte ranges granted under that name go too, for the same reason in the
+   * other direction: the lock table's only name for a file is its path, so a
+   * range left under a name that has been reused would deny a file its holder
+   * never locked. See `locks.ts` for what that costs the holder.
    */
   #released(path: string): void {
     this.fids.release(path);
+    this.locks.released(path);
   }
 
   // -------------------------------------------------------------------------
@@ -2263,57 +2312,81 @@ export class P9Session {
   // -------------------------------------------------------------------------
 
   /**
-   * `Tlock` — granted, always.
+   * `Tlock` — take, upgrade, downgrade or release a byte range.
    *
-   * This is the `nolock` decision `src/nfs/mount.ts` makes, arrived at from the
-   * other side. A 9P mount served here has exactly one client: the connection
-   * *is* the session, and `mount9p()` hands the socket to one kernel. That
-   * kernel already does the POSIX-lock bookkeeping for every process on its own
-   * side — `fs/9p` calls `locks_lock_file_wait()` before it ever sends a
-   * `Tlock` — so the locking users actually observe is real and local, and what
-   * this reply adds is whether a *second* client could conflict. There is no
-   * second client.
+   * The decision this reply makes is only ever about *another* client. The
+   * client's own kernel does the POSIX-lock bookkeeping for its own processes —
+   * `fs/9p` calls `locks_lock_file_wait()` before it ever sends a `Tlock` — so
+   * a mount with one client behind it observes real locking whatever this says,
+   * which is why the table starts empty per session and only a shared one (a
+   * `createP9Server` with two connections on it) can ever refuse anything. See
+   * `locks.ts` for who owns a range and why a conflict is `P9_LOCK_BLOCKED`
+   * rather than a wait.
    *
-   * Granting is therefore honest and refusing would not be: `P9_LOCK_ERROR`
-   * makes `fcntl(F_SETLK)` fail on a mount where nothing is contending, which
-   * breaks sqlite, dpkg and every lockfile idiom for no protection at all. If
-   * `createP9Server` ever grows real multi-client use, this is where the table
-   * goes — noted in `.agents/roadmap.md`.
+   * Two fields of `Tlock` are deliberately not read. `flags` carries
+   * `P9_LOCK_FLAGS_BLOCK`, which says what the client will do with a `BLOCKED`
+   * answer (sleep and ask again) rather than asking the server to wait, and
+   * `P9_LOCK_FLAGS_RECLAIM`, which the v6.12 client never sets and which there
+   * is nothing here to reclaim against — no state survives a restart, so a
+   * reclaim is served as an ordinary request rather than answered
+   * `P9_LOCK_GRACE`. The fid is required, so a lock on a fid that does not
+   * exist is still the client's bug and still `EBADF`; it need not be *open*,
+   * because the only thing this needs from it is the path it names.
+   *
+   * Synchronous the whole way through — the table awaits nothing — so this runs
+   * outside the path lock without a rename being able to move the path out from
+   * under it mid-request.
    */
   async #setlk(header: P9Header, request: Tlock): Promise<Uint8Array> {
-    // The fid is required, so a lock on a fid that does not exist is still the
-    // client's bug and still `EBADF`.
-    this.fids.require(request.fid);
-    return this.#framed(
-      header,
-      P9_RLOCK,
-      (writer) => writeRlock(writer, { status: P9_LOCK_SUCCESS }),
-      16,
-    );
+    const entry = this.fids.require(request.fid);
+    const status = this.locks.lock({
+      path: entry.path,
+      fid: request.fid,
+      type: request.type,
+      start: request.start,
+      length: request.length,
+      procId: request.procId,
+      clientId: request.clientId,
+    });
+    return this.#framed(header, P9_RLOCK, (writer) => writeRlock(writer, { status }), 16);
   }
 
   /**
-   * `Tgetlock` — nothing is locked.
+   * `Tgetlock` — the lock that would deny this range, if there is one.
    *
-   * The counterpart of `#setlk`: this server holds no lock
-   * table, so there is no conflicting lock to report and `P9_LOCK_TYPE_UNLCK`
-   * is the truthful answer. The range and the client identity are echoed back
-   * because `p9_client_getlock_dotl()` copies them into the caller's `flock`,
-   * and a reply that invented a range would describe a lock nobody holds.
+   * A conflict answers with the holder's own type, range and identity, which is
+   * the only way one client learns another exists: `p9_client_getlock_dotl()`
+   * copies all of it into the caller's `flock`, with `l_pid` taken from
+   * `proc_id`. No conflict answers `P9_LOCK_TYPE_UNLCK` and echoes the
+   * request's own fields back, because that is what the client reads for "the
+   * lock could be placed" and a reply that invented a range would describe a
+   * lock nobody holds.
    */
   async #getlk(header: P9Header, request: Tgetlock): Promise<Uint8Array> {
-    this.fids.require(request.fid);
+    const entry = this.fids.require(request.fid);
+    const conflict = this.locks.getlock({
+      path: entry.path,
+      fid: request.fid,
+      type: request.type,
+      start: request.start,
+      length: request.length,
+      procId: request.procId,
+      clientId: request.clientId,
+    });
     return this.#framed(
       header,
       P9_RGETLOCK,
       (writer) =>
-        writeRgetlock(writer, {
-          type: P9_LOCK_TYPE_UNLCK,
-          start: request.start,
-          length: request.length,
-          procId: request.procId,
-          clientId: request.clientId,
-        }),
+        writeRgetlock(
+          writer,
+          conflict ?? {
+            type: P9_LOCK_TYPE_UNLCK,
+            start: request.start,
+            length: request.length,
+            procId: request.procId,
+            clientId: request.clientId,
+          },
+        ),
       48,
     );
   }

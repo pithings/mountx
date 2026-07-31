@@ -26,6 +26,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   P9_GETATTR_BASIC,
   P9_IOHDRSZ,
+  P9_LOCK_BLOCKED,
+  P9_LOCK_SUCCESS,
+  P9_LOCK_TYPE_WRLCK,
   P9_NOTAG,
   P9_RGETATTR,
   P9_RLOPEN,
@@ -314,6 +317,40 @@ describe("over TCP", () => {
     expect(server.connections).toBe(2);
     const [a, b] = watch(server);
     expect(a).not.toBe(b);
+  });
+
+  it("gives both connections the same lock table, and empties it when one goes", async () => {
+    const server = serve(createMemoryDriver());
+    await server.listen();
+
+    const first = await connect(server);
+    const second = await connect(server);
+    const one = await ready(first);
+    await ready(second);
+    await one.writeFile("/db", "x".repeat(64));
+    await first.client.walk(0, 7, ["db"]);
+    await second.client.walk(0, 7, ["db"]);
+    watch(server);
+
+    const alice = { procId: 11, clientId: "host-a", type: P9_LOCK_TYPE_WRLCK };
+    const bob = { procId: 22, clientId: "host-b", type: P9_LOCK_TYPE_WRLCK };
+    expect(await first.client.lock(7, alice)).toBe(P9_LOCK_SUCCESS);
+    // Fid 7 means something different on each connection; the *file* is what a
+    // lock is on, and that is shared where the fid table is not.
+    expect(await second.client.lock(7, bob)).toBe(P9_LOCK_BLOCKED);
+    expect(await second.client.getlock(7, bob)).toMatchObject({
+      type: P9_LOCK_TYPE_WRLCK,
+      procId: alice.procId,
+      clientId: alice.clientId,
+    });
+
+    // EOF is the only teardown 9P has, and it has to release: nothing else is
+    // left that could, and the range would deny the file to every other client
+    // for as long as the server ran.
+    const dropped = server.clients[0]!;
+    await first.end();
+    await dropped.closed;
+    expect(await second.client.lock(7, bob)).toBe(P9_LOCK_SUCCESS);
   });
 
   it("answers requests concurrently, replying in completion order", async () => {

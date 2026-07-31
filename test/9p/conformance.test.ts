@@ -53,10 +53,12 @@ import { P9Client, p9Driver } from "./client.ts";
  * rename, `statfs` — crosses intact, and each of those is a message of its own
  * (`Tlink`, `Tsymlink`/`Treadlink`, `Tsetattr`, `Trenameat`, `Tstatfs`).
  *
- * Nothing here is faked to make a case pass: the two gaps 9P really has are
- * extended attributes (`Txattrwalk`/`Txattrcreate` answer `ENOTSUP`) and
- * byte-range locks (`Tlock` grants unconditionally), and the driver interface
- * has no notion of either, so the suite never asks.
+ * Nothing here is faked to make a case pass: the one gap 9P really has is
+ * extended attributes (`Txattrwalk`/`Txattrcreate` answer `ENOTSUP`), and the
+ * driver interface has no notion of them, so the suite never asks. Byte-range
+ * locks are answered from `src/9p/locks.ts` rather than granted blind, and are
+ * not a driver capability either — they are arbitrated between clients here and
+ * never reach the driver.
  */
 const THROUGH_9P: ResolvedCapabilities = {
   handles: true,
