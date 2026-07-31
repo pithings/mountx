@@ -35,14 +35,26 @@
  * fact about `davfs2`'s privilege model, not about the server: the share
  * itself is served by an ordinary user's process over an ordinary TCP socket.
  *
- * ## What class 1 turns out to cost here: nothing
+ * ## What the `DAV` header buys, measured twice
  *
- * `mount.davfs` sends `OPTIONS` first, reads `DAV: 1, 3`, prints `the server
- * does not support locks` and mounts **read-write anyway** — witnessed, and the
- * reason the configuration below leaves `use_locks` at its default rather than
- * turning it off. Not one `LOCK` reaches the server across this whole suite.
- * macOS's `mount_webdav` is the client that insists on class 2, and it is not
- * this one.
+ * `mount.davfs` sends `OPTIONS` first and believes the answer, so this suite has
+ * seen both sides of the class-2 line and neither is a guess:
+ *
+ * - Against **class 1** — what this server advertised before locking landed — it
+ *   printed `the server does not support locks` and mounted **read-write
+ *   anyway**, sending not one `LOCK`. macOS's `mount_webdav` is the client that
+ *   insists on class 2; this one never did. The observation is kept because it
+ *   is the evidence behind that distinction, and it is recorded in
+ *   `.agents/environment.md` where a historical fact belongs.
+ * - Against **class 2**, which is what it reads today, it takes a lock per write
+ *   and releases it. That is not decoration: it means the workload below drives
+ *   `LOCK`, the `If` header and `UNLOCK` from a real kernel client rather than
+ *   from a `fetch` this repository wrote, which is the one thing no other test
+ *   here can claim. `#locks` asserts it, so a regression that silently stopped
+ *   advertising class 2 would fail this file rather than pass it quietly.
+ *
+ * Either way `use_locks` stays at its `davfs2` default of on: the point is what
+ * a real client does when it is not told what to do.
  *
  * ## `davfs2` is a caching client, and the assertions are shaped around it
  *
@@ -238,9 +250,11 @@ const PASSWORD = "a pass:word";
  *   trusted, in seconds. One, so a driver-side change is visible within a
  *   {@link settle} rather than within a minute.
  *
- * **`use_locks` is deliberately absent**, left at the `davfs2` default of on.
- * The point of this suite is that a class-1 share is writable by a real client
- * *without* being told to stop asking for locks.
+ * **`use_locks` is deliberately absent**, left at the `davfs2` default of on, so
+ * what the client does about locking is the client's decision and not this
+ * file's instruction. It read `DAV: 1, 3` and wrote without locks; it reads
+ * `DAV: 1, 2, 3` and takes one per write. Both were measured — see the module
+ * docs — and the second is asserted.
  */
 function davfsConfig(askAuth: boolean): string {
   return [
@@ -569,6 +583,34 @@ describe.skipIf(!probe.usable)("a real WebDAV mount", () => {
     }
     expect(await settle(async () => (await fs.readdir(root)).length === 0)).toBe(true);
   }, 120_000);
+
+  it("takes and releases a lock, because the server advertises class 2", async () => {
+    /* The one thing no other test in this package can claim: `LOCK`, the `If`
+       header that carries its token, and `UNLOCK`, driven by a real kernel
+       client that decided on its own to send them — `use_locks` is left at its
+       default, so the only reason davfs2 locks here is the `DAV: 1, 2, 3` it
+       read from `OPTIONS`. Asserted rather than described, so that a server
+       which quietly stopped advertising class 2 fails this file: davfs2 would
+       go back to writing without a lock, which is what it did before locking
+       landed (see the module docs). */
+    const share = await mounted();
+    await fs.writeFile(share.path("locked.txt"), "written through the kernel");
+    expect(
+      await settle(async () =>
+        (await fs.readFile(join(share.root, "locked.txt"), "utf8")).startsWith("written"),
+      ),
+      "the write to reach the driver",
+    ).toBe(true);
+
+    const methods = share.server.session.stats.methods;
+    expect(methods.get("LOCK") ?? 0).toBeGreaterThan(0);
+    expect(methods.get("UNLOCK") ?? 0).toBe(methods.get("LOCK") ?? 0);
+    /* Every one of them succeeded: a `423` would mean the client's own token
+       was not accepted back, which is the failure this pairing exists to
+       catch. */
+    expect(share.server.session.stats.errors).toBe(0);
+    expect(share.server.session.assertions).toEqual([]);
+  });
 
   it("reads back what the driver already held, byte for byte", async () => {
     /* The other direction, and the one `davfs2`'s cache cannot fake: every one

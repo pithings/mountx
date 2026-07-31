@@ -449,12 +449,20 @@ test:webdav:mount` passes**: 5 passed, 2 skipped, ~0.2 s of tests.
   mount.davfs http://127.0.0.1:PORT/ /mnt/point -o conf=…/davfs2.conf,rw,uid=0,gid=0
   ```
 
-- **A class-1 share is fully writable, with `use_locks` left on.** davfs2 sends
-  `OPTIONS` first, reads `DAV: 1, 3`, prints `mount.davfs: warning: the server
-does not support locks` and mounts read-write anyway. **Not one `LOCK` reaches
-  the server** — verified by shadowing `session.handleRequest` and counting. So
-  the class-2 gap costs nothing here; macOS's `mount_webdav` is the client that
-  insists, and it is a different client.
+- **davfs2 writes either way, and locks when it is offered locks.** Both halves
+  were measured here by shadowing `session.handleRequest` and counting methods,
+  and they are worth keeping apart:
+  - Against **class 1** (`DAV: 1, 3`, which this server sent before locking
+    landed) it prints `mount.davfs: warning: the server does not support locks`
+    and mounts read-write anyway — **not one `LOCK` was sent**. So the class-2
+    gap cost this client nothing; macOS's `mount_webdav` is the client that
+    insists, and it is a different client.
+  - Against **class 2** (`DAV: 1, 2, 3`) it takes a lock per write and releases
+    it: `echo > f && cp f g` over the mount is `OPTIONS 1, PROPFIND 2, HEAD 2,
+LOCK 2, PUT 2, UNLOCK 2`. The warning is gone. That is what makes
+    `test/webdav/mount.test.ts` a check on the _locking_ path rather than only
+    on the class-1 one, and `use_locks` is left at its default of on for exactly
+    that reason.
 - **HTTP Basic works through the mount.** `-o username=ada` with the password on
   the helper's stdin mounts; a wrong password fails the mount outright with
   `Could not authenticate to server: rejected Basic challenge`, which is the
