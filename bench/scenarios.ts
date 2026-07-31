@@ -3,9 +3,9 @@
  *
  * The same trick the conformance matrix uses: everything here is expressed
  * against {@link Loopback}, so the *identical* client code drives the memory
- * driver directly (the ceiling), a real FUSE mount through `node:fs`, and the
- * NFSv3 server through the JS client. Any difference between the columns is
- * transport, not benchmark.
+ * driver directly (the ceiling), a real FUSE mount and a real 9P mount through
+ * `node:fs`, and the NFSv3 server through the JS client. Any difference between
+ * the columns is transport, not benchmark.
  *
  * Two of them look like they measure the same thing twice and do not, which is
  * the whole point of the exercise: `stat` and `open+read` are served out of the
@@ -37,7 +37,7 @@ export const WALK_FILES = 500;
 export const PARALLEL_WIDTH = 64;
 
 /**
- * What `bench/fuse.ts` asks `bench/fuse-client.ts` for: the same request
+ * What a mounting column asks `bench/mount-client.ts` for: the same request
  * {@link runScenarios} takes, plus the mountpoint to open it at. It lives here
  * rather than in either half so that importing the constant does not import the
  * script that runs on load.
