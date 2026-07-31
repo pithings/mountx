@@ -170,7 +170,7 @@ import {
   READ_CHUNK_BYTES,
   RESOURCE_CONTENT_TYPE,
 } from "./constants.ts";
-import { DavLockTable, type DavLock, type DavLockTableOptions, type LockDepth } from "./locks.ts";
+import { DavLockTable, type DavLock, type DavLockTableOptions } from "./locks.ts";
 import {
   collectBody,
   encodeLockResponse,
@@ -1737,7 +1737,7 @@ export class WebdavSession {
        refused LOCK on an unmapped URL leaves the namespace as it found it. The
        authoritative check is still the one inside `create` — it is the one with
        no `await` between the test and the grant. */
-    const blocking = this.locks.conflict(path, depth as LockDepth, info.exclusive, now);
+    const blocking = this.locks.conflict(path, depth, info.exclusive, now);
     if (blocking !== undefined) {
       throw this.#conflictingLock(blocking);
     }
@@ -1758,7 +1758,7 @@ export class WebdavSession {
       {
         path,
         collection,
-        depth: depth as LockDepth,
+        depth,
         exclusive: info.exclusive,
         owner: info.owner,
         timeoutSeconds: timeout,
