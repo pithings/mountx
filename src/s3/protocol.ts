@@ -49,14 +49,13 @@ import {
   MULTIPART_PREFIX,
 } from "./constants.ts";
 import {
-  etagMatchesStrongly,
-  etagMatchesWeakly,
+  evaluateConditionals as evaluateHttpConditionals,
   formatContentRange,
   formatETag,
   formatHttpDate,
   MAX_TIMESTAMP_MS,
-  parseETagList,
-  parseHttpDate,
+  type ConditionalResult,
+  type ConditionalTarget,
 } from "../http.ts";
 import { normalizePath } from "../path.ts";
 import type { HeaderEntry, QueryEntry, SigV4RefusalReason } from "./sigv4.ts";
@@ -503,12 +502,14 @@ export function s3ErrorResponse(error: S3ErrorSpec, extra: S3ErrorExtra = {}): S
 // ---------------------------------------------------------------------------
 
 /*
- * `HTTP-date`, the `Range` grammar, the `ETag` quoting and the entity-tag
- * comparison functions are RFC 9110 rather than S3, and `mountx/webdav` answers
- * the same ones — its `If` header (RFC 4918 §10.4) matches entity tags with the
- * very same list parser. They live in `src/http.ts` and are re-exported here
- * under the names they have always had, so this module's surface — and
- * `mountx/s3`'s — is unchanged.
+ * `HTTP-date`, the `Range` grammar, the `ETag` quoting, the entity-tag
+ * comparison functions and the conditional-request rules are RFC 9110 rather
+ * than S3, and `mountx/webdav` answers the same ones — its `If` header
+ * (RFC 4918 §10.4) matches entity tags with the very same list parser. They
+ * live in `src/http.ts` and are re-exported here under the names they have
+ * always had, so this module's surface — and `mountx/s3`'s — is unchanged.
+ * `evaluateConditionals` is the one that is wrapped rather than re-exported: it
+ * takes this transport's header list and hands the shared rule a lookup.
  */
 export {
   formatContentRange,
@@ -520,6 +521,8 @@ export {
   parseETagList,
   parseHttpDate,
   parseRange,
+  type ConditionalResult,
+  type ConditionalTarget,
   type ETag,
   type ETagList,
   type RangeSpec,
@@ -1529,82 +1532,30 @@ export function routeRequest(
 // conditional requests
 // ---------------------------------------------------------------------------
 
-/** What the conditional headers are evaluated against. */
-export interface ConditionalTarget {
-  /** The object's ETag, quoted or not — both compare the same. */
-  etag: string;
-  /** The object's modification time, in milliseconds. */
-  mtimeMs: number;
-}
-
-/** The outcome: serve it, answer `304`, or answer `412`. */
-export interface ConditionalResult {
-  status: 200 | 304 | 412;
-}
-
 /**
- * Evaluate the four conditional headers in RFC 9110 §13.2.2's order:
+ * Evaluate the four conditional headers in RFC 9110 §13.2.2's order.
  *
- * 1. `If-Match` — no match is `412`.
- * 2. `If-Unmodified-Since`, **only when `If-Match` is absent** — modified since
- *    is `412`.
- * 3. `If-None-Match` — a match is `304` for `GET`/`HEAD` and `412` for every
- *    other method.
- * 4. `If-Modified-Since`, **only when `If-None-Match` is absent and the method
- *    is `GET` or `HEAD`** — not modified is `304`.
- *
- * `If-Match` compares strongly and `If-None-Match` weakly (§8.8.3.2), which is
- * a difference a client can see even though every ETag this gateway produces is
- * strong: a weak tag *from the client* fails `If-Match` and passes
- * `If-None-Match`.
- *
- * A date that does not parse is ignored, as §13.1.3 and §13.1.4 require ("a
- * recipient MUST ignore the header field if the value is not a valid
- * HTTP-date"). Comparison is at one-second resolution, because that is all an
- * `HTTP-date` carries: an object modified 300 ms after the date in the header
- * counts as *not* modified.
+ * The rules are HTTP's rather than S3's and live in `src/http.ts` beside the
+ * entity-tag comparison functions they use; this is the S3 spelling of the same
+ * call, taking the header list this transport carries (SigV4 signs headers as
+ * they were sent, so they stay a list of entries here) and joining the two
+ * list-based fields the way RFC 9110 §5.3 permits.
  */
 export function evaluateConditionals(
   target: ConditionalTarget,
   headers: readonly HeaderEntry[],
   method: string,
 ): ConditionalResult {
-  const safe = method === "GET" || method === "HEAD";
-  const modifiedSeconds = Math.floor(target.mtimeMs / 1000);
-
-  const ifMatch = headerList(headers, "if-match");
-  if (ifMatch !== undefined) {
-    if (!etagMatchesStrongly(parseETagList(ifMatch), target.etag)) {
-      return { status: 412 };
-    }
-  } else {
-    const ifUnmodifiedSince = headerValue(headers, "if-unmodified-since");
-    if (ifUnmodifiedSince !== undefined) {
-      const at = parseHttpDate(ifUnmodifiedSince);
-      if (at !== undefined && modifiedSeconds > Math.floor(at / 1000)) {
-        return { status: 412 };
-      }
-    }
-  }
-
-  const ifNoneMatch = headerList(headers, "if-none-match");
-  if (ifNoneMatch !== undefined) {
-    if (etagMatchesWeakly(parseETagList(ifNoneMatch), target.etag)) {
-      return { status: safe ? 304 : 412 };
-    }
-    return { status: 200 };
-  }
-
-  if (safe) {
-    const ifModifiedSince = headerValue(headers, "if-modified-since");
-    if (ifModifiedSince !== undefined) {
-      const at = parseHttpDate(ifModifiedSince);
-      if (at !== undefined && modifiedSeconds <= Math.floor(at / 1000)) {
-        return { status: 304 };
-      }
-    }
-  }
-  return { status: 200 };
+  return evaluateHttpConditionals(
+    target,
+    {
+      "if-match": headerList(headers, "if-match"),
+      "if-none-match": headerList(headers, "if-none-match"),
+      "if-modified-since": headerValue(headers, "if-modified-since"),
+      "if-unmodified-since": headerValue(headers, "if-unmodified-since"),
+    },
+    method,
+  );
 }
 
 // ---------------------------------------------------------------------------

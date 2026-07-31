@@ -1288,6 +1288,149 @@ describe("what a write lock protects", () => {
 });
 
 // ---------------------------------------------------------------------------
+// RFC 9110's conditional requests
+// ---------------------------------------------------------------------------
+
+describe("conditional requests", () => {
+  /** The resource's validators, as a client would have read them. */
+  async function validators(): Promise<{ etag: string; lastModified: string }> {
+    const reply = await request(session, "HEAD", "/dir/file.txt");
+    return {
+      etag: reply.headers["etag"] as string,
+      lastModified: reply.headers["last-modified"] as string,
+    };
+  }
+
+  it("answers 304 to a GET whose client already has this representation", async () => {
+    const { etag, lastModified } = await validators();
+    const conditions: Record<string, string>[] = [
+      { "if-none-match": etag },
+      { "if-none-match": `"other", ${etag}` },
+      { "if-none-match": "*" },
+      { "if-modified-since": lastModified },
+    ];
+    for (const headers of conditions) {
+      const reply = await request(session, "GET", "/dir/file.txt", { headers });
+      expect(reply.status, JSON.stringify(headers)).toBe(304);
+      // §15.4.5: the validators, and no content — not even a length.
+      expect(reply.headers["etag"]).toBe(etag);
+      expect(reply.headers["content-length"]).toBeUndefined();
+      expect(reply.text).toBe("");
+    }
+    expect(
+      (await request(session, "HEAD", "/dir/file.txt", { headers: { "if-none-match": etag } }))
+        .status,
+    ).toBe(304);
+  });
+
+  it("answers 412 to a GET whose precondition failed", async () => {
+    const { lastModified } = await validators();
+    const past = new Date(Date.parse(lastModified) - 60_000).toUTCString();
+    const conditions: Record<string, string>[] = [
+      { "if-match": `"${"9".repeat(32)}"` },
+      { "if-match": `W/"weak"` },
+      { "if-unmodified-since": past },
+    ];
+    for (const headers of conditions) {
+      expect(
+        (await request(session, "GET", "/dir/file.txt", { headers })).status,
+        JSON.stringify(headers),
+      ).toBe(412);
+    }
+  });
+
+  it("evaluates the conditionals before the Range (RFC 9110 §13.2.2)", async () => {
+    const { etag } = await validators();
+    const reply = await request(session, "GET", "/dir/file.txt", {
+      headers: { "if-none-match": etag, range: "bytes=0-3" },
+    });
+    expect(reply.status).toBe(304);
+  });
+
+  it("ignores a date it cannot parse, which §13.1.3 requires", async () => {
+    const reply = await request(session, "GET", "/dir/file.txt", {
+      headers: { "if-modified-since": "the day before yesterday" },
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.text).toBe("hello world");
+  });
+
+  it("refuses a PUT whose precondition failed, and leaves the bytes alone", async () => {
+    const { etag } = await validators();
+    const stale = await request(session, "PUT", "/dir/file.txt", {
+      headers: { "if-match": `"${"9".repeat(32)}"` },
+      body: "overwritten",
+    });
+    expect(stale.status).toBe(412);
+    expect((await request(session, "GET", "/dir/file.txt")).text).toBe("hello world");
+    /* A match is 412 on a PUT and never 304: §13.2.2 gives `304` to `GET` and
+       `HEAD` only. */
+    const present = await request(session, "PUT", "/dir/file.txt", {
+      headers: { "if-none-match": etag },
+      body: "overwritten",
+    });
+    expect(present.status).toBe(412);
+    const fresh = await request(session, "PUT", "/dir/file.txt", {
+      headers: { "if-match": etag },
+      body: "overwritten",
+    });
+    expect(fresh.status).toBe(204);
+  });
+
+  it("is where `If-None-Match: *` means create-only", async () => {
+    /* The one case `mountx/s3` never has to answer: a `PUT` to a URL with no
+       representation at all. §13.1.1 fails `If-Match` on it and §13.1.2 lets
+       `If-None-Match` through. */
+    expect(
+      (
+        await request(session, "PUT", "/dir/new.txt", {
+          headers: { "if-none-match": "*" },
+          body: "created",
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await request(session, "PUT", "/dir/new.txt", {
+          headers: { "if-none-match": "*" },
+          body: "again",
+        })
+      ).status,
+    ).toBe(412);
+    expect(
+      (
+        await request(session, "PUT", "/dir/other.txt", {
+          headers: { "if-match": "*" },
+          body: "no",
+        })
+      ).status,
+    ).toBe(412);
+    await expect(driver.stat("/dir/other.txt")).rejects.toThrow();
+    // A date form on nothing is ignored rather than refused (§13.1.4).
+    expect(
+      (
+        await request(session, "PUT", "/dir/dated.txt", {
+          headers: { "if-unmodified-since": "Sun, 06 Nov 1994 08:49:37 GMT" },
+          body: "created anyway",
+        })
+      ).status,
+    ).toBe(201);
+  });
+
+  it("answers 423 before 412 on a locked resource", async () => {
+    /* Both preconditions failed; the lock is the one that says something
+       durable about the resource, and the one the client must resolve first. */
+    const { session: locking } = lockingSession();
+    await lockOf(locking, "/dir/file.txt");
+    const reply = await request(locking, "PUT", "/dir/file.txt", {
+      headers: { "if-match": `"${"9".repeat(32)}"` },
+      body: "no",
+    });
+    expect(reply.status).toBe(423);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // authentication
 // ---------------------------------------------------------------------------
 

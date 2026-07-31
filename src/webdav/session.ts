@@ -33,10 +33,13 @@
  *   that would then show up in every listing. `PROPPATCH` therefore answers
  *   `403 cannot-modify-protected-property` for everything, which is the
  *   truthful answer for a server whose properties are all live and all derived.
- * - **No conditional requests.** `If-Match`, `If-None-Match` and the two date
- *   forms are ignored rather than half-honoured — RFC 4918's own `If` (§10.4)
- *   is answered, and RFC 9110's four are not. `mountx/s3` implements them over
- *   the same derived ETag; they arrive here next.
+ * - **Conditional requests on `GET`, `HEAD` and `PUT` only.** RFC 9110's four
+ *   — `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` —
+ *   are evaluated there, by the same `src/http.ts` code `mountx/s3` uses over
+ *   the same derived ETag. `DELETE`, `COPY` and `MOVE` ignore them: the header
+ *   a WebDAV client reaches for on those is RFC 4918's `If`, which *is*
+ *   answered, and a conditional honoured on three methods and silently dropped
+ *   on six would be worse than one honoured where it is documented.
  * - **`GET` of a collection is `405`.** A collection has no body in RFC 4918;
  *   the HTML index other servers answer with is a user interface, and
  *   `PROPFIND` is the protocol's own way to list one.
@@ -144,6 +147,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { createLoopback, type Loopback } from "../harness.ts";
 import {
   etagMatchesWeakly,
+  evaluateConditionals,
   formatETag,
   formatHttpDate,
   formatIsoDate,
@@ -636,6 +640,17 @@ export class WebdavSession {
          these reachable at all (`mountx.mknod`). */
       throw refuse(403, { message: "that resource is not a regular file" });
     }
+    /* Before the `Range`, which RFC 9110 §13.2.2 requires: a `304` and a `412`
+       are both answers about the whole representation, and evaluating the range
+       first would answer `206` to a request whose precondition failed. */
+    const conditional = this.#conditional(head, stats);
+    if (conditional === 304) {
+      /* §15.4.5: a `304` carries the validators a `200` would have and no
+         content — not even a `Content-Length`, which would describe a body this
+         reply is forbidden to have. */
+      const validators = this.#resourceHeaders(stats);
+      return { status: 304, headers: validators };
+    }
     const range = parseRange(head.headers["range"], stats.size);
     const headers = this.#resourceHeaders(stats);
     if (range.kind === "unsatisfiable") {
@@ -660,6 +675,46 @@ export class WebdavSession {
        consumer that has *started* it abandons it — see `server.ts`. */
     const handle = await this.driver.open(path, "r");
     return { status, headers, body: streamHandle(handle, start, length, this.#readChunkBytes) };
+  }
+
+  /**
+   * RFC 9110's four conditional headers, against the representation that is
+   * there — or against nothing at all.
+   *
+   * `200` to carry on, `304` for a `GET`/`HEAD` whose client already has this
+   * representation, and a thrown `412` for a precondition that failed. The
+   * rules themselves are `src/http.ts`'s, shared with `mountx/s3`; what is
+   * here is the case S3's gateway never has to answer, because a `PUT` may name
+   * a resource that **does not exist yet** and §13.1's answers for that are
+   * per-header:
+   *
+   * - `If-Match` on nothing is `412` (§13.1.1: "if the field value is '*' and
+   *   the resource has no current representation"), and a list of tags cannot
+   *   match a representation that is not there either. This is the header a
+   *   client uses to say "only if you still have the copy I read".
+   * - `If-None-Match` on nothing **passes** — `If-None-Match: *` is exactly the
+   *   "create only if absent" idiom, and this is where it succeeds.
+   * - The two date forms are **ignored** on nothing: §13.1.3 and §13.1.4 both
+   *   compare against a last-modified date, and there is none.
+   *
+   * @throws {DavFault} `412`.
+   */
+  #conditional(head: WebdavRequestHead, stats: StatsLike | undefined): 200 | 304 {
+    if (stats === undefined) {
+      if (head.headers["if-match"] !== undefined) {
+        throw refuse(412, { message: "If-Match names a representation that is not here" });
+      }
+      return 200;
+    }
+    const outcome = evaluateConditionals(
+      { etag: formatETag(resourceETag(stats)), mtimeMs: stats.mtimeMs },
+      head.headers,
+      head.method.toUpperCase(),
+    );
+    if (outcome.status === 412) {
+      throw refuse(412, { message: "a conditional header did not match this resource" });
+    }
+    return outcome.status;
   }
 
   /** The headers every resource reply carries, `Content-Length` aside. */
@@ -710,6 +765,12 @@ export class WebdavSession {
        a resource also changes its parent's membership (§7.4), and the parent's
        own depth-0 lock protects exactly that. */
     this.#requireWritable(path, guard, { membership: existing === undefined });
+    /* After the lock check rather than before it: `423` is a fact about the
+       resource that a client must act on before anything else it might try,
+       while `412` only says its copy is stale. A `PUT` is never `304` — §13.2.2
+       makes that answer `GET`/`HEAD`'s alone — so the outcome here is either
+       `200` or a thrown `412`. */
+    this.#conditional(head, existing);
     await this.#write(path, body);
     const stats = await this.#statOrAbsent(path);
     const headers: Record<string, string> = { "content-length": "0" };

@@ -1,6 +1,7 @@
 /**
- * The HTTP the two HTTP transports share: `HTTP-date`, `Range`, `ETag` and the
- * two entity-tag comparison functions.
+ * The HTTP the two HTTP transports share: `HTTP-date`, `Range`, `ETag`, the two
+ * entity-tag comparison functions, and the conditional-request rules built on
+ * them.
  *
  * All of it is **RFC 9110**, none of it is S3's or WebDAV's, and it lives here
  * for the same reason `src/errors.ts` holds one errno table: a wire format
@@ -343,6 +344,103 @@ export function etagMatchesWeakly(list: ETagList, etag: string): boolean {
 export function formatETag(etag: string): string {
   return etag.startsWith(`"`) && etag.endsWith(`"`) && etag.length >= 2 ? etag : `"${etag}"`;
 }
+
+// ---------------------------------------------------------------------------
+// conditional requests
+// ---------------------------------------------------------------------------
+
+/**
+ * The four conditional header fields, by their lowercase names.
+ *
+ * A plain record rather than either transport's own header shape: WebDAV hands
+ * over exactly this (`node:http` lowercases and combines), and the S3 gateway —
+ * which must keep its headers as a list, because SigV4 signs them as they were
+ * sent — builds one at the call site, joining repeated `If-Match`/`If-None-
+ * Match` lines the way RFC 9110 §5.3 permits. Only these four names are read.
+ */
+export type ConditionalHeaders = Readonly<Record<string, string | undefined>>;
+
+/** What the conditional headers are evaluated against. */
+export interface ConditionalTarget {
+  /** The representation's ETag, quoted or not — both compare the same. */
+  etag: string;
+  /** Its modification time, in milliseconds. */
+  mtimeMs: number;
+}
+
+/** The outcome: serve it, answer `304`, or answer `412`. */
+export interface ConditionalResult {
+  status: 200 | 304 | 412;
+}
+
+/**
+ * Evaluate the four conditional headers in RFC 9110 §13.2.2's order:
+ *
+ * 1. `If-Match` — no match is `412`.
+ * 2. `If-Unmodified-Since`, **only when `If-Match` is absent** — modified since
+ *    is `412`.
+ * 3. `If-None-Match` — a match is `304` for `GET`/`HEAD` and `412` for every
+ *    other method.
+ * 4. `If-Modified-Since`, **only when `If-None-Match` is absent and the method
+ *    is `GET` or `HEAD`** — not modified is `304`.
+ *
+ * `If-Match` compares strongly and `If-None-Match` weakly (§8.8.3.2), which is
+ * a difference a client can see even though every ETag either transport
+ * produces is strong: a weak tag *from the client* fails `If-Match` and passes
+ * `If-None-Match`.
+ *
+ * A date that does not parse is ignored, as §13.1.3 and §13.1.4 require ("a
+ * recipient MUST ignore the header field if the value is not a valid
+ * HTTP-date"). Comparison is at one-second resolution, because that is all an
+ * `HTTP-date` carries: an object modified 300 ms after the date in the header
+ * counts as *not* modified.
+ */
+export function evaluateConditionals(
+  target: ConditionalTarget,
+  headers: ConditionalHeaders,
+  method: string,
+): ConditionalResult {
+  const safe = method === "GET" || method === "HEAD";
+  const modifiedSeconds = Math.floor(target.mtimeMs / 1000);
+
+  const ifMatch = headers["if-match"];
+  if (ifMatch !== undefined) {
+    if (!etagMatchesStrongly(parseETagList(ifMatch), target.etag)) {
+      return { status: 412 };
+    }
+  } else {
+    const ifUnmodifiedSince = headers["if-unmodified-since"];
+    if (ifUnmodifiedSince !== undefined) {
+      const at = parseHttpDate(ifUnmodifiedSince);
+      if (at !== undefined && modifiedSeconds > Math.floor(at / 1000)) {
+        return { status: 412 };
+      }
+    }
+  }
+
+  const ifNoneMatch = headers["if-none-match"];
+  if (ifNoneMatch !== undefined) {
+    if (etagMatchesWeakly(parseETagList(ifNoneMatch), target.etag)) {
+      return { status: safe ? 304 : 412 };
+    }
+    return { status: 200 };
+  }
+
+  if (safe) {
+    const ifModifiedSince = headers["if-modified-since"];
+    if (ifModifiedSince !== undefined) {
+      const at = parseHttpDate(ifModifiedSince);
+      if (at !== undefined && modifiedSeconds <= Math.floor(at / 1000)) {
+        return { status: 304 };
+      }
+    }
+  }
+  return { status: 200 };
+}
+
+// ---------------------------------------------------------------------------
+// Content-Range
+// ---------------------------------------------------------------------------
 
 /** `Content-Range: bytes 0-99/1234` (RFC 9110 §14.4). */
 export function formatContentRange(start: number, end: number, total: number): string {
