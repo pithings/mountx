@@ -8,9 +8,9 @@ All 7 planned milestones are done (commits `8609d65..97e7ba9`, 2026-07-27/28):
 the driver interface and its two drivers, the FUSE protocol/session/root-mode
 transport, the validation suites (differential, record/replay, pjdfstest),
 NFSv3 loopback, and the conformance matrix + benchmark suite the README is
-drawn from. See `AGENTS.md` for the current code map and invariants, and
-`.agents/conformance-matrix.md` / `.agents/benchmarks.md` for the generated
-results.
+drawn from. See `.agents/architecture.md` for the current code map,
+`.agents/invariants.md` for the rules, and `.agents/conformance-matrix.md` /
+`.agents/benchmarks.md` for the generated results.
 
 ## Shipped since v1
 
