@@ -35,6 +35,7 @@ import { constants } from "node:fs";
 import { fsError } from "../../errors.ts";
 import { createLoopback, type Loopback } from "../../harness.ts";
 import { PathLock } from "../../lock.ts";
+import { claimNewEntry, type NewEntry, newEntryOwnership } from "../../ownership.ts";
 import { dirname, joinPath, normalizePath } from "../../path.ts";
 import type { FileHandleLike, FsDriver, StatsLike, TimeLike } from "../../types.ts";
 import { S_IFDIR, S_IFLNK, S_IFMT } from "../../types.ts";
@@ -73,9 +74,11 @@ import {
   MOUNTPROC3_UMNT,
   MOUNTPROC3_UMNTALL,
   NFS3_COOKIEVERFSIZE,
+  NFS3_CREATEVERFSIZE,
   NFS3_OK,
   NFS3_WRITEVERFSIZE,
   NFS3ERR_BAD_COOKIE,
+  NFS3ERR_EXIST,
   NFS3ERR_NOTSUPP,
   NFS3ERR_NOT_SYNC,
   NFS3ERR_TOOSMALL,
@@ -181,6 +184,7 @@ import {
 import {
   type AccessRights,
   allowedAccess,
+  ExclusiveCreates,
   MAX_OFFSET,
   modeBitsOfFtype,
   NAME_MAX,
@@ -320,12 +324,15 @@ export class Nfs3Session {
   readonly #snapshots: DirectorySnapshots;
   readonly #lock: PathLock;
   readonly #mounts: MountRecord[] = [];
+  /** The verifiers of `CREATE` with `EXCLUSIVE` — see `../util.ts`. */
+  readonly #exclusives: ExclusiveCreates;
   #destroyed = false;
 
   /**
-   * `shared` is the router's: one handle table, one path lock and one stats
-   * object across every version this server speaks. Left out — which is what
-   * this session's own tests do — each is constructed here instead.
+   * `shared` is the router's: one handle table, one path lock, one stats object
+   * and one exclusive-create table across every version this server speaks.
+   * Left out — which is what this session's own tests do — each is constructed
+   * here instead.
    */
   constructor(driver: FsDriver, options: NfsSessionOptions = {}, shared: NfsSharedState = {}) {
     this.driver = createLoopback(driver);
@@ -341,6 +348,7 @@ export class Nfs3Session {
     // Derived from the handle table's boot verifier, so both change together.
     this.writeVerifier = this.handles.verifier.slice(0, NFS3_WRITEVERFSIZE);
     this.#snapshots = new DirectorySnapshots(options.snapshotCache);
+    this.#exclusives = shared.exclusiveCreates ?? new ExclusiveCreates();
   }
 
   /** MOUNT registrations currently outstanding, in order. */
@@ -401,6 +409,7 @@ export class Nfs3Session {
     this.#destroyed = true;
     this.handles.clear();
     this.#snapshots.clear();
+    this.#exclusives.clear();
     this.#mounts.length = 0;
     await Promise.resolve();
   }
@@ -629,8 +638,23 @@ export class Nfs3Session {
 
   /** The `before` half of a `wcc_data`, taken before the operation runs. */
   async #preOp(path: string): Promise<WccAttr | undefined> {
+    const stats = await this.#preOpStats(path);
+    return stats === undefined ? undefined : wccAttrOf(stats);
+  }
+
+  /**
+   * The whole `lstat` behind {@link Nfs3Session.#preOp}, for the creating
+   * operations: they need the parent's mode and gid for set-gid inheritance
+   * (`#claim`) as well as the three fields a `wcc_attr` keeps, and this is the
+   * `lstat` they were already paying for.
+   *
+   * Swallows the failure for the same reason `#preOp` does — a `wcc_data` is a
+   * hint — and an unreadable parent then inherits nothing, which is what a
+   * parent with the bit clear does too.
+   */
+  async #preOpStats(path: string): Promise<StatsLike | undefined> {
     try {
-      return wccAttrOf(await this.#statOf(path));
+      return await this.#statOf(path);
     } catch {
       return undefined;
     }
@@ -724,6 +748,10 @@ export class Nfs3Session {
         throw new NfsStatusError(NFS3ERR_NOT_SYNC, "SETATTR guard does not match the ctime");
       }
       await this.#applySattr(path, request.attributes, { current: stats });
+      // §3.3.8's commit: this is the SETATTR an `EXCLUSIVE` create sends the
+      // client back for, and once it has landed the client is not going to
+      // retry the create. See `ExclusiveCreates` in `../util.ts`.
+      this.#exclusives.forget(path);
       writeWccRes(writer, { status: NFS3_OK, wcc: await this.#wcc(before, path) });
     } catch (error) {
       writeWccRes(writer, {
@@ -1077,23 +1105,29 @@ export class Nfs3Session {
    * server process, and without this a file created by uid 1000 comes back
    * owned by the server and then fails every permission check its own creator
    * makes. Skipped when the caller *is* the server, and quiet when the driver
-   * cannot express ownership.
+   * cannot express ownership — both in `claimNewEntry`.
+   *
+   * The group is not simply the caller's: a set-gid parent hands its own down,
+   * and a new directory takes the bit with it (`../../ownership.ts` has the
+   * rule and where it comes from). That is why `parent` is threaded in from the
+   * `lstat` `#preOpStats` already did for the reply's `wcc_data` rather than
+   * stat'ed here — every creating operation in this file reads the parent
+   * anyway, so the rule costs no extra round trip. It does cost an `lstat` and
+   * a `chmod` when a new directory has to take the bit, which is the one case
+   * that cannot be folded into the create: the mode the create asked for is not
+   * the mode it got (`../../ownership.ts` on the umask), so the bit goes on top
+   * of what the driver actually made.
+   *
+   * Only ever for something **this call created** — an `UNCHECKED` CREATE that
+   * found the file already there must not re-own it, and must not re-mode it
+   * either, which would strip the set-group-ID bit off a file the caller had
+   * nothing to do with.
    */
-  async #claim(path: string, creds: RpcCredentials): Promise<void> {
-    if (this.options.claimOwnership === false || creds.uid === undefined) {
+  async #claim(path: string, creds: RpcCredentials, entry: NewEntry): Promise<void> {
+    if (this.options.claimOwnership === false) {
       return;
     }
-    if (creds.uid === (process.getuid?.() ?? -1) && creds.gid === (process.getgid?.() ?? -1)) {
-      return;
-    }
-    try {
-      await this.driver.lchown(path, creds.uid, creds.gid ?? -1);
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
-        throw error;
-      }
-    }
+    await claimNewEntry(this.driver, path, newEntryOwnership(creds, entry));
   }
 
   async #create(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
@@ -1104,25 +1138,33 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "open"));
-      before = await this.#preOp(dir);
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
       if (request.mode === CREATE_EXCLUSIVE) {
-        // `EXCLUSIVE` asks the server to *store* the client's verifier
-        // somewhere it survives a retry, so a duplicated request recognises its
-        // own creation instead of failing `EEXIST`. There is nowhere in the
-        // driver interface to keep it (it would want an xattr), and inventing a
-        // side table that a restart loses would be a worse lie than saying no.
-        // Linux falls back to `GUARDED` on this status.
-        throw new NfsStatusError(NFS3ERR_NOTSUPP, "EXCLUSIVE create is not supported");
+        await this.#createExclusive(dir, path, request.verf, creds, parent);
+        await this.#created(writer, dir, before, path);
+        return;
       }
-      const mode = request.attributes?.mode;
-      const flags =
-        constants.O_WRONLY |
-        constants.O_CREAT |
-        (request.mode === CREATE_GUARDED ? constants.O_EXCL : 0);
-      const handle = await this.driver.open(path, flags, (mode ?? 0o666) & 0o7777);
-      await handle.close();
+      const mode = (request.attributes?.mode ?? 0o666) & 0o7777;
+      const created = await this.#createFile(path, mode);
+      if (!created && request.mode === CREATE_GUARDED) {
+        // "GUARDED ... the server checks for the presence of a duplicate
+        // object by name before performing the create."
+        throw new NfsStatusError(NFS3ERR_EXIST, "an object of that name already exists");
+      }
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      if (created) {
+        await this.#claim(path, creds, { parent, directory: false, mode });
+      } else {
+        // `UNCHECKED` over an existing file is an `open(2)` of that file, and
+        // its refusals are this server's answer: `EISDIR` for a directory,
+        // `EACCES` for a file this caller may not write. Learning whether the
+        // create won had to be an `O_EXCL` attempt (a `stat` first would be a
+        // race, and would tell `#claim` to re-own and re-mode a file this call
+        // did not make), so the plain open is made here instead of skipped.
+        const handle = await this.driver.open(path, constants.O_WRONLY | constants.O_CREAT, mode);
+        await handle.close();
+      }
       // `UNCHECKED` over an existing file still applies the attributes, which
       // is how a client asks for `open(…, O_CREAT|O_TRUNC)` in one round trip.
       await this.#applySattr(path, { ...request.attributes, mode: undefined });
@@ -1133,6 +1175,90 @@ export class Nfs3Session {
     return;
   }
 
+  /**
+   * `CREATE` with `EXCLUSIVE` (§3.3.8): create it, or recognise the retry.
+   *
+   * The mode exists because a client cannot make a create idempotent by itself:
+   * if the reply is lost, the resend cannot tell "I created it" from "someone
+   * else did". So the client sends a verifier it made up, and the server
+   * remembers which verifier created which file — a resend carrying the same
+   * one is answered with the file it already made, and a *different* verifier
+   * on the same name is the second client, which is the case that really is
+   * `NFS3ERR_EXIST`.
+   *
+   * What "remembers" means here — a bounded table in memory, so a retry is
+   * covered and a restart is not — is stated in full on `ExclusiveCreates` in
+   * `../util.ts`. §3.3.8 would rather that were stable storage and offers
+   * `NFS3ERR_NOTSUPP` to a server that cannot manage it, which is what this
+   * answered before the table existed.
+   *
+   * There are **no attributes**: `createhow3`'s `EXCLUSIVE` arm carries the
+   * verifier *instead of* an `sattr3`, and §3.3.8 has the client follow up with
+   * a SETATTR carrying the ones it wanted — the same SETATTR that retires the
+   * entry, since after it the client is no longer relying on the retry. The
+   * file is therefore created with the mode `UNCHECKED` uses when the client
+   * names none, and the client's SETATTR narrows it.
+   */
+  async #createExclusive(
+    dir: string,
+    path: string,
+    verf: Uint8Array | undefined,
+    creds: RpcCredentials,
+    parent: StatsLike | undefined,
+  ): Promise<void> {
+    const verifier = verf ?? new Uint8Array(NFS3_CREATEVERFSIZE);
+    // Recorded from inside the create, before it awaits anything else: the
+    // duplicate this mode exists for is a *retransmission*, sent because the
+    // reply was lost, and it therefore arrives while the original is still in
+    // flight. A verifier recorded after the `close()` — or after the `#claim`
+    // below — is one the duplicate looks for, does not find, and is answered
+    // `NFS3ERR_EXIST` for, by the very create that succeeded.
+    const created = await this.#createFile(path, 0o666, () => this.#exclusives.set(path, verifier));
+    if (!created) {
+      if (this.#exclusives.match(path, verifier) === undefined) {
+        throw new NfsStatusError(NFS3ERR_EXIST, "a different file already has that name");
+      }
+      // The duplicate of a request whose reply never arrived. Nothing to
+      // create, nothing to invalidate, nothing to chown a second time — the
+      // caller answers with the file this client already made.
+      return;
+    }
+    this.#invalidate(dir);
+    await this.#claim(path, creds, { parent, directory: false, mode: 0o666 });
+  }
+
+  /**
+   * Create a file, answering whether it was **this call** that created it.
+   *
+   * `O_EXCL` rather than a `stat` first, for the same reason `v4/session.ts`
+   * learns it the same way: a `stat` would be a race, and every caller here
+   * needs the answer to be the truth about its own create — `#claim` may only
+   * give away a file this call made, and an `UNCHECKED` CREATE over a file
+   * somebody else owns must not re-own it or strip the set-group-ID bit off it.
+   *
+   * `onCreated` runs after the create wins and before the `close()`, i.e.
+   * before this function's next `await`. That is the only place a concurrent
+   * duplicate cannot already have overtaken — see `#createExclusive`.
+   */
+  async #createFile(path: string, mode: number, onCreated?: () => void): Promise<boolean> {
+    let handle: FileHandleLike;
+    try {
+      handle = await this.driver.open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        mode,
+      );
+    } catch (error) {
+      if ((error as { code?: string }).code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+    onCreated?.();
+    await handle.close();
+    return true;
+  }
+
   async #mkdir(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {
     const request = readMkdirArgs(args);
     args.end("MKDIR arguments");
@@ -1141,10 +1267,12 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "mkdir"));
-      before = await this.#preOp(dir);
-      await this.driver.mkdir(path, { mode: (request.attributes.mode ?? 0o777) & 0o7777 });
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
+      const mode = (request.attributes.mode ?? 0o777) & 0o7777;
+      await this.driver.mkdir(path, { mode });
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      await this.#claim(path, creds, { parent, directory: true, mode });
       await this.#applySattr(path, { ...request.attributes, mode: undefined });
       await this.#created(writer, dir, before, path);
     } catch (error) {
@@ -1161,10 +1289,13 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "symlink"));
-      before = await this.#preOp(dir);
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
       await this.driver.symlink(request.target, path);
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      // A symlink's own mode is 0o777 and not the client's to choose, so the
+      // only half of the rule that can apply to one is the group.
+      await this.#claim(path, creds, { parent, directory: false, mode: 0o777 });
       // A symlink has no mode of its own to set; times and ownership still do.
       await this.#applySattr(
         path,
@@ -1195,7 +1326,8 @@ export class Nfs3Session {
     try {
       dir = this.#pathOf(request.where.dir);
       const path = joinPath(dir, this.#checkName(request.where.name, "mknod"));
-      before = await this.#preOp(dir);
+      const parent = await this.#preOpStats(dir);
+      before = parent === undefined ? undefined : wccAttrOf(parent);
       const mknod = this.driver.mountx?.mknod;
       if (mknod === undefined) {
         throw new NfsStatusError(NFS3ERR_NOTSUPP, "MKNOD needs the mountx.mknod extension");
@@ -1204,7 +1336,7 @@ export class Nfs3Session {
       const rdev = ((request.spec?.major ?? 0) << 8) | (request.spec?.minor ?? 0);
       await mknod.call(this.driver.mountx, path, mode | modeBitsOfFtype(request.type), rdev);
       this.#invalidate(dir);
-      await this.#claim(path, creds);
+      await this.#claim(path, creds, { parent, directory: false, mode });
       await this.#created(writer, dir, before, path);
     } catch (error) {
       await this.#createFailed(writer, dir, before, error);
@@ -1236,6 +1368,9 @@ export class Nfs3Session {
       if (entry !== undefined && directory) {
         this.#snapshots.delete(entry.id);
       }
+      // Whatever appears at this name next is a different file, and must not
+      // inherit the promise made about this one.
+      this.#exclusives.forget(path);
       writeWccRes(writer, { status: NFS3_OK, wcc: await this.#wcc(before, dir) });
     } catch (error) {
       writeWccRes(writer, {
@@ -1266,6 +1401,11 @@ export class Nfs3Session {
       // client goes on using the handle it already has, for the file and for
       // everything below it if this was a directory.
       this.handles.remap(from, to);
+      // The verifiers are keyed by *path*, and both of these paths now name
+      // something else: `from` nothing, `to` the file that moved onto it (over
+      // whatever was there). Neither promise survives the move.
+      this.#exclusives.forget(from);
+      this.#exclusives.forget(to);
       // Exactly two directories changed their names: the one that lost `from`
       // and the one that gained `to`. A directory that *moved* keeps its own
       // snapshot — same contents, and `remap` kept it the same entry — and no

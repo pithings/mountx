@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
-import { readFile, stat as nodeStat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat as nodeStat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../src/drivers/memory.ts";
+import { createNodeFsDriver } from "../src/drivers/node-fs.ts";
 import {
   basename,
   createLoopback,
@@ -18,7 +21,8 @@ import {
   resolvePath,
   splitPath,
 } from "../src/index.ts";
-import type { FsDriver } from "../src/index.ts";
+import type { ErrnoCode, FsDriver, StatsLike } from "../src/index.ts";
+import { claimNewEntry, newEntryOwnership } from "../src/ownership.ts";
 
 describe("every entry point runs under node's type stripping", () => {
   /**
@@ -341,6 +345,183 @@ describe("errors", () => {
     expect(isFsError(fsError("EPERM"), "EACCES")).toBe(false);
     expect(isFsError(new Error("plain"))).toBe(false);
     expect(isFsError(null)).toBe(false);
+  });
+});
+
+/**
+ * `src/ownership.ts` on its own: the decision, with no session around it.
+ *
+ * The NFS session suites drive the same rule end to end; this is the table of
+ * cases `inode_init_owner()` distinguishes, including the two a wire is
+ * unlikely to produce (an unreadable parent, a caller who did not say who it
+ * is) and the one that needs a privileged caller.
+ */
+describe("set-gid inheritance", () => {
+  /** Only the two fields the rule reads. */
+  const dir = (mode: number, gid: number): StatsLike => ({ mode, gid }) as StatsLike;
+  const caller = { uid: 1000, gid: 1000, gids: [] as number[] };
+
+  it("takes the caller's group when the parent has no set-gid bit", () => {
+    expect(
+      newEntryOwnership(caller, { parent: dir(0o40755, 4000), directory: false, mode: 0o644 }),
+    ).toEqual({ uid: 1000, gid: 1000, setgid: undefined });
+  });
+
+  it("inherits nothing from a parent that could not be read", () => {
+    expect(newEntryOwnership(caller, { parent: undefined, directory: true, mode: 0o755 })).toEqual({
+      uid: 1000,
+      gid: 1000,
+      setgid: undefined,
+    });
+  });
+
+  it("leaves both alone for a caller that did not say who it is", () => {
+    // AUTH_NONE: `-1` is `chown`'s "leave this one alone", and there is still a
+    // group to inherit if the parent has the bit.
+    expect(newEntryOwnership({}, { parent: undefined, directory: false, mode: 0o644 })).toEqual({
+      uid: -1,
+      gid: -1,
+      setgid: undefined,
+    });
+    expect(
+      newEntryOwnership({}, { parent: dir(0o42775, 4000), directory: false, mode: 0o644 }),
+    ).toEqual({ uid: -1, gid: 4000, setgid: undefined });
+  });
+
+  it("asks for the bit on a new directory, whatever mode the create named", () => {
+    expect(
+      newEntryOwnership(caller, { parent: dir(0o42775, 4000), directory: true, mode: 0o755 }),
+    ).toEqual({ uid: 1000, gid: 4000, setgid: true });
+    // Asked for even when the create named it: `mkdir(2)` is not allowed to set
+    // `S_ISGID` itself, so whether it is there is a question for the driver.
+    // `claimNewEntry` reads back and skips the `chmod` when it already is.
+    expect(
+      newEntryOwnership(caller, { parent: dir(0o42775, 4000), directory: true, mode: 0o2755 }),
+    ).toEqual({ uid: 1000, gid: 4000, setgid: true });
+  });
+
+  it("clears set-gid on an executable for a group the caller is not in", () => {
+    const entry = { parent: dir(0o42775, 4000), directory: false, mode: 0o2775 };
+    expect(newEntryOwnership(caller, entry).setgid).toBe(false);
+    // Membership counts whether it is the effective group or a supplementary
+    // one, and a privileged caller keeps the bit either way
+    // (`capable_wrt_inode_uidgid(dir, CAP_FSETID)`).
+    expect(newEntryOwnership({ uid: 1000, gid: 4000 }, entry).setgid).toBeUndefined();
+    expect(newEntryOwnership({ ...caller, gids: [4000] }, entry).setgid).toBeUndefined();
+    expect(newEntryOwnership({ ...caller, uid: 0 }, entry).setgid).toBeUndefined();
+    // Not group-executable: nothing to run as, so nothing to clear.
+    expect(newEntryOwnership(caller, { ...entry, mode: 0o2664 }).setgid).toBeUndefined();
+  });
+
+  describe("applying it", () => {
+    /**
+     * A driver that records its calls, and can be told to refuse them.
+     *
+     * `lstat` answers with `mode`, which is what the entry is supposed to have
+     * come back from the create as — the whole point of the read-back being
+     * that it is not the mode the create *asked* for.
+     */
+    function recorder(mode = 0o755, refusal?: string) {
+      const calls: string[] = [];
+      const answer = async (what: string): Promise<void> => {
+        calls.push(what);
+        if (refusal !== undefined) throw fsError(refusal as ErrnoCode);
+      };
+      return {
+        calls,
+        lchown: (path: string, uid: number, gid: number) => answer(`lchown ${path} ${uid}:${gid}`),
+        chmod: (path: string, mode: number) => answer(`chmod ${path} ${mode.toString(8)}`),
+        lstat: async (path: string) => {
+          calls.push(`lstat ${path}`);
+          if (refusal !== undefined) throw fsError(refusal as ErrnoCode);
+          return { mode } as StatsLike;
+        },
+      };
+    }
+
+    it("chowns, then chmods — never the other way round", async () => {
+      const driver = recorder(0o755);
+      await claimNewEntry(driver, "/f", { uid: 1000, gid: 4000, setgid: true });
+      // `chown(2)` clears set-group-ID on an executable when an unprivileged
+      // caller changes ownership, so the bit has to go on afterwards.
+      expect(driver.calls).toEqual(["lchown /f 1000:4000", "lstat /f", "chmod /f 2755"]);
+    });
+
+    it("chmods the mode the driver made, not the one the create asked for", async () => {
+      // The create asked for 0o775 and a umask of 022 made it 0o755. Asserting
+      // the requested mode here would hand the caller group-write it was denied
+      // one directory over, purely because this parent is set-gid.
+      const driver = recorder(0o755);
+      await claimNewEntry(driver, "/d", { uid: -1, gid: 4000, setgid: true });
+      expect(driver.calls).toEqual(["lchown /d -1:4000", "lstat /d", "chmod /d 2755"]);
+
+      // And the clearing direction reads back the same way.
+      const executable = recorder(0o2755);
+      await claimNewEntry(executable, "/x", { uid: -1, gid: 4000, setgid: false });
+      expect(executable.calls).toEqual(["lchown /x -1:4000", "lstat /x", "chmod /x 755"]);
+    });
+
+    it("does nothing when the driver already produced the answer", async () => {
+      const driver = recorder();
+      await claimNewEntry(driver, "/f", {
+        uid: process.getuid?.() ?? -1,
+        gid: process.getgid?.() ?? -1,
+        setgid: undefined,
+      });
+      await claimNewEntry(driver, "/f", { uid: -1, gid: -1, setgid: undefined });
+      expect(driver.calls).toEqual([]);
+
+      // ...including a driver that applied the rule itself: the bit is already
+      // there, so the read-back is the end of it.
+      const inherited = recorder(0o2755);
+      await claimNewEntry(inherited, "/d", { uid: -1, gid: -1, setgid: true });
+      expect(inherited.calls).toEqual(["lstat /d"]);
+    });
+
+    /**
+     * The same thing against a driver with a real umask behind it.
+     *
+     * The recorder above proves what is chmod'ed; this proves the number it is
+     * computed from is the truth. `createNodeFsDriver` goes to `node:fs`, so
+     * `mkdir`'s mode is masked by the umask of *this* process and the `chmod`
+     * that follows is not — which is the whole bug: asserting the requested
+     * mode here widens a directory that a plain parent would have narrowed.
+     * The memory driver applies no umask unless asked, which is why none of the
+     * session suites could see it.
+     */
+    it("reads back a real driver rather than widening what the umask narrowed", async () => {
+      const sandbox = await mkdtemp(join(tmpdir(), "mountx-setgid-"));
+      try {
+        const driver = createNodeFsDriver(sandbox);
+        await driver.mkdir!("/d", { mode: 0o775 });
+        const created = (await driver.lstat!("/d")).mode & 0o7777;
+        await claimNewEntry(driver as never, "/d", { uid: -1, gid: -1, setgid: true });
+        const claimed = (await driver.lstat!("/d")).mode & 0o7777;
+        // Exactly one bit different, whatever this host's umask turned 0o775
+        // into — 0o755 at the usual 022, which the old rule published as
+        // 0o2775.
+        expect(claimed).toBe(created | 0o2000);
+      } finally {
+        await rm(sandbox, { recursive: true, force: true });
+      }
+    });
+
+    it("is quiet for a driver with no concept of ownership, and only for that", async () => {
+      for (const code of ["ENOSYS", "EPERM", "ENOTSUP"]) {
+        const driver = recorder(0o755, code);
+        await claimNewEntry(driver, "/f", { uid: 1000, gid: 4000, setgid: true });
+        // Quiet, and the refused `lchown` does not stop the mode half from
+        // being tried: they are two different things the driver may or may not
+        // have. The `lstat` refusing is the end of that half, since there is
+        // nothing to put the bit on top of.
+        expect(driver.calls).toEqual(["lchown /f 1000:4000", "lstat /f"]);
+      }
+      // Anything else is a real failure of the create that just happened.
+      const broken = recorder(0o755, "EIO");
+      await expect(
+        claimNewEntry(broken, "/f", { uid: 1000, gid: 4000, setgid: undefined }),
+      ).rejects.toMatchObject({ code: "EIO" });
+    });
   });
 });
 

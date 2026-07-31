@@ -164,8 +164,12 @@ without a line of rename code changing.
     reason `#claim` sets only `uid`/`gid`.
 - **Known gaps that are ours but not pjdfstest's.** Set-gid directory
   inheritance (a new entry in a set-gid directory should take its parent's
-  group) is not implemented; pjdfstest does not cover it, and the honest fix is
-  caller credentials in the driver interface rather than more work in `#claim`.
+  group; a new subdirectory takes the bit too) is not implemented **on this
+  transport**. The rule shipped as `src/ownership.ts` and both NFS sessions
+  apply it, but the FUSE session does not — `#claim` there states the two
+  reasons, and `.agents/roadmap.md` carries the item. pjdfstest does not cover
+  it, so none of the numbers above move either way: they were not re-measured
+  for that change and did not need to be.
 
 ## Running it
 

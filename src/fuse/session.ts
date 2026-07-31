@@ -867,10 +867,26 @@ export class FuseSession {
    * not privileged enough to hand ownership away (`EPERM`): a driver with no
    * concept of ownership is not thereby broken.
    *
-   * Two things this does **not** do, both of which want the credentials to
-   * reach the driver properly rather than more patching here: supplementary
-   * groups (only `gid` is on the wire before `FUSE_EXT_GROUPS`), and the
-   * set-gid directory rule that gives a new entry its parent's group.
+   * **Set-gid inheritance is missing here, and unlike on 9P that is a gap.**
+   * The rule — a new entry in a set-gid directory takes the parent's group, a
+   * new directory takes the bit too — is in `../ownership.ts`, and the two NFS
+   * sessions apply it. Nothing applies it on this wire: the kernel calls
+   * `inode_init_owner()` for local filesystems and leaves it to the server for
+   * a FUSE one. Two things stand between here and it, which is why it is not
+   * simply mirrored:
+   *
+   * - **A `stat` of the parent per create.** The NFS sessions read the parent
+   *   anyway — for `wcc_data` on v3, for `change_info4` on v4.1 — so the rule
+   *   is free there. Nothing here reads it: `#childOf` resolves a nodeid to a
+   *   path without touching the driver, and the skip above means the common
+   *   case currently costs *no* driver call at all. Applying the rule would
+   *   make every create cost one, for every caller.
+   * - **The membership half cannot be answered.** Linux clears `S_ISGID` on a
+   *   new group-executable file when the creator is not in the target group,
+   *   and the only thing that puts that group on this wire is
+   *   `FUSE_CREATE_SUPP_GROUP` — 7.38, riding in a `FUSE_EXT_GROUPS` extension
+   *   block, and listed in `./init.ts` among the flags this server does not
+   *   ask for because nothing consumed them.
    */
   async #claim(path: string, header: FuseInHeader): Promise<void> {
     const uid = process.getuid?.() ?? -1;

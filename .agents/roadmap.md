@@ -7,6 +7,13 @@ map, `.agents/invariants.md` the rules, `.agents/conformance-matrix.md` /
 Nothing is removed from this file until it is done _and_ recorded in one of
 those.
 
+**Then it is removed entirely.** Finished work is not mentioned here at all —
+not as a checked box, not as "X shipped", not as "half of this is closed". An
+entry that needs a fact about what exists states it in the present tense, as the
+constraint the remaining work runs into; the entry is deleted the moment nothing
+is left to run into it. A reader here is looking for what to pick up, and every
+sentence about something already done is a sentence they have to rule out first.
+
 ## Decisions still binding
 
 - **Layout:** single `mountx` package with subpath exports; the pnpm workspace
@@ -28,6 +35,24 @@ those.
 - **The S3 gateway stays out of `mountx/auto`.** Auto's whole contract is a
   mountpoint and that transport never produces one.
 - **NLM byte-range locking is out of scope**, hence NFS mounts use `nolock`.
+- **Per-call caller credentials are not going into `FsDriver`.** The shape would
+  be a `mountx.*` extension carrying the caller's uid/gid/groups into each
+  creating call, so ownership is the driver's from the start instead of a
+  post-hoc `lchown` in each session's `#claim`. Three things against it, and
+  they compound: `node:fs/promises` has no credential parameter and the POSIX
+  way to get one — `setfsuid(2)`/`setfsgid(2)` — is per-thread state Node does
+  not expose and the threadpool would scramble, so `node-fs` could never
+  implement it and `unstorage`/S3 have no ownership to implement it with; the
+  memory driver, the only one that could, enforces no permissions at all, so the
+  only observable effect of a credential inside it is the initial owner and
+  group, which `src/ownership.ts` decides; and invariant 5 means every session
+  keeps the `lchown` path anyway for drivers without the extension, so the whole
+  surface buys one driver's atomicity at the price of two permanent code paths.
+  What would reopen it is a driver that enforces permissions itself — there the
+  credential decides whether a call _succeeds_, not just who owns the result,
+  and `#claim` cannot express that at all. Where the **server** decides, the
+  credential is already first-class: `allowedAccess()` in `src/nfs/util.ts`
+  answers ACCESS from the effective and supplementary groups both.
 - **Subagent models:** implementation work SHOULD use `opus`; docs work SHOULD
   use `sonnet`.
 
@@ -37,9 +62,7 @@ Nothing here blocks a release; each is a real gap worth picking up deliberately
 rather than by accident.
 
 - **FUSE reader concurrency: one mode worth building, two not.** Async
-  main-thread mode is all that ships. This bullet used to ask for a relay mode
-  and a sync-driver-in-workers mode; a design pass against
-  `.agents/benchmarks.md` cut it down, and what follows is the residue.
+  main-thread mode is all there is.
 
   **Relay buys no throughput.** The reader-count experiment already says pulling
   requests off `/dev/fuse` is not the bottleneck, so a mode whose whole content
@@ -75,23 +98,18 @@ rather than by accident.
   and use the mount from another. `bench/drive.ts` does exactly that in reverse,
   which is why no benchmark column has ever wedged.
 
-- **9P `trans=fd`, no longer waiting on a relay.** It was deferred twice, and
-  both premises are gone. `.agents/9p-plan.md` deferred it because Node
-  supposedly cannot create a socketpair without native code; that is **false**,
-  and verified on this host — libuv's `stdio: "pipe"` on POSIX _is_
-  `socketpair(AF_UNIX, SOCK_STREAM)`, the child's inherited fd reads
+- **9P `trans=fd`.** Reachable today with no relay and no native code, and an
+  ordinary option to be judged on its own merits: Node _can_ create a socketpair
+  without native code — verified on this host, libuv's `stdio: "pipe"` on POSIX
+  **is** `socketpair(AF_UNIX, SOCK_STREAM)`, the child's inherited fd reads
   `socket:[…]`, and the parent end is a full-duplex `net.Socket` that
-  round-trips bytes. This file deferred it again because it wanted a descriptor
-  only a relay would hold; with relay cut down to a worker that holds nothing of
-  the sort, that no longer follows either. So `trans=fd` is reachable today with
-  no relay and no native code, and it is now an ordinary option to be judged on
-  its own merits. Two facts need one root mount each first: whether `mount(8)`
-  keeps an inherited socket fd open across `mount(2)`, and whether v9fs's
-  `trans=fd` drives an `AF_UNIX` stream.
-- **An NFSv4.1 bench column.** 9P has one now (`pnpm bench:9p`), which leaves
-  v4.1 as the last transport that is in the conformance matrix and not in the
-  benchmarks.
-- **Whether `DEFAULT_MAX_IN_FLIGHT` should be higher.** The 9P column put numbers
+  round-trips bytes. (`.agents/9p-plan.md` says otherwise; it is wrong.) Two
+  facts need one root mount each first: whether `mount(8)` keeps an inherited
+  socket fd open across `mount(2)`, and whether v9fs's `trans=fd` drives an
+  `AF_UNIX` stream.
+- **An NFSv4.1 bench column.** The last transport that is in the conformance
+  matrix and not in the benchmarks.
+- **Whether `DEFAULT_MAX_IN_FLIGHT` should be higher.** The 9P column has numbers
   behind both of that transport's knobs, and they point opposite ways. The
   dispatch window pays: 64 against the shipped 16 is 1.34–1.35× on stats 64 deep,
   and closing it to 1 costs 0.87–0.94×, so the default sits below where it stops
@@ -112,19 +130,17 @@ rather than by accident.
   covered at Tier 0/1 — two connections on one `createP9Server`, including the
   release when one drops — but two _real_ mounts of one server, a guest and its
   host or two guests, is not, and needs a host that can produce them.
-- **A driver → transport "path X changed underneath you" channel.** Half of this
-  already ships, and it is the transport-facing half: `notifyInvalInode()` /
-  `notifyInvalEntry()` on the FUSE session (`src/fuse/session.ts`) and on the
-  mount (`src/fuse/mount.ts`), pure encoders in `src/fuse/notify.ts`. What is
-  missing is the driver end — nothing in `FsDriver` can say a path changed, so
-  the only caller today is code that already knows because it made the change
-  itself. It is **not** a `mountx.*` member: every extension there is a
-  path-shaped call the session makes, and this is an event the driver raises
-  unprompted, so it wants a `watch`-shaped surface on `FsDriver` rather than a
-  method in the namespace. The FUSE half of the translation is already in place
-  — `InodeTable.byPath` turns the path into the `ino` a notification needs, and
-  a path the kernel never looked up has nothing cached, which is the natural
-  no-op.
+- **A driver → transport "path X changed underneath you" channel.** The driver
+  end is what is missing: nothing in `FsDriver` can say a path changed, so the
+  only caller of `notifyInvalInode()` / `notifyInvalEntry()`
+  (`src/fuse/session.ts`, `src/fuse/mount.ts`, encoders in `src/fuse/notify.ts`)
+  is code that already knows because it made the change itself. It is **not** a
+  `mountx.*` member: every extension there is a path-shaped call the session
+  makes, and this is an event the driver raises unprompted, so it wants a
+  `watch`-shaped surface on `FsDriver` rather than a method in the namespace.
+  The translation costs nothing — `InodeTable.byPath` turns the path into the
+  `ino` a notification needs, and a path the kernel never looked up has nothing
+  cached, which is the natural no-op.
   **FUSE is the only transport that could consume it today, and the only one
   that can without new protocol work.** 9P has no invalidation message at all
   (below). NFSv3 is request/response only: client caching is bounded by
@@ -163,9 +179,8 @@ rather than by accident.
   unprivileged, zero-native-code path for macOS/Windows. Windows also has no
   `mount(8)`, so it stays out of the NFS transport's platform switch.
 - **A `mknod` polyfill for drivers that cannot store a special file
-  themselves.** The extension itself shipped (`mountx.mknod` + the memory
-  driver, which closed the whole pjdfstest gap). What is deferred is the
-  fallback: an overlay holding the node in memory only, writing nothing through
+  themselves.** A driver without `mountx.mknod` answers `ENOTSUP`; the fallback
+  would be an overlay holding the node in memory only, writing nothing through
   to the backing store — a small union filesystem, because it has to win on
   every creating call (`mkdir`/`symlink`/`link`/`open(O_CREAT)`/a `rename`
   destination must answer `EEXIST` against an overlaid name) and not merely on
@@ -176,10 +191,13 @@ rather than by accident.
   every other one.
 - **xattr and the rest of the `mountx.*` extension namespace** (byte-range
   locks, `fallocate`/`lseek`) — `ENOTSUP` until a real user needs one.
-  Cache-invalidation `notify` used to be listed here and is not an extension at
-  all; it has its own entry above.
-- **NFS `CREATE` with `EXCLUSIVE`** — currently `NFS3ERR_NOTSUPP`; the verifier
-  would have to be stored somewhere that survives a retry.
+  Cache-invalidation `notify` is not an extension at all; it has its own entry
+  above.
+- **`suppattr_exclcreat` (75) is unadvertised** in `src/nfs/v4/attr.ts`'s
+  `SUPPORTED_ATTRS`. The exclusive-create verifier lives beside the file rather
+  than in an attribute, so the honest value is the full settable set — the
+  attribute's "deliberately absent, it is the OPEN step's call" note predates
+  the OPEN step making that call.
 - **FUSE over io_uring** (Linux 6.14+) — would replace the read/reply loop with
   a shared ring and obsolete the threadpool discussion entirely; the transport
   layer should stay swappable so this is one file, not a rewrite.
@@ -196,20 +214,31 @@ rather than by accident.
 - **`mountx/drivers/s3`** — an `FsDriver` over a real S3-compatible bucket,
   mounting one rather than serving one; the natural follow-up to the S3 gateway
   transport. It would reuse `test/s3/client.ts`'s signing client instead of
-  writing a second one. Not started.
-- **Handle-table growth bound.** Neither NFS version has a `FORGET`, so nothing
-  tells the server a client is done with a handle. Half of this is closed:
-  `FileHandleTable.#detachPath` drops an entry once its last path is detached,
-  so create/delete churn under a mount no longer grows the table without bound.
-  What is left is genuinely bounded: **one entry per path a client currently has
-  a name for**, held for the life of the server however long ago the client
-  looked, plus the root entry, which is exempt from eviction because
-  `PUTROOTFH`/`PUTPUBFH`/`MNT` encode it from a field rather than from a lookup.
-  A generation-stamped LRU is the fix if a workload needs a bound on _that_ — it
-  is the only remaining growth, and the one an LRU can serve without breaking a
-  live client.
-- **Set-gid inheritance and caller credentials in the driver interface.** A new
-  entry in a set-gid directory should take its parent's group; more generally,
-  supplementary groups and per-call caller credentials want to be first-class in
-  `FsDriver` rather than patched on after the fact (the way new-inode ownership
-  is today, via a post-hoc `lchown` in each session's `#claim`).
+  writing a second one.
+- **A default for `maxHandles`.** The cap is opt-in, and what makes picking a
+  default a judgement call rather than a number is that **the cap is soft**: an
+  entry with live NFSv4.1 state is pinned and never a victim, so when every
+  candidate is pinned the table exceeds `maxHandles` rather than breaking a
+  share reservation, and it does not evict its way back down until the opens
+  close. A default is therefore a hint about the working set, not a memory
+  ceiling, and the honest one depends on a workload nobody has measured here
+  yet. Two smaller things belong with it: nothing enforces a floor relative to a
+  READDIRPLUS page (at `maxHandles: 8` one 40-entry page returns 40 handles of
+  which 33 are stale before the reply leaves — it converges, and it is
+  documented rather than clamped), and `MNT` binds the export root through an
+  ordinary lookup, so a _subdirectory_ export's mount root is evictable and a v3
+  client has no name above it to recover with. A directly constructed
+  `Nfs3Session` / `Nfs4Session` also builds its own table and ignores the
+  option; every public path goes through the router, so this is the tests and
+  the CLI only.
+- **Set-gid inheritance on the FUSE session.** `src/ownership.ts` holds the rule
+  (`inode_init_owner()`) and the two NFS sessions apply it from the parent
+  `stat` they take anyway for `wcc_data` / `change_info4`. 9P needs nothing —
+  its client computes both halves (`v9fs_get_fsgid_for_create()`) and they
+  arrive on the wire. FUSE is the gap, and `#claim` in `src/fuse/session.ts`
+  says why it is not simply mirrored: nothing on that path reads the parent, so
+  the rule would add an `lstat` to every create for every caller — including the
+  daemon-is-the-caller case that costs no driver call at all — and the
+  membership half needs `FUSE_CREATE_SUPP_GROUP` (7.38), which
+  `src/fuse/init.ts` does not ask for. Both are decisions to take deliberately,
+  not omissions.

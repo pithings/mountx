@@ -16,11 +16,14 @@
  *   directly; `server.ts` adds nothing this file is about.
  *
  * What the router *owns* rather than routes — the one handle table, the one
- * counters object shared by both versions — is asserted in
- * `test/nfs/v4/session.test.ts`, where there is a v4 client to obtain a handle
- * with. This file is the switch itself.
+ * counters object, the one exclusive-create table shared by both versions — is
+ * asserted in `test/nfs/v4/session.test.ts`, where there is a v4 client to
+ * obtain a handle with and a v3 one beside it. This file is the switch itself,
+ * plus the one owned object with edges no client can reach: the block at the
+ * bottom is `ExclusiveCreates`' window and size cap.
  */
 
+import { Buffer } from "node:buffer";
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
 import {
@@ -33,6 +36,11 @@ import {
   RPC_SUCCESS,
 } from "../../src/nfs/rpc.ts";
 import { NfsSession } from "../../src/nfs/session.ts";
+import {
+  DEFAULT_EXCLUSIVE_CREATES,
+  EXCLUSIVE_CREATE_WINDOW_MS,
+  ExclusiveCreates,
+} from "../../src/nfs/util.ts";
 import { MOUNT_PROGRAM, MOUNT_V3, NFS_PROGRAM, NFS_V3 } from "../../src/nfs/v3/constants.ts";
 import {
   NFS4_OK,
@@ -197,5 +205,114 @@ describe("the version router: which session gets the record", () => {
     const reply = await session().handleCall(bytes);
     const { results } = decodeReply(reply!);
     expect(results.u32("status")).toBe(NFS4_OK);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the exclusive-create table
+// ---------------------------------------------------------------------------
+
+/**
+ * The other thing the router owns: one table of exclusive-create verifiers
+ * across both versions.
+ *
+ * What it *means* — a v3 `CREATE EXCLUSIVE` and a v4 `OPEN EXCLUSIVE4` are the
+ * same promise — is asserted through the wire in the two versioned suites.
+ * This block is about the promise's edges, which are deliberately not
+ * reachable from a client: the window and the size cap. Both are bounds rather
+ * than protocol, so they are tested where they are written.
+ */
+describe("ExclusiveCreates", () => {
+  const VERIFIER = Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]);
+  const OTHER = Uint8Array.from([9, 9, 9, 9, 9, 9, 9, 9]);
+
+  it("matches the verifier that created a path, and nothing else", () => {
+    const table = new ExclusiveCreates();
+    table.set("/dir/file", VERIFIER, [33]);
+    expect(table.match("/dir/file", VERIFIER)?.attrset).toEqual([33]);
+    // A second client on the same name, and the same client on another name.
+    expect(table.match("/dir/file", OTHER)).toBeUndefined();
+    expect(table.match("/dir/other", VERIFIER)).toBeUndefined();
+  });
+
+  it("copies the verifier and the attrset it is handed", () => {
+    const table = new ExclusiveCreates();
+    // A `Buffer`, deliberately: `NfsSession.handleCall` is public and takes any
+    // `Uint8Array`, and `Buffer.prototype.slice` **is `subarray`** — so a
+    // `verifier.slice()` here passes against a plain `Uint8Array` and quietly
+    // stores a *view* of a socket's receive pool against a real one.
+    const verifier = Buffer.from(VERIFIER);
+    const attrset = [33];
+    table.set("/f", verifier, attrset);
+    // The request buffer is reused and the caller goes on pushing to its
+    // array; neither may reach back into the table.
+    verifier.fill(0);
+    attrset.push(4);
+    expect(table.match("/f", VERIFIER)?.attrset).toEqual([33]);
+    // ...and the bytes that were reused are not the ones now being matched.
+    expect(table.match("/f", verifier)).toBeUndefined();
+  });
+
+  it("forgets an entry past the window, and a lookup does not extend it", () => {
+    let now = 1000;
+    const table = new ExclusiveCreates({ windowMs: 100, now: () => now });
+    table.set("/f", VERIFIER);
+    now += 60;
+    expect(table.match("/f", VERIFIER)).toBeDefined();
+    // Still measured from the *set*, not from that match.
+    now += 60;
+    expect(table.match("/f", VERIFIER)).toBeUndefined();
+    // And the expired entry is gone rather than merely unmatched.
+    expect(table.size).toBe(0);
+  });
+
+  it("keeps at most `limit` entries, oldest insertion out first", () => {
+    const table = new ExclusiveCreates({ limit: 2 });
+    table.set("/a", VERIFIER);
+    table.set("/b", VERIFIER);
+    table.set("/c", VERIFIER);
+    expect(table.size).toBe(2);
+    // Evicting is the safe failure: the retry stops being recognised, which
+    // the session answers `EXIST`.
+    expect(table.match("/a", VERIFIER)).toBeUndefined();
+    expect(table.match("/b", VERIFIER)).toBeDefined();
+    expect(table.match("/c", VERIFIER)).toBeDefined();
+  });
+
+  it("holds the documented default, and no more", () => {
+    const table = new ExclusiveCreates();
+    for (let index = 0; index <= DEFAULT_EXCLUSIVE_CREATES; index++) {
+      table.set(`/f${index}`, VERIFIER);
+    }
+    expect(table.size).toBe(DEFAULT_EXCLUSIVE_CREATES);
+    expect(table.match("/f0", VERIFIER)).toBeUndefined();
+    // Two minutes: a handful of RPC retransmits, not a lease.
+    expect(EXCLUSIVE_CREATE_WINDOW_MS).toBe(120_000);
+  });
+
+  it("forgets a path, and everything under it", () => {
+    const table = new ExclusiveCreates();
+    table.set("/dir/file", VERIFIER);
+    table.set("/dir/sub/file", VERIFIER);
+    table.set("/dirty", VERIFIER);
+    // A removed or renamed *directory* takes the names below it with it — and
+    // takes nothing that merely shares a prefix.
+    table.forget("/dir");
+    expect(table.match("/dir/file", VERIFIER)).toBeUndefined();
+    expect(table.match("/dir/sub/file", VERIFIER)).toBeUndefined();
+    expect(table.match("/dirty", VERIFIER)).toBeDefined();
+
+    // ...and the root sweeps nothing, which is what a SETATTR on `/` should
+    // say about the files inside it.
+    table.set("/dirty/file", VERIFIER);
+    table.forget("/");
+    expect(table.match("/dirty", VERIFIER)).toBeDefined();
+    expect(table.match("/dirty/file", VERIFIER)).toBeDefined();
+
+    table.clear();
+    expect(table.size).toBe(0);
+    // Forgetting into an empty table is the common case, and does nothing.
+    table.forget("/dirty");
+    expect(table.size).toBe(0);
   });
 });

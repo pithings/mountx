@@ -20,8 +20,8 @@
 import type { PathLock } from "../lock.ts";
 import type { StatsLike } from "../types.ts";
 import { S_IFDIR, S_IFMT } from "../types.ts";
-import type { FileHandleTable } from "./handles.ts";
-import type { RpcCall, RpcCredentials } from "./rpc.ts";
+import { sameVerifier, type FileHandleTable } from "./handles.ts";
+import { copyBytes, type RpcCall, type RpcCredentials } from "./rpc.ts";
 
 /**
  * The largest offset either version can name.
@@ -136,6 +136,20 @@ export interface NfsSessionOptions {
   useDriverIno?: boolean;
   /** Boot verifier for file handles. Default: random, so restarts invalidate handles. */
   verifier?: Uint8Array;
+  /**
+   * Most file handle table entries to keep, the least recently used going
+   * first past it. Default: no cap, which is what this server has always done.
+   *
+   * An eviction costs the client holding that handle an `ESTALE` and a
+   * re-lookup. An entry an NFSv4.1 client has **open** is never taken — its
+   * share reservations and byte-range locks are keyed to that entry's id — so
+   * this is a **soft cap**: a client holding more files open than the cap
+   * allows entries pushes the table past it, and the table will not evict its
+   * way back down until those opens close. A cap below the largest READDIRPLUS
+   * page a client asks for is also self-defeating. Read `./handles.ts` before
+   * setting it.
+   */
+  maxHandles?: number;
   /** Largest `READ` answered. */
   rtmax?: number;
   /** Largest `WRITE` accepted. */
@@ -143,14 +157,19 @@ export interface NfsSessionOptions {
   /** Directory snapshots kept for readdir cookies. Default `64`. */
   snapshotCache?: number;
   /**
-   * `chown` a newly created entry to the `AUTH_SYS` uid/gid the request
-   * carried. Default `true`.
+   * `chown` a newly created entry to the `AUTH_SYS` uid the request carried,
+   * and to the group POSIX gives it. Default `true`.
    *
    * The same problem the FUSE session solves the same way: the driver creates
    * everything as the server process, while the requests arriving on it come
    * from whoever mounted the share. Quiet when the driver has no `lchown`, or
    * when the server is not privileged enough to hand ownership away — a driver
    * with no concept of ownership is not thereby broken.
+   *
+   * The group is not always the caller's: a set-gid parent directory hands its
+   * own down and a new directory takes the bit with it, which is `chmod`'s job
+   * and so is gated by this option too (`src/ownership.ts`). Turning it off
+   * leaves every new entry exactly as the driver made it.
    */
   claimOwnership?: boolean;
   /** Called for every request that ends in an error status. */
@@ -178,6 +197,171 @@ export function newSessionStats(): NfsSessionStats {
   return { requests: 0, replies: 0, errors: 0, dropped: 0, procedures: new Map() };
 }
 
+/**
+ * How long one exclusive-create verifier is remembered: two minutes.
+ *
+ * The thing being survived is a **retransmission**, not an outage: the client
+ * resends because it never saw the reply, and it resends on an RPC timeout —
+ * seconds, doubling, a handful of times. Two minutes is generous against that
+ * and short enough that the table empties itself on any idle server.
+ */
+export const EXCLUSIVE_CREATE_WINDOW_MS = 120_000;
+
+/** How many exclusive-create verifiers are remembered at once. */
+export const DEFAULT_EXCLUSIVE_CREATES = 256;
+
+/** One remembered exclusive create. */
+export interface ExclusiveCreate {
+  /** The verifier the client sent, copied out of its request. */
+  readonly verifier: Uint8Array;
+  /**
+   * The attribute bits the original request actually applied, so a replay
+   * answers with the same `attrset` the lost reply carried. Always empty for
+   * v3, whose `EXCLUSIVE` carries no `sattr3` at all.
+   */
+  readonly attrset: readonly number[];
+  /** When it was recorded, for the window. */
+  readonly at: number;
+}
+
+/** Knobs for {@link ExclusiveCreates}; the defaults are the two constants above. */
+export interface ExclusiveCreatesOptions {
+  /** Entries kept at once. Default {@link DEFAULT_EXCLUSIVE_CREATES}. */
+  limit?: number | undefined;
+  /** How long one is remembered. Default {@link EXCLUSIVE_CREATE_WINDOW_MS}. */
+  windowMs?: number | undefined;
+  /** Milliseconds since an arbitrary epoch. Default `Date.now`. */
+  now?: (() => number) | undefined;
+}
+
+/**
+ * The verifiers of exclusive creates, for exactly as long as a retry can take.
+ *
+ * `CREATE` with `EXCLUSIVE` (RFC 1813 §3.3.8) and OPEN with `EXCLUSIVE4` /
+ * `EXCLUSIVE4_1` (RFC 8881 §18.16.3) ask a server for the same one thing: keep
+ * the client's verifier beside the file it created, so that the *duplicate* of
+ * a request whose reply was lost recognises its own creation and is answered
+ * with it instead of `EXIST`. That is the whole feature — an exclusive create
+ * is the one operation a client cannot make idempotent by itself.
+ *
+ * **This is a table in memory, and it says so.** Both RFCs would rather it were
+ * not: §3.3.8 wants the verifier in stable storage, and §18.16.4 names "the
+ * requirement to commit the verifier to stable storage" as the reason a server
+ * may refuse the mode outright. There is nowhere in `FsDriver` to commit one to
+ * — it would want an xattr — so what is kept here survives a lost reply and a
+ * retransmission, **and nothing else**. A restarted server has forgotten every
+ * verifier, exactly as it has forgotten every file handle (`../handles.ts`) and
+ * for the same reason; a client retrying across a restart is told `EXIST` by
+ * the create that follows, which is what it would have had from `GUARDED`.
+ *
+ * **Bounded twice**, in the spirit `../handles.ts` states its own growth:
+ *
+ * - **By age.** An entry older than the window is not matched, and is dropped
+ *   when it is next looked at. A lookup does *not* refresh it — the window is
+ *   about how long the original request can still be in flight, and re-reading
+ *   the entry does not make that longer.
+ * - **By count.** `limit` entries, oldest insertion evicted first, so a client
+ *   creating exclusively in a loop cannot grow this without bound.
+ *
+ * Both edges fail the same safe way: the retry stops being recognised and gets
+ * `EXIST`, which is a worse answer than the RFC's but never a wrong file.
+ *
+ * An entry is dropped as soon as it cannot mean anything: the file was removed
+ * or renamed away (a later file at that path is a different file, and must not
+ * inherit the promise), or the client sent the SETATTR that §3.3.8 makes the
+ * commit — the follow-up that carries the attributes an exclusive create had
+ * nowhere to put, after which there is nothing left for the verifier to
+ * protect.
+ */
+export class ExclusiveCreates {
+  readonly #entries = new Map<string, ExclusiveCreate>();
+  readonly #limit: number;
+  readonly #windowMs: number;
+  readonly #now: () => number;
+
+  constructor(options: ExclusiveCreatesOptions = {}) {
+    this.#limit = Math.max(1, options.limit ?? DEFAULT_EXCLUSIVE_CREATES);
+    this.#windowMs = Math.max(0, options.windowMs ?? EXCLUSIVE_CREATE_WINDOW_MS);
+    this.#now = options.now ?? Date.now;
+  }
+
+  /** Entries held, expired ones included until something looks at them. */
+  get size(): number {
+    return this.#entries.size;
+  }
+
+  /** Remember `verifier` as the one that created `path`. */
+  set(path: string, verifier: Uint8Array, attrset: readonly number[] = []): void {
+    // Copied, both of them: this outlives the request they were decoded from,
+    // and `attrset` is the caller's own array, still being pushed to. The copy
+    // is `copyBytes` and not `verifier.slice()` because `handleCall` is public
+    // and takes any `Uint8Array`: hand it a `Buffer` and `.slice()` is
+    // `subarray`, which would leave this table holding a view of somebody
+    // else's receive buffer for the next two minutes.
+    const entry: ExclusiveCreate = {
+      verifier: copyBytes(verifier),
+      attrset: [...attrset],
+      at: this.#now(),
+    };
+    // Delete first, so the Map's insertion order stays the eviction order.
+    this.#entries.delete(path);
+    this.#entries.set(path, entry);
+    while (this.#entries.size > this.#limit) {
+      const oldest = this.#entries.keys().next().value!;
+      this.#entries.delete(oldest);
+    }
+  }
+
+  /**
+   * The record at `path` when `verifier` is the one that created it.
+   *
+   * `undefined` for every other case — nothing remembered, the window passed,
+   * or a *different* verifier, which is a second client racing for the same
+   * name and is the one case that genuinely is `EXIST`.
+   */
+  match(path: string, verifier: Uint8Array): ExclusiveCreate | undefined {
+    const entry = this.#entries.get(path);
+    if (entry === undefined) {
+      return undefined;
+    }
+    if (this.#now() - entry.at >= this.#windowMs) {
+      this.#entries.delete(path);
+      return undefined;
+    }
+    return sameVerifier(entry.verifier, verifier) ? entry : undefined;
+  }
+
+  /**
+   * Forget `path`, and everything under it.
+   *
+   * The subtree sweep is for the one caller that needs it — a renamed or
+   * removed *directory* takes every remembered name below it with it — and is
+   * a walk of a table capped at `limit`, which is why it does not need the
+   * index `../subtree.ts` builds for the handle table.
+   *
+   * The root is the one path this cannot sweep, its prefix being `//`, and
+   * that is the wanted answer rather than an edge case: `/` is never removed
+   * or renamed, and a SETATTR on it is about the directory, not about the
+   * files inside it.
+   */
+  forget(path: string): void {
+    if (this.#entries.size === 0) {
+      return;
+    }
+    this.#entries.delete(path);
+    const prefix = `${path}/`;
+    for (const key of this.#entries.keys()) {
+      if (key.startsWith(prefix)) {
+        this.#entries.delete(key);
+      }
+    }
+  }
+
+  clear(): void {
+    this.#entries.clear();
+  }
+}
+
 /** What the caller of a request is, as far as `AUTH_SYS` can say. */
 export interface NfsRequestContext {
   /** Remote address, for `DUMP` and for logging. */
@@ -200,6 +384,15 @@ export interface NfsSharedState {
   lock?: PathLock | undefined;
   /** The counters both versions increment. */
   stats?: NfsSessionStats | undefined;
+  /**
+   * The verifiers of exclusive creates still worth remembering.
+   *
+   * Shared for the same reason the handle table is: a client that created a
+   * file exclusively over v3 and retransmits over v4 (or the reverse — the two
+   * are one server on one port) must be answered from one table, or the same
+   * request gets two different answers depending on which version carried it.
+   */
+  exclusiveCreates?: ExclusiveCreates | undefined;
 }
 
 // ---------------------------------------------------------------------------

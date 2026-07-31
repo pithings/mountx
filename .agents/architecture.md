@@ -27,15 +27,16 @@ Deviations are noted per area below.
 
 ## Core (`src/`)
 
-| File         | What                                                                                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `types.ts`   | `FsDriver`, `FsCapabilities`, `StatsLike`/`DirentLike`/`FileHandleLike`, and the `mountx.*` namespace — **two live members**, `mknod` and `utimens`, no xattr |
-| `errors.ts`  | `ERRNO_CODES` (Linux), `fsError()` (byte-identical to `node:fs`'s), `errnoOf()` — the one errno table in the repo                                             |
-| `path.ts`    | absolute POSIX helpers, `..` clamps at root; canonical paths early-return, `resolvePath()` returns `{ path, segments }`                                       |
-| `harness.ts` | `createLoopback(driver)` — normalize, fill gaps with `ENOSYS`, resolve capabilities. The method table is fixed **at construction**                            |
-| `lock.ts`    | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                 |
-| `subtree.ts` | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                     |
-| `auto.ts`    | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                     |
+| File           | What                                                                                                                                                          |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.ts`     | `FsDriver`, `FsCapabilities`, `StatsLike`/`DirentLike`/`FileHandleLike`, and the `mountx.*` namespace — **two live members**, `mknod` and `utimens`, no xattr |
+| `errors.ts`    | `ERRNO_CODES` (Linux), `fsError()` (byte-identical to `node:fs`'s), `errnoOf()` — the one errno table in the repo                                             |
+| `path.ts`      | absolute POSIX helpers, `..` clamps at root; canonical paths early-return, `resolvePath()` returns `{ path, segments }`                                       |
+| `harness.ts`   | `createLoopback(driver)` — normalize, fill gaps with `ENOSYS`, resolve capabilities. The method table is fixed **at construction**                            |
+| `lock.ts`      | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                 |
+| `subtree.ts`   | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                     |
+| `ownership.ts` | who a new entry belongs to: `inode_init_owner()`'s set-gid rule, plus the `lchown`/`chmod` that applies it. Internal; used by the two NFS sessions' `#claim`  |
+| `auto.ts`      | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                     |
 
 ### Drivers (`src/drivers/`)
 
@@ -84,23 +85,23 @@ Linux only. No `server.ts` — it owns `/dev/fuse` directly.
 Two versions behind one router and one server. Linux and macOS — and on macOS
 **without root**, since `mount_nfs` is not setuid.
 
-| File                                | What                                                                                                                                                             |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `xdr.ts`                            | XDR (RFC 4506) — bounds-checked, big-endian, 64-bit as `bigint`                                                                                                  |
-| `rpc.ts`                            | ONC RPC v2 (RFC 5531) + TCP record marking + `AUTH_NONE`/`AUTH_SYS`. Version-neutral, so it lives here rather than in `v3/`                                      |
-| `handles.ts`                        | `FileHandleTable` (ids off a monotonic counter, so a dropped entry still answers `ESTALE`) and `DirectorySnapshots`                                              |
-| `util.ts`                           | the seam between `v3/` and `v4/` — version-neutral POSIX logic, `NfsSessionOptions`, `Nfs4IdMap`, and the `NfsSharedState` the router builds once                |
-| `session.ts`                        | `NfsSession` — peeks `prog`/`vers` and hands the **same raw bytes** on. Everything public is the versioned session's, reached through here                       |
-| `server.ts`                         | one connection per socket, window of 64 (it counter-offers `ca_maxrequests` up to 64)                                                                            |
-| `mount.ts`                          | the only platform-aware transport: Linux and macOS, `version: "3"` or `"4.1"`, plus the macOS consent gate                                                       |
-| `probe.ts`                          | root for Linux only; `v4` is reported orthogonally to `usable`                                                                                                   |
-| `v3/constants.ts`, `v3/protocol.ts` | RFC 1813, plus the MOUNT program — v3-only                                                                                                                       |
-| `v3/session.ts`                     | answers both MOUNT and NFS programs                                                                                                                              |
-| `v4/constants.ts`                   | RFC 8881 with RFC 5662 for the XDR it states only in prose. Complete tables even where the server answers `NFS4ERR_NOTSUPP`; no v4.2                             |
-| `v4/attr.ts`                        | the `bitmap4`/`fattr4` codec — an unsupported bit poisons every later offset, which is why `v4/session.ts` diffs the mask separately                             |
-| `v4/protocol.ts`                    | COMPOUND framing and every operation. Optional ops this server will never implement are absent by design                                                         |
-| `v4/state.ts`                       | client ids, sessions, slot replay caches, stateids, share reservations, locks, the lease clock. Pure and synchronous — **no grace period**, courteous revocation |
-| `v4/session.ts`                     | COMPOUND dispatch over `state.ts`'s decisions; owns open-state → `FileHandleLike` and the current-stateid cursor                                                 |
+| File                                | What                                                                                                                                                                                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `xdr.ts`                            | XDR (RFC 4506) — bounds-checked, big-endian, 64-bit as `bigint`                                                                                                                                                                |
+| `rpc.ts`                            | ONC RPC v2 (RFC 5531) + TCP record marking + `AUTH_NONE`/`AUTH_SYS`. Version-neutral, so it lives here rather than in `v3/`                                                                                                    |
+| `handles.ts`                        | `FileHandleTable` (ids off a monotonic counter, so a dropped entry still answers `ESTALE`; `maxHandles` evicts LRU past a cap, root and `pin`ned entries exempt — so the cap is soft) and `DirectorySnapshots`                 |
+| `util.ts`                           | the seam between `v3/` and `v4/` — version-neutral POSIX logic, `NfsSessionOptions`, `Nfs4IdMap`, `ExclusiveCreates` (the create verifiers a retransmission is recognised by), and the `NfsSharedState` the router builds once |
+| `session.ts`                        | `NfsSession` — peeks `prog`/`vers` and hands the **same raw bytes** on. Everything public is the versioned session's, reached through here                                                                                     |
+| `server.ts`                         | one connection per socket, window of 64 (it counter-offers `ca_maxrequests` up to 64)                                                                                                                                          |
+| `mount.ts`                          | the only platform-aware transport: Linux and macOS, `version: "3"` or `"4.1"`, plus the macOS consent gate                                                                                                                     |
+| `probe.ts`                          | root for Linux only; `v4` is reported orthogonally to `usable`                                                                                                                                                                 |
+| `v3/constants.ts`, `v3/protocol.ts` | RFC 1813, plus the MOUNT program — v3-only                                                                                                                                                                                     |
+| `v3/session.ts`                     | answers both MOUNT and NFS programs                                                                                                                                                                                            |
+| `v4/constants.ts`                   | RFC 8881 with RFC 5662 for the XDR it states only in prose. Complete tables even where the server answers `NFS4ERR_NOTSUPP`; no v4.2                                                                                           |
+| `v4/attr.ts`                        | the `bitmap4`/`fattr4` codec — an unsupported bit poisons every later offset, which is why `v4/session.ts` diffs the mask separately                                                                                           |
+| `v4/protocol.ts`                    | COMPOUND framing and every operation. Optional ops this server will never implement are absent by design                                                                                                                       |
+| `v4/state.ts`                       | client ids, sessions, slot replay caches, stateids, share reservations, locks, the lease clock. Pure and synchronous — **no grace period**, courteous revocation                                                               |
+| `v4/session.ts`                     | COMPOUND dispatch over `state.ts`'s decisions; owns open-state → `FileHandleLike` and the current-stateid cursor                                                                                                               |
 
 Not on `mountx/nfs` yet: `v4/protocol.ts` and `v4/constants.ts`, reachable only
 through `NfsSession.v4`.
@@ -181,6 +182,13 @@ The facts no single file's header can own.
   key, 9P releases the qid identity — and, in the lock table, the ranges granted under
   a name that has been replaced). Cost is O(tracked paths) per rename; a trie is the
   real fix and waits on a benchmark that wants it.
+- **`src/ownership.ts` is one rule for four sessions, and two of them use it.** The
+  NFS sessions apply it from the parent `stat` they already took for `wcc_data` /
+  `change_info4`; 9P's client computes the same rule and puts the answer on the wire
+  (`v9fs_get_fsgid_for_create()`), so the session would be disagreeing with the
+  kernel if it applied it again; FUSE's would need an `lstat` per create that nothing
+  there does today, and `FUSE_CREATE_SUPP_GROUP` for the membership half. Each of the
+  three states its own reason at its `#claim`.
 - **`v3/` and `v4/` never import from each other.** `nfs/session.ts` and
   `nfs/util.ts` are the only seam, and the router hands both versions one shared
   `FileHandleTable`/`PathLock`.

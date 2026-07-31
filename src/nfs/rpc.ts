@@ -461,9 +461,9 @@ export function frameFragments(message: Uint8Array, size: number): Uint8Array {
 /**
  * A genuine copy, whatever the input is.
  *
- * Not `bytes.slice(start, end)`: the input here is always a socket `Buffer`,
- * and `Buffer.prototype.slice` **is `subarray`** — it returns a view, the trap
- * `xdr.ts` documents at length.
+ * Not `bytes.slice(start, end)`: the input here is very often a socket
+ * `Buffer`, and `Buffer.prototype.slice` **is `subarray`** — it returns a view,
+ * the trap `xdr.ts` documents at length.
  *
  * `xdr.ts` spells its copy `Uint8Array.prototype.slice.call`, which is equally
  * correct and costs the same — the two are within noise of each other at every
@@ -473,8 +473,18 @@ export function frameFragments(message: Uint8Array, size: number): Uint8Array {
  * whose own `.slice()` is `subarray` again. A record exists to be owned
  * outright by whoever holds it; handing back a plain `Uint8Array` keeps that
  * from depending on what the socket happened to allocate.
+ *
+ * Which is why this is the copy anything **retaining** wire bytes past the call
+ * they arrived on uses — `RecordAssembler` below, and the verifiers
+ * `ExclusiveCreates` (`./util.ts`) keeps for two minutes. `handleCall` is
+ * public and takes any `Uint8Array`, so "the assembler happens to allocate
+ * plain ones" is not something a table outliving the request may rely on.
  */
-function copyBytes(bytes: Uint8Array, start: number, end: number): Uint8Array {
+export function copyBytes(
+  bytes: Uint8Array,
+  start = 0,
+  end: number = bytes.byteLength,
+): Uint8Array {
   const out = new Uint8Array(end - start);
   out.set(bytes.subarray(start, end));
   return out;

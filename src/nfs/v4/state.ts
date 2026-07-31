@@ -823,6 +823,27 @@ export interface Nfs4StateOptions {
    * middle of a table walk. A caller with asynchronous work to do queues it.
    */
   onOpenReleased?: ((other: Uint8Array) => void) | undefined;
+  /**
+   * This file now has state on it, where a moment ago it had none.
+   *
+   * The pair with {@link Nfs4StateOptions.onFileReleased} brackets the one
+   * `Map` of `FileState`s — the thing that makes a `fileKey` mean anything to
+   * this table — so the two are balanced by construction: one call each, from
+   * the single site that adds the entry and the single site that removes it,
+   * never nested and never repeated for a key already held.
+   *
+   * It exists because the key is the *caller's*, and only the caller knows what
+   * keeping it alive costs. `../handles.ts` evicts least-recently-used entries
+   * under a cap, and an evicted entry would come back with a new id and so a
+   * second, unrelated `FileState` for the same file — a share reservation
+   * silently stopping being enforced. The session answers this by pinning the
+   * handle entry for exactly the span between these two calls.
+   *
+   * Synchronous and must not throw, for the same reason `onOpenReleased` is.
+   */
+  onFileRetained?: ((fileKey: string) => void) | undefined;
+  /** The last open and the last granted range on this file are gone. */
+  onFileReleased?: ((fileKey: string) => void) | undefined;
 }
 
 const DEFAULT_LEASE_SECONDS = 90;
@@ -920,6 +941,8 @@ export class Nfs4State {
   readonly #maxLocksPerFile: number;
   readonly #requireReclaimComplete: boolean;
   readonly #onOpenReleased: ((other: Uint8Array) => void) | undefined;
+  readonly #onFileRetained: ((fileKey: string) => void) | undefined;
+  readonly #onFileReleased: ((fileKey: string) => void) | undefined;
 
   /** `co_ownerid` → the confirmed and unconfirmed records that ownerid has (§18.35.4 case 5). */
   readonly #byOwner = new Map<string, { confirmed?: ClientRecord; unconfirmed?: ClientRecord }>();
@@ -948,6 +971,8 @@ export class Nfs4State {
     this.#maxLocksPerFile = Math.max(1, options.maxLocksPerFile ?? 1024);
     this.#requireReclaimComplete = options.requireReclaimComplete ?? true;
     this.#onOpenReleased = options.onOpenReleased;
+    this.#onFileRetained = options.onFileRetained;
+    this.#onFileReleased = options.onFileReleased;
   }
 
   /** The lease length, in seconds — the `lease_time` attribute the session reports. */
@@ -1723,11 +1748,21 @@ export class Nfs4State {
     return open?.kind === "open" ? open : undefined;
   }
 
+  /**
+   * The `FileState` for a key, created if this is the file's first.
+   *
+   * The one place `#files` grows, which is what lets
+   * {@link Nfs4StateOptions.onFileRetained} be a balanced pair with the one
+   * place it shrinks. **Call it only once the state is certain to be
+   * recorded** — a refused LOCK that had already created an empty `FileState`
+   * would leave the caller holding a pin for a file with nothing on it.
+   */
   #fileOf(fileKey: string): FileState {
     let file = this.#files.get(fileKey);
     if (file === undefined) {
       file = { opens: new Set(), locks: [] };
       this.#files.set(fileKey, file);
+      this.#onFileRetained?.(fileKey);
     }
     return file;
   }
@@ -1736,6 +1771,7 @@ export class Nfs4State {
     const file = this.#files.get(fileKey);
     if (file !== undefined && file.opens.size === 0 && file.locks.length === 0) {
       this.#files.delete(fileKey);
+      this.#onFileReleased?.(fileKey);
     }
   }
 
@@ -2031,13 +2067,18 @@ export class Nfs4State {
     const ownerKey = lockState?.ownerKey ?? `${request.clientid}:${keyOf(request.lockOwner!)}`;
 
     this.#revokeExpiredHolders(request.fileKey, request.clientid);
-    const file = this.#fileOf(request.fileKey);
-    for (const held of file.locks) {
-      if (overlaps(held, range.start, range.end) && conflicts(held, ownerKey, type)) {
-        return { status: NFS4ERR_DENIED, denied: deniedOf(held) };
+    // Read before the refusals and only created after them: `#fileOf` is what
+    // tells the caller this file now has state worth pinning a handle for, and
+    // a LOCK that ends in DENIED or DELAY has added none. (In practice the
+    // open the stateid above resolved through already made one — this is the
+    // rule holding rather than a case being handled.)
+    const held = this.#files.get(request.fileKey)?.locks ?? [];
+    for (const lock of held) {
+      if (overlaps(lock, range.start, range.end) && conflicts(lock, ownerKey, type)) {
+        return { status: NFS4ERR_DENIED, denied: deniedOf(lock) };
       }
     }
-    if (file.locks.length >= this.#maxLocksPerFile) {
+    if (held.length >= this.#maxLocksPerFile) {
       return { status: NFS4ERR_DELAY };
     }
     if (lockState === undefined) {
@@ -2045,6 +2086,7 @@ export class Nfs4State {
     } else {
       lockState.seqid = bumpSeqid(lockState.seqid);
     }
+    const file = this.#fileOf(request.fileKey);
     file.locks = replaceRange(file.locks, {
       ownerKey,
       openKey: lockState.openKey,
@@ -2115,8 +2157,13 @@ export class Nfs4State {
       return { status: resolved.status };
     }
     const lockState = resolved.state!;
-    const file = this.#fileOf(request.fileKey);
-    file.locks = subtractRange(file.locks, lockState.ownerKey, range.start, range.end);
+    // A lock stateid outlives the ranges it stood for — LOCKU does not drop it
+    // — so a second LOCKU can arrive with the file's state already forgotten.
+    // Nothing to subtract from then, and nothing to create either.
+    const file = this.#files.get(request.fileKey);
+    if (file !== undefined) {
+      file.locks = subtractRange(file.locks, lockState.ownerKey, range.start, range.end);
+    }
     lockState.seqid = bumpSeqid(lockState.seqid);
     this.#forgetFileIfEmpty(request.fileKey);
     return { status: NFS4_OK, stateid: { seqid: lockState.seqid, other: copyOf(lockState.other) } };

@@ -238,3 +238,9 @@ export const S_IFBLK = 0o060000;
 export const S_IFCHR = 0o020000;
 export const S_IFIFO = 0o010000;
 export const S_IFSOCK = 0o140000;
+
+// --- the mode bits that are not permission bits (`inode(7)`) ---
+/** Set-group-ID. On a directory it also means "children inherit my group". */
+export const S_ISGID = 0o2000;
+/** Group execute — the bit that makes set-group-ID mean something on a file. */
+export const S_IXGRP = 0o0010;

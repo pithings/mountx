@@ -26,10 +26,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../../src/drivers/memory.ts";
 import { fsError } from "../../../src/errors.ts";
 import {
+  AUTH_SYS,
   authSys,
   decodeReply,
+  encodeAuthSys,
   encodeCall,
   MSG_ACCEPTED,
+  type OpaqueAuth,
   RPC_PROC_UNAVAIL,
   RPC_SUCCESS,
 } from "../../../src/nfs/rpc.ts";
@@ -208,7 +211,9 @@ import { Nfs4Session } from "../../../src/nfs/v4/session.ts";
 import { XdrWriter } from "../../../src/nfs/xdr.ts";
 import { createLoopback } from "../../../src/harness.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
+import { withLatency } from "../../latency.ts";
 import { withoutExtensions } from "../../no-extensions.ts";
+import { CREATE_EXCLUSIVE, NFS3ERR_EXIST } from "../../../src/nfs/v3/constants.ts";
 import { check as check3, NfsClient as Nfs3Client, nfsDriver } from "../v3/client.ts";
 import {
   type Compound4reply,
@@ -267,7 +272,13 @@ let nextXid = 1;
  */
 function compoundCall(
   ops: Op[],
-  options: { tag?: string; minorversion?: number; xid?: number; count?: number } = {},
+  options: {
+    tag?: string;
+    minorversion?: number;
+    xid?: number;
+    count?: number;
+    cred?: OpaqueAuth;
+  } = {},
 ): { xid: number; bytes: Uint8Array } {
   const writer = new XdrWriter(512);
   writer.string(options.tag ?? "");
@@ -292,7 +303,7 @@ function compoundCall(
       program: NFS4_PROGRAM,
       version: NFS_V4,
       procedure: NFSPROC4_COMPOUND,
-      cred: authSys(1000, 1000),
+      cred: options.cred ?? authSys(1000, 1000),
       args: writer.bytes(),
     }),
   };
@@ -407,10 +418,18 @@ class Client {
   slotSeqid = 0;
   clientid = 0n;
 
-  constructor(readonly session: Nfs4Session) {}
+  constructor(
+    readonly session: Nfs4Session,
+    /** The credential every compound this client sends carries. */
+    readonly cred?: OpaqueAuth,
+  ) {}
 
-  static async open(session: Nfs4Session, ownerid = "test-client"): Promise<Client> {
-    const client = new Client(session);
+  static async open(
+    session: Nfs4Session,
+    ownerid = "test-client",
+    cred?: OpaqueAuth,
+  ): Promise<Client> {
+    const client = new Client(session, cred);
     const exchange = await client.send([
       {
         op: OP_EXCHANGE_ID,
@@ -451,7 +470,7 @@ class Client {
 
   /** A raw compound, with no SEQUENCE prepended. */
   async send(ops: Op[], options: Parameters<typeof compoundCall>[1] = {}): Promise<Reply> {
-    const { bytes } = compoundCall(ops, options);
+    const { bytes } = compoundCall(ops, { cred: this.cred, ...options });
     const reply = await this.session.handleCall(bytes);
     expect(reply).not.toBeNull();
     return readReply(reply!);
@@ -1964,8 +1983,12 @@ describe("the version router", () => {
  * server answers `NFS4ERR_GRACE` until it does — which is a case of its own
  * below.
  */
-async function ready(session: Nfs4Session, ownerid = "test-client"): Promise<Client> {
-  const client = await Client.open(session, ownerid);
+async function ready(
+  session: Nfs4Session,
+  ownerid = "test-client",
+  cred?: OpaqueAuth,
+): Promise<Client> {
+  const client = await Client.open(session, ownerid, cred);
   const done = await client.run([{ op: OP_RECLAIM_COMPLETE, args: { oneFs: false } }]);
   expect(done.compound.status).toBe(NFS4_OK);
   return client;
@@ -2013,6 +2036,40 @@ function createHow(mode: number, attrs: { bits?: number[]; values?: Fattr4Values
     },
   };
 }
+
+/**
+ * `createhow4` for the two exclusive modes: `EXCLUSIVE4` carries the verifier
+ * alone, `EXCLUSIVE4_1` carries it beside a `cva_attrs` the other modes would
+ * have sent as `createattrs`.
+ */
+function exclusiveHow(
+  mode: number,
+  verf: Uint8Array,
+  attrs?: { bits?: number[]; values?: Fattr4Values },
+): unknown {
+  return {
+    opentype: OPEN4_CREATE,
+    how:
+      mode === EXCLUSIVE4
+        ? { mode, createverf: verf }
+        : {
+            mode,
+            createboth: {
+              verf,
+              attrs: {
+                attrmask: bitmapOf(attrs?.bits ?? []),
+                values: attrs?.values ?? {},
+                unsupported: [],
+              },
+            },
+          },
+  };
+}
+
+/** One client's verifier: eight bytes it made up, and keeps resending. */
+const VERIFIER = Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]);
+/** A second client's, for the same name. */
+const OTHER_VERIFIER = Uint8Array.from([9, 9, 9, 9, 9, 9, 9, 9]);
 
 /** Open `/dir/file` and hand back the stateid, with the file as the current FH. */
 async function opened(client: Client, options: OpenOptions = {}): Promise<Stateid4> {
@@ -2204,36 +2261,185 @@ describe("OPEN", () => {
     expect(reply.compound.status).toBe(NFS4ERR_INVAL);
   });
 
-  it("refuses both exclusive create modes with NFS4ERR_INVAL", async () => {
+  /**
+   * §18.16.3's exclusive create, in both its shapes. The point of the mode is
+   * that a client cannot make a create idempotent by itself: a lost reply
+   * leaves it unable to tell "I created it" from "someone else did", so it
+   * sends a verifier and the server remembers which verifier made which file.
+   * `ExclusiveCreates` in `src/nfs/util.ts` states what that memory does and
+   * does not cover — a retransmission, not a restart.
+   */
+  it("creates with either exclusive mode and answers the retry with the same file", async () => {
+    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
+      const session = new Nfs4Session(await populated());
+      const client = await ready(session);
+      const first = await client.run([
+        ...TO_DIR,
+        OPEN({ name: "exclusive", openhow: exclusiveHow(mode, VERIFIER) }),
+        { op: OP_GETFH },
+      ]);
+      expect(first.compound.status).toBe(NFS4_OK);
+      const created = resFor<Getfh4res>(first, OP_GETFH).object!;
+      expect(session.handles.resolve(created)).toBe("/dir/exclusive");
+
+      // The duplicate of a request whose reply never arrived: `NFS4_OK` and
+      // the same file, where `GUARDED4` would now say NFS4ERR_EXIST.
+      const retry = await client.run([
+        ...TO_DIR,
+        OPEN({ name: "exclusive", owner: 2, openhow: exclusiveHow(mode, VERIFIER) }),
+        { op: OP_GETFH },
+      ]);
+      expect(retry.compound.status).toBe(NFS4_OK);
+      expect([...resFor<Getfh4res>(retry, OP_GETFH).object!]).toEqual([...created]);
+
+      // A different verifier on the same name is a *second client*, which is
+      // the one case that really is NFS4ERR_EXIST.
+      const rival = await client.run([
+        ...TO_DIR,
+        OPEN({ name: "exclusive", owner: 3, openhow: exclusiveHow(mode, OTHER_VERIFIER) }),
+      ]);
+      expect(rival.compound.status).toBe(NFS4ERR_EXIST);
+    }
+  });
+
+  /**
+   * The same promise, kept against the duplicate that actually happens.
+   *
+   * A retransmission is sent because the reply was *lost*, so it goes out while
+   * the original is still in flight rather than after it has been answered. A
+   * verifier recorded any later than "the create won" — after the `#claim`, or
+   * after the `cva_attrs` are applied — is one the duplicate looks for, does
+   * not find, and is told `NFS4ERR_EXIST` about by the very OPEN that
+   * succeeded. {@link withLatency} is what makes that ordering observable: the
+   * memory driver answers inside a microtask and no duplicate can lose to it.
+   */
+  it("answers duplicates that arrive while the original is still in flight", async () => {
+    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
+      const session = new Nfs4Session(withLatency(await populated()));
+      // Separate 4.1 sessions, because one slot table is one request at a time
+      // — which is the client-side reason a resend is a *new* connection's
+      // problem as often as it is a retransmission on this one.
+      const clients = await Promise.all(
+        Array.from({ length: 8 }, (_, index) => ready(session, `client-${index}`)),
+      );
+      const replies = await Promise.all(
+        clients.map((client, index) =>
+          client.run([
+            ...TO_DIR,
+            OPEN({
+              name: "exclusive",
+              owner: index + 1,
+              openhow: exclusiveHow(mode, VERIFIER),
+            }),
+            { op: OP_GETFH },
+          ]),
+        ),
+      );
+      const first = resFor<Getfh4res>(replies[0]!, OP_GETFH).object!;
+      for (const reply of replies) {
+        expect(reply.compound.status).toBe(NFS4_OK);
+        // Every one of them is the same file, which is the whole promise.
+        expect([...resFor<Getfh4res>(reply, OP_GETFH).object!]).toEqual([...first]);
+      }
+      expect(session.handles.resolve(first)).toBe("/dir/exclusive");
+    }
+  });
+
+  it("applies EXCLUSIVE4_1's cva_attrs and replays the same attrset", async () => {
     const session = new Nfs4Session(await populated());
     const client = await ready(session);
-    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
-      const reply = await client.run([
-        ...TO_DIR,
-        OPEN({
-          name: "exclusive",
-          openhow: {
-            opentype: OPEN4_CREATE,
-            how:
-              mode === EXCLUSIVE4
-                ? { mode, createverf: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]) }
-                : {
-                    mode,
-                    createboth: {
-                      verf: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]),
-                      attrs: { attrmask: [], values: {}, unsupported: [] },
-                    },
-                  },
-          },
+    const how = exclusiveHow(EXCLUSIVE4_1, VERIFIER, {
+      bits: [FATTR4_MODE, FATTR4_SIZE],
+      values: { mode: 0o640, size: 0n },
+    });
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "both", access: OPEN4_SHARE_ACCESS_BOTH, openhow: how }),
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    expect(attrsFor(reply).mode).toBe(0o640);
+    // The same "which attributes were successfully set" answer the other two
+    // create modes give — `creatverfattr` is the only difference on the wire.
+    const attrset = resFor<Open4res>(reply, OP_OPEN).attrset;
+    expect(attrset).toEqual(bitmapOf([FATTR4_MODE, FATTR4_SIZE]));
+
+    // And the replay carries the set the lost reply carried, not an empty one.
+    const retry = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "both", owner: 2, access: OPEN4_SHARE_ACCESS_BOTH, openhow: how }),
+    ]);
+    expect(retry.compound.status).toBe(NFS4_OK);
+    expect(resFor<Open4res>(retry, OP_OPEN).attrset).toEqual(attrset);
+
+    // `EXCLUSIVE4` has no attributes to report, and reports none.
+    const bare = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "bare", openhow: exclusiveHow(EXCLUSIVE4, VERIFIER) }),
+    ]);
+    expect(bare.compound.status).toBe(NFS4_OK);
+    expect(resFor<Open4res>(bare, OP_OPEN).attrset).toEqual(bitmapOf([]));
+  });
+
+  it("refuses an unsettable cva_attrs the way createattrs is refused", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    // Nothing is reserved to hold the verifier, so what may be named here is
+    // exactly what SETATTR may name — and `fileid` is read-only in both.
+    const reply = await client.run([
+      ...TO_DIR,
+      OPEN({
+        name: "readonly-attr",
+        openhow: exclusiveHow(EXCLUSIVE4_1, VERIFIER, {
+          bits: [FATTR4_FILEID],
+          values: { fileid: 7n },
         }),
-      ]);
-      // There is nowhere to commit a verifier to. §18.16.4 would have this be
-      // NFS4ERR_NOTSUPP, but §15.2's OPEN row and §15.4's NFS4ERR_NOTSUPP row
-      // both exclude that status for OPEN, and NFS4ERR_INVAL is what §18.16.3
-      // itself gives the neighbouring "this form must not be used here" cases.
-      expect(reply.compound.status).toBe(NFS4ERR_INVAL);
-    }
-    await expect(session.driver.stat("/dir/exclusive")).rejects.toThrow();
+      }),
+    ]);
+    expect(reply.compound.status).toBe(NFS4ERR_INVAL);
+    await expect(session.driver.stat("/dir/readonly-attr")).rejects.toThrow();
+  });
+
+  it("forgets the verifier once SETATTR commits it, or the name stops meaning that file", async () => {
+    const session = new Nfs4Session(await populated());
+    const client = await ready(session);
+    const create = (name: string, owner: number): Op[] => [
+      ...TO_DIR,
+      OPEN({ name, owner, openhow: exclusiveHow(EXCLUSIVE4, VERIFIER) }),
+    ];
+
+    // The follow-up §18.16.4 sends the client back for. After it, the client
+    // is not retrying the OPEN, and the entry has nothing left to protect.
+    expect((await client.run(create("committed", 1))).compound.status).toBe(NFS4_OK);
+    const set = await client.run([
+      ...TO_DIR,
+      { op: OP_LOOKUP, args: { objname: "committed" } },
+      {
+        op: OP_SETATTR,
+        args: {
+          stateid: ANONYMOUS,
+          objAttributes: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o600 },
+            unsupported: [],
+          },
+        },
+      },
+    ]);
+    expect(set.compound.status).toBe(NFS4_OK);
+    expect((await client.run(create("committed", 2))).compound.status).toBe(NFS4ERR_EXIST);
+
+    // Removed and re-created by somebody else: the name is a different file
+    // now, and the promise made about the first one must not cover it.
+    expect((await client.run(create("recycled", 3))).compound.status).toBe(NFS4_OK);
+    const removed = await client.run([...TO_DIR, { op: OP_REMOVE, args: { target: "recycled" } }]);
+    expect(removed.compound.status).toBe(NFS4_OK);
+    const replaced = await client.run([
+      ...TO_DIR,
+      OPEN({ name: "recycled", owner: 4, openhow: createHow(UNCHECKED4) }),
+    ]);
+    expect(replaced.compound.status).toBe(NFS4_OK);
+    expect((await client.run(create("recycled", 5))).compound.status).toBe(NFS4ERR_EXIST);
   });
 
   it("answers a reclaim with NFS4ERR_NO_GRACE, whichever claim asks", async () => {
@@ -2862,6 +3068,170 @@ describe("byte-range locks", () => {
     const open = await opened(client, { access: OPEN4_SHARE_ACCESS_BOTH });
     const reply = await client.run([...TO_DIR, LOCK(open)]);
     expect(reply.compound.status).toBe(NFS4ERR_ISDIR);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a capped handle table under live v4.1 state
+// ---------------------------------------------------------------------------
+
+/**
+ * What a handle eviction must **not** cost a client that has the file open.
+ *
+ * `../../src/nfs/v4/session.ts` keys open and lock state by handle table entry
+ * id, so an entry evicted under `maxHandles` and looked up again would come
+ * back with a *new* id — and one file would carry two `FileState`s that cannot
+ * see each other. That is not a round trip, it is a share reservation the
+ * server promised and then did not keep, and it was reproduced exactly as
+ * written here before the fix: the second OPEN was granted.
+ *
+ * The table is the router's, so these go through `NfsSession` — a directly
+ * constructed `Nfs4Session` builds its own table and ignores `maxHandles`.
+ */
+describe("a capped handle table under live v4.1 state", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  /** `/dir/file`, plus enough decoys to push anything unpinned out of a small cap. */
+  async function crowded(): Promise<FullFsDriver> {
+    const driver = await populated();
+    for (let index = 0; index < 12; index++) {
+      const decoy = await driver.open(`/dir/decoy${index}`, "w");
+      await decoy.close();
+    }
+    return driver;
+  }
+
+  /** Look each decoy up in turn: twelve binds into a table that holds four. */
+  async function walk(client: Client): Promise<void> {
+    for (let index = 0; index < 12; index++) {
+      const reply = await client.run([
+        ...TO_DIR,
+        { op: OP_LOOKUP, args: { objname: `decoy${index}` } },
+      ]);
+      expect(reply.compound.status).toBe(NFS4_OK);
+    }
+  }
+
+  it("keeps a share reservation across the eviction pressure of another client", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const holder = await ready(session.v4, "client-a");
+    const rival = await ready(session.v4, "client-b");
+
+    const held = await holder.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_READ, deny: OPEN4_SHARE_DENY_WRITE }),
+    ]);
+    expect(held.compound.status).toBe(NFS4_OK);
+    const entry = session.handles.at("/dir/file")!;
+    expect(entry.pins).toBe(1);
+
+    await walk(rival);
+    // The pin held: same entry, same id, so the same `fileKey` and the same
+    // `FileState`. Twelve lookups into a table of four, and what is left is the
+    // root, `/dir`, the pinned file and the last decoy — the twelve decoys took
+    // each other's places instead.
+    expect(session.handles.at("/dir/file")).toBe(entry);
+    expect(session.handles.size).toBe(4);
+
+    const clash = await rival.run([...TO_DIR, OPEN({ access: OPEN4_SHARE_ACCESS_WRITE })]);
+    expect(clash.compound.status).toBe(NFS4ERR_SHARE_DENIED);
+  });
+
+  it("keeps a byte-range lock across the same pressure", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const holder = await ready(session.v4, "client-a");
+    const rival = await ready(session.v4, "client-b");
+
+    const open = await opened(holder, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const locked = await holder.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCK,
+        args: {
+          locktype: WRITE_LT,
+          reclaim: false,
+          offset: 0n,
+          length: 10n,
+          locker: {
+            newLockOwner: true,
+            openOwner: {
+              openSeqid: 1,
+              openStateid: open,
+              lockSeqid: 1,
+              lockOwner: { clientid: 0n, owner: Uint8Array.from([5]) },
+            },
+          },
+        },
+      },
+    ]);
+    expect(locked.compound.status).toBe(NFS4_OK);
+
+    await walk(rival);
+
+    // The granted range is `state.locksOf(fileKey)`, so it follows the entry id
+    // exactly as the reservation above does.
+    const test = await rival.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCKT,
+        args: {
+          locktype: WRITE_LT,
+          offset: 4n,
+          length: 2n,
+          owner: { clientid: 0n, owner: Uint8Array.from([6]) },
+        },
+      },
+    ]);
+    expect(test.compound.status).toBe(NFS4ERR_DENIED);
+    expect(resFor<Lockt4res>(test, OP_LOCKT).denied!.owner.clientid).toBe(holder.clientid);
+  });
+
+  it("lets the entry go once the state does, and leaves no pin behind", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const client = await ready(session.v4, "client-a");
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    const entry = session.handles.at("/dir/file")!;
+    expect(entry.pins).toBe(1);
+
+    const closed = await client.run([
+      ...TO_FILE,
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: stateid } },
+    ]);
+    expect(closed.compound.status).toBe(NFS4_OK);
+    // A leaked pin is a permanently unevictable entry, so the count is asserted
+    // rather than inferred from the eviction that follows.
+    expect(entry.pins).toBe(0);
+
+    await walk(client);
+    expect(session.handles.get(entry.id)).toBeUndefined();
+    expect(session.handles.size).toBe(4);
+  });
+
+  it("releases the pins a teardown finds still held", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const client = await ready(session.v4, "client-a");
+    // Two files open at once, and no CLOSE for either: `destroy()` is the only
+    // thing left that can give the entries back.
+    await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    await opened(client, { name: "decoy0", owner: 2, access: OPEN4_SHARE_ACCESS_READ });
+    const file = session.handles.at("/dir/file")!;
+    const decoy = session.handles.at("/dir/decoy0")!;
+    expect([file.pins, decoy.pins]).toEqual([1, 1]);
+
+    // The v4 session alone, not the router: `NfsSession.destroy()` ends in
+    // `handles.clear()`, which would drop the entries and make any answer look
+    // right. What has to be proved is that the session gives its pins *back*,
+    // into a table that outlives it.
+    await session.v4.destroy();
+    expect([file.pins, decoy.pins]).toEqual([0, 0]);
+    // The table outlives the session that pinned into it — it is the router's —
+    // so it must be evictable again for whatever serves next.
+    for (let index = 0; index < 12; index++) {
+      const path = `/dir/decoy${index}`;
+      session.handles.bind(path, await session.driver.lstat(path));
+    }
+    expect(session.handles.size).toBe(4);
+    expect(session.handles.get(file.id)).toBeUndefined();
   });
 });
 
@@ -3695,6 +4065,42 @@ describe("the v4 client over a real socket", () => {
     expect(server.session.stats.procedures.get("MOUNT:MNT")).toBe(1);
   });
 
+  /**
+   * The exclusive-create verifiers are the router's, like the handle table:
+   * one server on one port, so the same request must get the same answer
+   * whichever version carried it. A client that created over v3 and retries
+   * over v4 has not changed its mind about anything.
+   */
+  it("recognises a v3 exclusive create retried over v4, from one table", async () => {
+    const server = await serve();
+    const v3 = await connect3(server);
+    const v4 = await connect(server);
+    const root = await v4.rootFh();
+
+    const created = check3(
+      await v3.client.create(v3.root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    const retried = await v4.openAt(root, "excl", {
+      create: true,
+      verifier: VERIFIER,
+      access: OPEN4_SHARE_ACCESS_BOTH,
+    });
+    expect([...retried.fh]).toEqual([...created.obj!]);
+    // v3's `EXCLUSIVE` carried no attributes, so none were applied and the
+    // replay says so rather than claiming this OPEN's `cva_attrs` landed.
+    await retried.close();
+
+    // And a second client's verifier is refused on the same name, again
+    // whichever version asks.
+    await expect(
+      v4.openAt(root, "excl", { create: true, verifier: OTHER_VERIFIER }),
+    ).rejects.toThrow();
+    expect(
+      (await v3.client.create(v3.root, "excl", CREATE_EXCLUSIVE, {}, OTHER_VERIFIER)).status,
+    ).toBe(NFS3ERR_EXIST);
+  });
+
   it("destroys its session and leaves the next request without one", async () => {
     const server = await serve();
     const client = await connect(server);
@@ -3907,5 +4313,208 @@ describe("the v4 client over a real socket", () => {
     // And the first client's state was discarded with its record, which is what
     // a reboot means and is a status that names the cause.
     expect((await first.renew()).status).toBe(10_052); // NFS4ERR_BADSESSION
+  });
+});
+
+/**
+ * The rule in `src/ownership.ts`, driven through CREATE and a creating OPEN.
+ *
+ * §18.4.3 has the server "derive the owner ... from the principal indicated in
+ * the RPC credentials of the call", and says nothing about the group, because
+ * the group is not the principal's to give: a set-gid parent hands its own
+ * down, and a new directory takes the bit with it. The fixture is built through
+ * the driver rather than through the server, so the setup is not itself subject
+ * to the rule under test.
+ */
+describe("set-gid inheritance", () => {
+  const TEAM = 4000;
+  /** A caller in no group the fixture uses, so every group below is inherited. */
+  const OUTSIDER = credential(4242, 4343);
+  /** The same caller, with the team in its supplementary list (`AUTH_SYS` gids). */
+  const MEMBER = credential(4242, 4343, [7, TEAM]);
+
+  function credential(uid: number, gid: number, gids: number[] = []): OpaqueAuth {
+    // `authSys()` always sends an empty `gids`, and the supplementary list is
+    // exactly what one half of the rule turns on.
+    return {
+      flavor: AUTH_SYS,
+      body: encodeAuthSys({ stamp: 0, machineName: "test", uid, gid, gids }),
+    };
+  }
+
+  /** `/team` is set-gid and owned by group 4000; `/plain` is an ordinary one. */
+  async function fixture(): Promise<FullFsDriver> {
+    const driver = createMemoryDriver();
+    await driver.mkdir("/team");
+    await driver.chown("/team", 500, TEAM);
+    await driver.chmod("/team", 0o2775);
+    await driver.mkdir("/plain");
+    return driver;
+  }
+
+  async function serving(
+    options: { cred?: OpaqueAuth; claimOwnership?: boolean } = {},
+  ): Promise<{ session: Nfs4Session; client: Client }> {
+    const session = new Nfs4Session(await fixture(), {
+      claimOwnership: options.claimOwnership,
+    });
+    return { session, client: await ready(session, "test-client", options.cred ?? OUTSIDER) };
+  }
+
+  const TO_TEAM: Op[] = [{ op: OP_PUTROOTFH }, { op: OP_LOOKUP, args: { objname: "team" } }];
+  const TO_PLAIN: Op[] = [{ op: OP_PUTROOTFH }, { op: OP_LOOKUP, args: { objname: "plain" } }];
+
+  it("gives a file created by OPEN the parent's group and the caller the ownership", async () => {
+    const { session, client } = await serving();
+    const reply = await client.run([
+      ...TO_TEAM,
+      OPEN({
+        name: "f",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o644 } }),
+      }),
+      GETATTR([FATTR4_OWNER, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // §5.9's numeric form, since nothing is idmapped here.
+    expect(attrsFor(reply)).toMatchObject({ owner: "4242", ownerGroup: String(TEAM) });
+    expect(await session.driver.lstat("/team/f")).toMatchObject({ uid: 4242, gid: TEAM });
+  });
+
+  it("inherits on the exclusive create paths as well", async () => {
+    const { session, client } = await serving();
+    for (const [mode, name] of [
+      [EXCLUSIVE4, "one"],
+      [EXCLUSIVE4_1, "two"],
+    ] as const) {
+      const reply = await client.run([
+        ...TO_TEAM,
+        OPEN({
+          name,
+          access: OPEN4_SHARE_ACCESS_BOTH,
+          openhow: exclusiveHow(mode, VERIFIER),
+        }),
+      ]);
+      expect(reply.compound.status).toBe(NFS4_OK);
+      expect((await session.driver.lstat(`/team/${name}`)).gid).toBe(TEAM);
+    }
+  });
+
+  it("gives a new directory the group *and* the set-gid bit", async () => {
+    const { session, client } = await serving();
+    const reply = await client.run([
+      ...TO_TEAM,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "sub",
+          createattrs: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o750 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // `inode(7)`: "newly created subdirectories inherit the set-group-ID bit",
+    // which is what makes the rule apply to a whole tree rather than one level.
+    expect(attrsFor(reply)).toMatchObject({ mode: 0o2750, ownerGroup: String(TEAM) });
+    // A symlink takes the group and keeps its own 0o777 — nothing was chmod'ed
+    // through the link.
+    const link = await client.run([
+      ...TO_TEAM,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4LNK, linkdata: "./f" },
+          objname: "l",
+          createattrs: { attrmask: [], values: {}, unsupported: [] },
+        },
+      },
+    ]);
+    expect(link.compound.status).toBe(NFS4_OK);
+    expect(await session.driver.lstat("/team/l")).toMatchObject({ gid: TEAM, mode: 0o120777 });
+  });
+
+  it("gives the caller's own group in an ordinary directory", async () => {
+    const { session, client } = await serving();
+    const reply = await client.run([
+      ...TO_PLAIN,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "sub",
+          createattrs: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o750 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE, FATTR4_OWNER_GROUP]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // No parent bit, nothing to inherit: the mode is the one that was asked for.
+    expect(attrsFor(reply)).toMatchObject({ mode: 0o750, ownerGroup: "4343" });
+    expect((await session.driver.lstat("/plain/sub")).gid).toBe(4343);
+  });
+
+  it("clears set-gid on a new executable the creator has no claim to that group", async () => {
+    const outsider = await serving();
+    const reply = await outsider.client.run([
+      ...TO_TEAM,
+      OPEN({
+        name: "run",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o2775 } }),
+      }),
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // A set-gid executable is a way to *run as* a group, so one may not be made
+    // for a group its creator is not in — `inode_init_owner()`, and the reason
+    // the supplementary list is on the wire at all.
+    expect(attrsFor(reply).mode).toBe(0o775);
+
+    const member = await serving({ cred: MEMBER });
+    const kept = await member.client.run([
+      ...TO_TEAM,
+      OPEN({
+        name: "run",
+        access: OPEN4_SHARE_ACCESS_BOTH,
+        openhow: createHow(UNCHECKED4, { bits: [FATTR4_MODE], values: { mode: 0o2775 } }),
+      }),
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(kept.compound.status).toBe(NFS4_OK);
+    expect(attrsFor(kept).mode).toBe(0o2775);
+  });
+
+  it("does not claim at all with claimOwnership off", async () => {
+    const { session, client } = await serving({ claimOwnership: false });
+    const reply = await client.run([
+      ...TO_TEAM,
+      {
+        op: OP_CREATE,
+        args: {
+          objtype: { type: NF4DIR },
+          objname: "sub",
+          createattrs: {
+            attrmask: bitmapOf([FATTR4_MODE]),
+            values: { mode: 0o750 },
+            unsupported: [],
+          },
+        },
+      },
+      GETATTR([FATTR4_MODE]),
+    ]);
+    expect(reply.compound.status).toBe(NFS4_OK);
+    // Whatever the driver did on its own: no bit added, no group inherited.
+    expect(attrsFor(reply).mode).toBe(0o750);
+    expect((await session.driver.lstat("/team/sub")).gid).toBe(process.getgid?.() ?? 0);
   });
 });

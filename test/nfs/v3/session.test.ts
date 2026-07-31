@@ -47,6 +47,7 @@ import {
   NFS3ERR_TOOSMALL,
   NFS_PROGRAM,
   NFS_V3,
+  NFSPROC3_CREATE,
   NFSPROC3_LOOKUP,
   NFSPROC3_NULL,
   NFSPROC3_READ,
@@ -57,15 +58,27 @@ import {
   RPC_PROG_UNAVAIL,
 } from "../../../src/nfs/v3/constants.ts";
 import { NFS_V4 } from "../../../src/nfs/v4/constants.ts";
-import { decodeReply, encodeCall, frameFragments } from "../../../src/nfs/rpc.ts";
+import {
+  AUTH_SYS,
+  decodeReply,
+  encodeAuthSys,
+  encodeCall,
+  frameFragments,
+  type OpaqueAuth,
+} from "../../../src/nfs/rpc.ts";
 import { encodeXdr } from "../../../src/nfs/xdr.ts";
+import { readCreateRes, writeCreateArgs } from "../../../src/nfs/v3/protocol.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
-import type { FsDriver } from "../../../src/types.ts";
+import type { FsDriver, FullFsDriver } from "../../../src/types.ts";
+import { withLatency } from "../../latency.ts";
 import { withoutExtensions } from "../../no-extensions.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
 import { createLoopback, type Loopback } from "../../../src/harness.ts";
 
 const encoder = new TextEncoder();
+
+/** One client's `createverf3`: eight bytes it made up, and keeps resending. */
+const VERIFIER = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
 
 interface Harness {
   server: NfsServer;
@@ -83,10 +96,13 @@ afterEach(async () => {
   }
 });
 
-async function serve(driver: FsDriver = createMemoryDriver()): Promise<Harness> {
-  const server = createNfsServer(driver);
+async function serve(
+  driver: FsDriver = createMemoryDriver(),
+  options: { cred?: OpaqueAuth; claimOwnership?: boolean } = {},
+): Promise<Harness> {
+  const server = createNfsServer(driver, { claimOwnership: options.claimOwnership });
   await server.listen();
-  const client = await NfsClient.connect({ port: server.port });
+  const client = await NfsClient.connect({ port: server.port, cred: options.cred });
   const mounted = await client.mnt("/");
   expect(mounted.status).toBe(MNT3_OK);
   const harness: Harness = {
@@ -732,24 +748,136 @@ describe("individual procedures", () => {
     );
   });
 
-  it("implements all three CREATE modes, EXCLUSIVE as NOTSUPP", async () => {
+  it("implements all three CREATE modes", async () => {
     const { client, root } = await serve();
     expect(check(await client.create(root, "f", CREATE_UNCHECKED), "create").obj).toBeDefined();
     // UNCHECKED over an existing file succeeds and applies the attributes.
     const again = check(await client.create(root, "f", CREATE_UNCHECKED, { size: 0n }), "create");
     expect(again.objAttributes!.size).toBe(0n);
     expect((await client.create(root, "f", CREATE_GUARDED)).status).toBe(NFS3ERR_EXIST);
-    // EXCLUSIVE wants the verifier stored somewhere that survives a retry, and
-    // there is nowhere in the driver interface to put it. Linux falls back.
-    const exclusive = await client.create(
-      root,
-      "excl",
-      CREATE_EXCLUSIVE,
-      {},
-      new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+    // EXCLUSIVE creates like GUARDED, and carries a verifier instead of an
+    // `sattr3` — so there are no attributes to apply and none are.
+    const created = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
     );
-    expect(exclusive.status).toBe(NFS3ERR_NOTSUPP);
-    expect((await client.lookup(root, "excl")).status).toBe(NFS3ERR_NOENT);
+    expect(created.obj).toBeDefined();
+    expect(created.objAttributes!.type).toBe(NF3REG);
+    expect(check(await client.lookup(root, "excl"), "lookup").object).toEqual(created.obj);
+  });
+
+  /**
+   * §3.3.8's whole point: a client cannot make a create idempotent by itself,
+   * because a lost reply leaves it unable to tell "I created it" from "someone
+   * else did". The verifier is how it tells the difference, and the table
+   * behind it is `ExclusiveCreates` in `src/nfs/util.ts` — a retry, not a
+   * restart.
+   */
+  it("answers the retry of an EXCLUSIVE create with the file it already made", async () => {
+    const { client, root, fs } = await serve();
+    const first = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    await fs.writeFile("/excl", "written after the create");
+
+    // The duplicate of a request whose reply never arrived: the same file
+    // handle back, `NFS3_OK` rather than `EXIST`, and nothing truncated.
+    const retry = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    expect([...retry.obj!]).toEqual([...first.obj!]);
+    expect(retry.objAttributes!.size).toBe(24n);
+    expect(new TextDecoder().decode(await fs.readFile("/excl"))).toBe("written after the create");
+
+    // A different verifier on the same name is a *second client*, which is the
+    // one case that really is `NFS3ERR_EXIST`.
+    const other = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9]);
+    expect((await client.create(root, "excl", CREATE_EXCLUSIVE, {}, other)).status).toBe(
+      NFS3ERR_EXIST,
+    );
+  });
+
+  /**
+   * The same promise, kept against the duplicate that actually happens.
+   *
+   * A retransmission is sent because the reply was *lost*, which means it goes
+   * out while the original is still in flight — not after it has been answered.
+   * A verifier recorded any later than "the create won" is therefore a verifier
+   * the duplicate looks for, does not find, and is told `NFS3ERR_EXIST` about
+   * by the very request that succeeded.
+   *
+   * Driven through {@link withLatency}, because the ordering is only observable
+   * against a driver that takes a real turn to answer: 17 of 17 duplicates were
+   * told `EXIST` before the verifier moved ahead of the `close()`.
+   */
+  it("answers duplicates that arrive while the original is still in flight", async () => {
+    const { server, root } = await serve(withLatency(createMemoryDriver()));
+    // The same record 18 times — same xid and all, which is what an RPC
+    // retransmission *is* — handed to the session together rather than one
+    // after another, so none of them can see another's reply. The server
+    // dispatches every record it reads without awaiting it, so this is the
+    // arrival pattern a congested client produces, not a synthetic one.
+    const record = encodeCall({
+      xid: 0x3c_3c_3c_3c,
+      program: NFS_PROGRAM,
+      version: NFS_V3,
+      procedure: NFSPROC3_CREATE,
+      args: encodeXdr((w) =>
+        writeCreateArgs(w, {
+          where: { dir: root, name: "excl" },
+          mode: CREATE_EXCLUSIVE,
+          attributes: {},
+          verf: VERIFIER,
+        }),
+      ),
+    });
+    const replies = await Promise.all(
+      Array.from({ length: 18 }, () => server.session.handleCall(record)),
+    );
+    const results = replies.map((reply) => readCreateRes(decodeReply(reply!).results));
+    const first = check(results[0]!, "create");
+    for (const result of results) {
+      expect(result.status).toBe(NFS3_OK);
+      // Every one of them is the same file, which is the whole promise.
+      expect([...check(result, "create").obj!]).toEqual([...first.obj!]);
+    }
+  });
+
+  it("forgets the verifier once the client commits with SETATTR", async () => {
+    const { client, root } = await serve();
+    const created = check(
+      await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    // The follow-up §3.3.8 sends the client back for, since EXCLUSIVE had
+    // nowhere to carry the mode. After it, the client is not retrying.
+    expect((await client.setattr(created.obj!, { mode: 0o600 })).status).toBe(NFS3_OK);
+    expect((await client.create(root, "excl", CREATE_EXCLUSIVE, {}, VERIFIER)).status).toBe(
+      NFS3ERR_EXIST,
+    );
+  });
+
+  it("forgets the verifier when the name stops meaning that file", async () => {
+    const { client, root } = await serve();
+    // Removed, then re-created by somebody else: the name is a different file
+    // now, and the promise made about the first one must not cover it.
+    check(await client.create(root, "gone", CREATE_EXCLUSIVE, {}, VERIFIER), "create");
+    expect((await client.remove(root, "gone")).status).toBe(NFS3_OK);
+    check(await client.create(root, "gone", CREATE_UNCHECKED), "create");
+    expect((await client.create(root, "gone", CREATE_EXCLUSIVE, {}, VERIFIER)).status).toBe(
+      NFS3ERR_EXIST,
+    );
+
+    // Same again through a rename, which moves the file out from under the
+    // name rather than deleting it.
+    check(await client.create(root, "moved", CREATE_EXCLUSIVE, {}, VERIFIER), "create");
+    expect((await client.rename(root, "moved", root, "elsewhere")).status).toBe(NFS3_OK);
+    check(await client.create(root, "moved", CREATE_UNCHECKED), "create");
+    expect((await client.create(root, "moved", CREATE_EXCLUSIVE, {}, VERIFIER)).status).toBe(
+      NFS3ERR_EXIST,
+    );
   });
 
   it("answers MKNOD with NOTSUPP when the driver has no mknod extension", async () => {
@@ -925,6 +1053,212 @@ describe("individual procedures", () => {
     expect(server.session.stats.procedures.get("NFS:GETATTR")).toBe(1);
     expect(server.session.stats.procedures.get("MOUNT:MNT")).toBe(1);
     expect(server.session.stats.replies).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The rule in `src/ownership.ts`, driven through CREATE/MKDIR/SYMLINK/MKNOD.
+ *
+ * Everything here is about the *group*, which the caller's `AUTH_SYS`
+ * credential does not settle: a set-gid parent hands its own group down, and a
+ * new directory takes the bit with it. The tree is built through the driver
+ * rather than through the mount, so that the setup is not itself subject to the
+ * rule under test.
+ */
+describe("set-gid inheritance", () => {
+  const TEAM = 4000;
+  /** A caller in no group the fixture uses, so every group below is inherited. */
+  const OUTSIDER = credential(4242, 4343);
+  /** The same caller, with the team in its supplementary list (`AUTH_SYS` gids). */
+  const MEMBER = credential(4242, 4343, [7, TEAM]);
+
+  function credential(uid: number, gid: number, gids: number[] = []): OpaqueAuth {
+    // `authSys()` always sends an empty `gids`, and the supplementary list is
+    // exactly what one half of the rule turns on.
+    return {
+      flavor: AUTH_SYS,
+      body: encodeAuthSys({ stamp: 0, machineName: "test", uid, gid, gids }),
+    };
+  }
+
+  /** `/team` is set-gid and owned by group 4000; `/plain` is an ordinary one. */
+  async function fixture(): Promise<FullFsDriver> {
+    const driver = createMemoryDriver();
+    await driver.mkdir("/team");
+    await driver.chown("/team", 500, TEAM);
+    await driver.chmod("/team", 0o2775);
+    await driver.mkdir("/plain");
+    return driver;
+  }
+
+  async function served(options: { cred?: OpaqueAuth; claimOwnership?: boolean } = {}): Promise<{
+    client: NfsClient;
+    team: Uint8Array;
+    plain: Uint8Array;
+  }> {
+    const { client, root } = await serve(await fixture(), { cred: OUTSIDER, ...options });
+    return {
+      client,
+      team: check(await client.lookup(root, "team"), "lookup").object!,
+      plain: check(await client.lookup(root, "plain"), "lookup").object!,
+    };
+  }
+
+  it("gives a new file the parent's group and the caller the ownership", async () => {
+    const { client, team } = await served();
+    const created = check(await client.create(team, "f", CREATE_UNCHECKED), "create");
+    expect(created.objAttributes!.uid).toBe(4242);
+    expect(created.objAttributes!.gid).toBe(TEAM);
+    // EXCLUSIVE carries no `sattr3` at all, and inherits just the same.
+    const exclusive = check(
+      await client.create(team, "x", CREATE_EXCLUSIVE, {}, VERIFIER),
+      "create",
+    );
+    expect(exclusive.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("gives a new directory the group *and* the set-gid bit", async () => {
+    const { client, team } = await served();
+    const made = check(await client.mkdir(team, "sub", { mode: 0o755 }), "mkdir");
+    expect(made.objAttributes!.gid).toBe(TEAM);
+    // `inode(7)`: "newly created subdirectories inherit the set-group-ID bit",
+    // which is what makes the rule apply to the whole tree rather than one
+    // level of it.
+    expect(made.objAttributes!.mode).toBe(0o2755);
+    // And it really is inherited *again* one level down.
+    const sub = made.obj!;
+    expect(check(await client.mkdir(sub, "deeper"), "mkdir").objAttributes!.mode & 0o2000).toBe(
+      0o2000,
+    );
+    expect(
+      check(await client.create(sub, "f", CREATE_UNCHECKED), "create").objAttributes!.gid,
+    ).toBe(TEAM);
+  });
+
+  it("inherits through SYMLINK and MKNOD too", async () => {
+    const { client, team } = await served();
+    const link = check(await client.symlink(team, "l", "./f"), "symlink");
+    expect(link.objAttributes!.gid).toBe(TEAM);
+    // A symlink's own mode is 0o777 and stays it: nothing was chmod'ed through
+    // the link.
+    expect(link.objAttributes!.mode).toBe(0o777);
+    const fifo = check(await client.mknod(team, "fifo", NF3FIFO, { mode: 0o644 }), "mknod");
+    expect(fifo.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("gives the caller's own group in an ordinary directory", async () => {
+    const { client, plain } = await served();
+    const created = check(await client.create(plain, "f", CREATE_UNCHECKED), "create");
+    expect(created.objAttributes!.uid).toBe(4242);
+    expect(created.objAttributes!.gid).toBe(4343);
+    const made = check(await client.mkdir(plain, "sub", { mode: 0o755 }), "mkdir");
+    expect(made.objAttributes!.gid).toBe(4343);
+    // No parent bit, nothing to inherit: the mode is the one that was asked for.
+    expect(made.objAttributes!.mode).toBe(0o755);
+  });
+
+  it("clears set-gid on a new executable the creator has no claim to that group", async () => {
+    const { client, team } = await served();
+    const created = check(
+      await client.create(team, "run", CREATE_UNCHECKED, { mode: 0o2775 }),
+      "create",
+    );
+    // A set-gid executable is a way to *run as* a group, so one may not be made
+    // for a group its creator is not in — `inode_init_owner()`, and the reason
+    // the supplementary list is on the wire at all.
+    expect(created.objAttributes!.mode).toBe(0o775);
+    expect(created.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("keeps it when only the supplementary list makes the creator a member", async () => {
+    const { client, team } = await served({ cred: MEMBER });
+    const created = check(
+      await client.create(team, "run", CREATE_UNCHECKED, { mode: 0o2775 }),
+      "create",
+    );
+    expect(created.objAttributes!.mode).toBe(0o2775);
+    // Not group-executable, so there is nothing to run as and nothing to clear.
+    const plainMode = check(
+      await client.create(team, "data", CREATE_UNCHECKED, { mode: 0o2664 }),
+      "create",
+    );
+    expect(plainMode.objAttributes!.mode).toBe(0o2664);
+  });
+
+  /**
+   * The bit goes on top of the mode the driver **made**, not the one the client
+   * asked for.
+   *
+   * `open`/`mkdir` mask their mode argument with the umask of the process the
+   * driver runs in and a `chmod` is not masked at all, so a rule that
+   * re-asserts the requested mode hands the caller *wider* permissions in a
+   * set-gid directory than the same call gets one directory over. The memory
+   * driver applies no umask by default, which is why every case above is blind
+   * to this; one that does is the smallest thing that can see it.
+   */
+  it("puts the bit on the mode the driver made, not the one the client asked for", async () => {
+    const driver = createMemoryDriver({ umask: 0o022 });
+    await driver.mkdir("/team");
+    await driver.chown("/team", 500, TEAM);
+    await driver.chmod("/team", 0o2775);
+    await driver.mkdir("/plain");
+    const { client, root } = await serve(driver, { cred: OUTSIDER });
+    const team = check(await client.lookup(root, "team"), "lookup").object!;
+    const plain = check(await client.lookup(root, "plain"), "lookup").object!;
+
+    // 0o775 asked for, 0o755 created, 0o2755 after the bit: the same mode the
+    // plain directory produces, plus the one bit that was inherited.
+    const inherited = check(await client.mkdir(team, "sub", { mode: 0o775 }), "mkdir");
+    const control = check(await client.mkdir(plain, "sub", { mode: 0o775 }), "mkdir");
+    expect(control.objAttributes!.mode).toBe(0o755);
+    expect(inherited.objAttributes!.mode).toBe(0o2755);
+
+    // The clearing half reads back the same way: 0o2775 asked for, 0o2755
+    // created, 0o755 once the bit this caller may not hand out comes off.
+    const executable = check(
+      await client.create(team, "run", CREATE_UNCHECKED, { mode: 0o2775 }),
+      "create",
+    );
+    expect(executable.objAttributes!.mode).toBe(0o755);
+  });
+
+  /**
+   * `#claim` is about a *new* entry, and an `UNCHECKED` CREATE is not always
+   * one: §3.3.8's UNCHECKED "does not check for the existence of the file", so
+   * it succeeds over a file somebody else made and owns. Claiming that file
+   * would hand it to whoever named it last — and, once the rule started
+   * `chmod`ing as well, would strip the set-gid bit off it on the way.
+   */
+  it("claims only the entry the call actually created", async () => {
+    const driver = await fixture();
+    // Somebody else's shared executable, already in the team directory.
+    await (await driver.open("/team/run", "w")).close();
+    await driver.chown("/team/run", 500, TEAM);
+    await driver.chmod("/team/run", 0o2775);
+
+    const { client, root } = await serve(driver, { cred: OUTSIDER });
+    const team = check(await client.lookup(root, "team"), "lookup").object!;
+    const over = check(await client.create(team, "run", CREATE_UNCHECKED), "create");
+    expect(over.objAttributes!.uid).toBe(500);
+    expect(over.objAttributes!.gid).toBe(TEAM);
+    expect(over.objAttributes!.mode).toBe(0o2775);
+
+    // ...and the file this call *did* create is claimed exactly as before.
+    const made = check(await client.create(team, "new", CREATE_UNCHECKED), "create");
+    expect(made.objAttributes!.uid).toBe(4242);
+    expect(made.objAttributes!.gid).toBe(TEAM);
+  });
+
+  it("does not claim at all with claimOwnership off", async () => {
+    const { client, team } = await served({ claimOwnership: false });
+    const created = check(await client.create(team, "f", CREATE_UNCHECKED), "create");
+    // Whatever the driver did on its own: the server's own uid and gid, and no
+    // set-gid bit added to a new directory either.
+    expect(created.objAttributes!.uid).toBe(process.getuid?.() ?? 0);
+    expect(created.objAttributes!.gid).toBe(process.getgid?.() ?? 0);
+    const made = check(await client.mkdir(team, "sub", { mode: 0o755 }), "mkdir");
+    expect(made.objAttributes!.mode).toBe(0o755);
+    expect(made.objAttributes!.gid).toBe(process.getgid?.() ?? 0);
   });
 });
 

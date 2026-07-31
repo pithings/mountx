@@ -37,6 +37,14 @@
  * opens and closes its own handle per request, which is what `../v3/session.ts`
  * does for every request it answers.
  *
+ * That the `fileKey` is a handle-table entry id has one consequence running the
+ * other way: an entry the table evicted would come back under a *new* id, and
+ * the same file would then carry two `FileState`s that cannot see each other —
+ * a share reservation quietly stopping being enforced. So this file **pins** an
+ * entry for exactly as long as `./state.ts` holds state for its key
+ * (`onFileRetained`/`onFileReleased` → `#pinFile`/`#unpinFile`), and the cap in
+ * `../handles.ts` is soft as a result.
+ *
  * ## The current stateid
  *
  * A COMPOUND's cursor carries a stateid beside the two filehandles
@@ -71,6 +79,7 @@ import { constants } from "node:fs";
 import { ERRNO_CODES, fsError } from "../../errors.ts";
 import { createLoopback, type Loopback } from "../../harness.ts";
 import { PathLock } from "../../lock.ts";
+import { claimNewEntry, type NewEntry, newEntryOwnership } from "../../ownership.ts";
 import { dirname, joinPath } from "../../path.ts";
 import type { FileHandleLike, FsDriver, StatsLike, TimeLike } from "../../types.ts";
 import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../types.ts";
@@ -105,6 +114,7 @@ import {
 import {
   type AccessRights,
   allowedAccess,
+  ExclusiveCreates,
   MAX_OFFSET,
   modeBitsOfFtype,
   NAME_MAX,
@@ -297,6 +307,7 @@ import {
   type Compound4res,
   type Create4args,
   type Create4res,
+  type CreateHow4,
   type CreateSession4args,
   type CreateSession4res,
   type DestroyClientid4args,
@@ -779,6 +790,17 @@ function stateKey(other: Uint8Array): string {
   return hexOf(other);
 }
 
+/**
+ * The handle entry id a `fileKey` names — the inverse of `#fileKey`.
+ *
+ * `undefined` for anything that is not one of those keys, which is the reclaim
+ * arm's `""` and nothing else. Written as a test rather than a `try`, because
+ * `BigInt("0x")` throwing is not the reason this returns `undefined`.
+ */
+function entryIdOf(fileKey: string): bigint | undefined {
+  return /^[\da-f]+$/.test(fileKey) ? BigInt(`0x${fileKey}`) : undefined;
+}
+
 /** {@link allowedAccess}'s answer as `ACCESS4_*` bits (RFC 8881 §18.1.1). */
 function accessBits4(rights: AccessRights): number {
   return (
@@ -911,11 +933,28 @@ export class Nfs4Session {
    * encoded.
    */
   readonly #released: string[] = [];
+  /**
+   * The `fileKey`s whose handle entry this session is holding pinned.
+   *
+   * `../handles.ts` evicts least-recently-used entries under a cap, and this
+   * file keys every open and every byte-range lock by *entry id* — so an
+   * evicted entry would be looked up again under a new id and the same file
+   * would end up with two `FileState`s that cannot see each other, silently
+   * dropping a share reservation. `./state.ts` reports the exact span in which
+   * a key means something (`onFileRetained`/`onFileReleased`), and this set is
+   * the record of the pins taken for it: it makes the pins idempotent per key,
+   * and it is what `destroy()` hands back so a session teardown cannot leave an
+   * entry pinned for the rest of the table's life.
+   */
+  readonly #pinnedFiles = new Set<string>();
+  /** The verifiers of OPEN with `EXCLUSIVE4`/`EXCLUSIVE4_1` — see `../util.ts`. */
+  readonly #exclusives: ExclusiveCreates;
   #destroyed = false;
 
   /**
    * `shared` is the router's — see `../util.ts`. Left out, this session makes
-   * its own handle table, lock and counters, which is what its own tests do.
+   * its own handle table, lock, counters and exclusive-create table, which is
+   * what its own tests do.
    */
   constructor(driver: FsDriver, options: NfsSessionOptions = {}, shared: NfsSharedState = {}) {
     this.driver = createLoopback(driver);
@@ -930,12 +969,15 @@ export class Nfs4Session {
       });
     this.writeVerifier = this.handles.verifier.slice(0, NFS4_VERIFIER_SIZE);
     this.#snapshots = new DirectorySnapshots(options.snapshotCache);
+    this.#exclusives = shared.exclusiveCreates ?? new ExclusiveCreates();
     // The ID map is this file's, not the state table's — see `../util.ts`.
     const { idmap, ...knobs } = options.nfs4 ?? {};
     this.#idmap = idmap;
     this.state = new Nfs4State({
       ...knobs,
       onOpenReleased: (other) => this.#released.push(stateKey(other)),
+      onFileRetained: (fileKey) => this.#pinFile(fileKey),
+      onFileReleased: (fileKey) => this.#unpinFile(fileKey),
     });
     this.#maxOperations = Math.max(1, options.nfs4?.maxOperations ?? DEFAULT_MAX_OPERATIONS);
   }
@@ -990,8 +1032,14 @@ export class Nfs4Session {
   }
 
   /**
-   * Drop every cached listing, close every driver handle still held open, and
-   * stop. Idempotent. File *handles* (the wire kind) are the router's.
+   * Drop every cached listing, release every pinned handle entry, close every
+   * driver handle still held open, and stop. Idempotent. File *handles* (the
+   * wire kind) are the router's.
+   *
+   * The pins have to go here precisely *because* the table is the router's:
+   * this session's state dies with it, but the entries it was holding against
+   * eviction do not, and a pin nobody can ever release again is an entry the
+   * cap can never reclaim.
    *
    * The driver handles are this session's own: an open state that is still
    * open when the server stops has nobody left to CLOSE it, and a driver whose
@@ -1002,7 +1050,14 @@ export class Nfs4Session {
   async destroy(): Promise<void> {
     this.#destroyed = true;
     this.#snapshots.clear();
+    this.#exclusives.clear();
     this.#maxOpsBySession.clear();
+    // Not through `#unpinFile`: the whole set goes at once here, so it is
+    // emptied in one step rather than deleted from under its own iterator.
+    for (const fileKey of this.#pinnedFiles) {
+      this.handles.unpin(entryIdOf(fileKey)!);
+    }
+    this.#pinnedFiles.clear();
     const open = [...this.#openHandles.keys(), ...this.#released];
     this.#released.length = 0;
     for (const key of open) {
@@ -1993,6 +2048,12 @@ export class Nfs4Session {
       return { status: statusOf(error), attrsset: [] };
     }
     const applied = await this.#applyAttrs(path, args.objAttributes);
+    if (applied.status === NFS4_OK) {
+      // §18.16.4's commit: this is the SETATTR an exclusive create sends the
+      // client back for, and once it has landed the client is not going to
+      // retry the OPEN. See `ExclusiveCreates` in `../util.ts`.
+      this.#exclusives.forget(path);
+    }
     return { status: applied.status, attrsset: bitmapOf(applied.bits) };
   }
 
@@ -2313,23 +2374,25 @@ export class Nfs4Session {
    * indicated in the RPC credentials of the call". Without it a file created by
    * uid 1000 comes back owned by the server and then fails every permission
    * check its own creator makes. Quiet when the driver cannot express
-   * ownership, which is not the same as broken.
+   * ownership, which is not the same as broken — that, and the skip when the
+   * caller *is* the server, are in `claimNewEntry`.
+   *
+   * The *group* is not derived from the principal alone: §18.4.3's "MUST
+   * derive" is about the owner, and the group a set-gid parent hands down is
+   * the parent's (`../../ownership.ts` has the rule and where it comes from).
+   * `parent` is therefore threaded in from the `stat` the caller already took —
+   * CREATE reads the parent to check it is a directory, OPEN to build its
+   * `change_info4` — so the rule adds no round trip of its own. A new directory
+   * taking the set-gid bit does cost an `lstat` and a `chmod`, which is the one
+   * part of it that cannot be folded into the create: the mode the create asked
+   * for is not the mode it got (`../../ownership.ts` on the umask), so the bit
+   * goes on top of what the driver actually made.
    */
-  async #claim(path: string, creds: RpcCredentials): Promise<void> {
-    if (this.options.claimOwnership === false || creds.uid === undefined) {
+  async #claim(path: string, creds: RpcCredentials, entry: NewEntry): Promise<void> {
+    if (this.options.claimOwnership === false) {
       return;
     }
-    if (creds.uid === (process.getuid?.() ?? -1) && creds.gid === (process.getgid?.() ?? -1)) {
-      return;
-    }
-    try {
-      await this.driver.lchown(path, creds.uid, creds.gid ?? -1);
-    } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code !== "ENOSYS" && code !== "EPERM" && code !== "ENOTSUP") {
-        throw error;
-      }
-    }
+    await claimNewEntry(this.driver, path, newEntryOwnership(creds, entry));
   }
 
   /**
@@ -2407,7 +2470,14 @@ export class Nfs4Session {
     }
 
     this.#invalidate(dir);
-    await this.#claim(path, cursor.creds);
+    // A symlink's mode is 0o777 and not the client's to choose — `createattrs`
+    // never reached `symlink` — so the mode named here is the one the object
+    // really has.
+    await this.#claim(path, cursor.creds, {
+      parent,
+      directory: type === NF4DIR,
+      mode: type === NF4LNK ? 0o777 : mode,
+    });
     // `mkdir` already took the mode; a symlink has none to take. `size` is not
     // a writable attribute of any of these types, so it is neither applied nor
     // reported (§18.4.3, "any writable attribute valid for the object type").
@@ -2457,6 +2527,9 @@ export class Nfs4Session {
     if (entry !== undefined && directory) {
       this.#snapshots.delete(entry.id);
     }
+    // Whatever appears at this name next is a different object, and must not
+    // inherit the promise made about this one.
+    this.#exclusives.forget(path);
     return { status: NFS4_OK, cinfo: this.#cinfo(before, await this.#changeOf(dir)) };
   }
 
@@ -2478,6 +2551,11 @@ export class Nfs4Session {
     // client goes on using the handle it already has, for the object and for
     // everything below it if this was a directory.
     this.handles.remap(from, to);
+    // The verifiers are keyed by *path*, and both of these paths now name
+    // something else: `from` nothing, `to` the object that moved onto it (over
+    // whatever was there). Neither promise survives the move.
+    this.#exclusives.forget(from);
+    this.#exclusives.forget(to);
     // Exactly two directories changed their names: the one that lost `from` and
     // the one that gained `to`. A directory that *moved* keeps its own snapshot
     // — same contents, and `remap` kept it the same entry — and no unrelated
@@ -2794,6 +2872,36 @@ export class Nfs4Session {
     return entry.id.toString(16);
   }
 
+  /**
+   * Hold the handle entry a `fileKey` names against LRU eviction, for as long
+   * as `./state.ts` has state on that file.
+   *
+   * The key is hex of an entry id and nothing else, so it inverts — which is
+   * the only reason this can be driven by the state table, which knows nothing
+   * about handles. A key that is not one is ignored rather than refused: the
+   * reclaim arm of {@link Nfs4Session.#open} passes `""` deliberately, having
+   * no file to name, and a `FileState` is never created for it.
+   *
+   * Idempotent per key, and paired with {@link Nfs4Session.#unpinFile} through
+   * `#pinnedFiles`, so an unpin can only ever release a pin this session took.
+   */
+  #pinFile(fileKey: string): void {
+    const id = entryIdOf(fileKey);
+    if (id === undefined || this.#pinnedFiles.has(fileKey)) {
+      return;
+    }
+    this.#pinnedFiles.add(fileKey);
+    this.handles.pin(id);
+  }
+
+  /** Release {@link Nfs4Session.#pinFile}'s pin, if this session took one. */
+  #unpinFile(fileKey: string): void {
+    if (!this.#pinnedFiles.delete(fileKey)) {
+      return;
+    }
+    this.handles.unpin(entryIdOf(fileKey)!);
+  }
+
   /** The current filehandle as the pair a stateful operation needs. */
   #target(cursor: Cursor): { path: string; fileKey: string; entry: HandleEntry } {
     const entry = this.handles.decode(this.#requireCurrent(cursor));
@@ -2944,20 +3052,15 @@ export class Nfs4Session {
    *   "valid in general but ... not appropriate to the context in which the
    *   stateid is used".
    *
-   * Exclusive create is the one place this file knowingly departs from a
-   * sentence of the RFC, and it is a contradiction inside the RFC: §18.16.4
-   * says "if the server cannot support exclusive create semantics, possibly
-   * because of the requirement to commit the verifier to stable storage, it
-   * should fail the OPEN request with the error NFS4ERR_NOTSUPP", while
-   * §15.2's OPEN row and §15.4's `NFS4ERR_NOTSUPP` row — the two normative
-   * error tables, agreeing from both directions — do not admit that status for
-   * OPEN. `NFS4ERR_INVAL` is what they do admit, and it is the status §18.16.3
-   * itself gives to the two neighbouring cases of "this exclusive-create form
-   * must not be used here" (a named attribute directory: "the server will
-   * return EINVAL"; a persistent session or a pNFS client ID: "the server MUST
-   * return NFS4ERR_INVAL"). There is nowhere in the driver interface to commit
-   * a verifier to, and a side table a restart loses would be a worse answer
-   * than a refusal — the same call `../v3/session.ts` makes about `EXCLUSIVE`.
+   * Exclusive create is served, out of a table in memory that covers a retry
+   * and not a restart — {@link Nfs4Session.#openCreateExclusive} below, and
+   * `ExclusiveCreates` in `../util.ts` for what that does and does not promise.
+   * §18.16.4 offers the other answer ("if the server cannot support exclusive
+   * create semantics, possibly because of the requirement to commit the
+   * verifier to stable storage, it should fail the OPEN request with the error
+   * NFS4ERR_NOTSUPP") and this file would not have been able to give it: §15.2's
+   * OPEN row and §15.4's `NFS4ERR_NOTSUPP` row — the two normative error
+   * tables, agreeing from both directions — do not admit that status for OPEN.
    *
    * On success the opened file becomes the current filehandle ("upon success
    * ... the current filehandle is replaced by that of the created or existing
@@ -3018,11 +3121,15 @@ export class Nfs4Session {
     let dir: string | undefined;
     let before = 0n;
     let path: string;
+    // Kept for `#openCreate`: a creating OPEN always names its file inside a
+    // directory (the CLAIM_FH arm above is refused for one), and set-gid
+    // inheritance is decided from the parent this already read.
+    let parent: StatsLike | undefined;
     if (claim === CLAIM_FH) {
       path = this.#pathOfCurrent(cursor);
     } else {
       dir = this.#pathOfCurrent(cursor);
-      const parent = await this.#statOf(dir);
+      parent = await this.#statOf(dir);
       if ((parent.mode & S_IFMT) !== S_IFDIR) {
         return refused(NFS4ERR_NOTDIR);
       }
@@ -3032,7 +3139,7 @@ export class Nfs4Session {
 
     const attrset: number[] = [];
     if (create) {
-      const refusal = await this.#openCreate(args, path, cursor, attrset);
+      const refusal = await this.#openCreate(args, path, cursor, attrset, parent);
       if (refusal !== undefined) {
         return refused(refusal);
       }
@@ -3101,7 +3208,9 @@ export class Nfs4Session {
   }
 
   /**
-   * The create half of an OPEN: `UNCHECKED4` and `GUARDED4` (§18.16.3).
+   * The create half of an OPEN: `UNCHECKED4` and `GUARDED4` (§18.16.3), with
+   * the two exclusive modes handed on to
+   * {@link Nfs4Session.#openCreateExclusive}.
    *
    * Answers `undefined` when the file is there to be opened, or the status that
    * refuses the whole OPEN. `attrset` is filled with what was actually applied,
@@ -3121,10 +3230,11 @@ export class Nfs4Session {
     path: string,
     cursor: Cursor,
     attrset: number[],
+    parent: StatsLike | undefined,
   ): Promise<number | undefined> {
     const how = args.openhow.how!;
     if (how.mode === EXCLUSIVE4 || how.mode === EXCLUSIVE4_1) {
-      return NFS4ERR_INVAL;
+      return this.#openCreateExclusive(how, path, cursor, attrset, parent);
     }
     const attrs = how.createattrs!;
     this.#settableOrRefuse(attrs);
@@ -3141,7 +3251,7 @@ export class Nfs4Session {
       }
       return undefined;
     }
-    await this.#claim(path, cursor.creds);
+    await this.#claim(path, cursor.creds, { parent, directory: false, mode });
     // The mode went in as `open`'s third argument, so `#applyAttrs` must not
     // see it — and must see everything else, size included: a create names the
     // initial state of a file that did not exist a moment ago.
@@ -3163,22 +3273,130 @@ export class Nfs4Session {
     return undefined;
   }
 
-  /** Create a file, answering whether it was this call that created it. */
-  async #createFile(path: string, mode: number): Promise<boolean> {
+  /**
+   * The other create half: `EXCLUSIVE4` and `EXCLUSIVE4_1` (§18.16.3).
+   *
+   * Both exist for one reason — a client cannot make a create idempotent by
+   * itself, because a lost reply leaves it unable to tell "I created it" from
+   * "someone else did". So it sends a verifier it made up, the server remembers
+   * which verifier created which file, and the resend carrying that same
+   * verifier is answered with the file it already made. A *different* verifier
+   * on the same name is a second client, and that is the case that really is
+   * `NFS4ERR_EXIST`.
+   *
+   * What "remembers" means — a bounded table in memory, so a retransmission is
+   * covered and a restart is not — is stated in full on `ExclusiveCreates` in
+   * `../util.ts`.
+   *
+   * The two modes differ only in what travels beside the verifier. `EXCLUSIVE4`
+   * carries nothing else, so the file is created with the mode `UNCHECKED4`
+   * uses when the client names none and §18.16.4's follow-up SETATTR sets the
+   * rest. `EXCLUSIVE4_1` carries `creatverfattr`, whose `cva_attrs` are applied
+   * and reported in `attrset` exactly as `createattrs` are on the other path —
+   * and are checked against the same supported/settable sets, which is the
+   * answer this server would give for `suppattr_exclcreat` (75) if it
+   * advertised it: the verifier lives beside the file rather than *in* one of
+   * its attributes, so no attribute is reserved and every settable one may be
+   * named here. That attribute stays out of `SUPPORTED_ATTRS` (`./attr.ts`
+   * says why), so a client sees the omission and sends what it would have sent
+   * anyway.
+   *
+   * The `attrset` is remembered with the verifier, so the reply to a resend
+   * carries the same set the lost one did rather than an empty one.
+   *
+   * §18.16.3's one refusal of `EXCLUSIVE4` — "if the client ID is
+   * pNFS-enabled, or the session is persistent, the server MUST return
+   * NFS4ERR_INVAL" — cannot arise: this server grants no `csa_flags` at all
+   * (`./state.ts` on CREATE_SESSION), so no session is persistent, and there
+   * is no pNFS here to enable. A check for it would be unreachable code
+   * describing a state the server cannot enter.
+   */
+  async #openCreateExclusive(
+    how: CreateHow4,
+    path: string,
+    cursor: Cursor,
+    attrset: number[],
+    parent: StatsLike | undefined,
+  ): Promise<number | undefined> {
+    const exclusive4 = how.mode === EXCLUSIVE4;
+    const verifier = exclusive4 ? how.createverf! : how.createboth!.verf;
+    const attrs = exclusive4 ? undefined : how.createboth!.attrs;
+    if (attrs !== undefined) {
+      this.#settableOrRefuse(attrs);
+    }
+    const mode = (attrs?.values.mode ?? 0o666) & 0o7777;
+    // Recorded from inside the create, before it awaits anything else: the
+    // duplicate these two modes exist for is a *retransmission*, sent because
+    // the reply was lost, and it therefore arrives while the original is still
+    // in flight. A verifier recorded after the `#claim` and `#applyAttrs`
+    // below is one the duplicate looks for, does not find, and is answered
+    // `NFS4ERR_EXIST` for, by the very create that succeeded. It goes in with
+    // no `attrset`, and is rewritten with the real one further down — an
+    // under-reported `attrset` is the case §18.16.4 already tells client
+    // implementors to check for and follow with a SETATTR, whereas an `EXIST`
+    // for one's own file is not recoverable at all.
+    const created = await this.#createFile(path, mode, () => this.#exclusives.set(path, verifier));
+    if (!created) {
+      const remembered = this.#exclusives.match(path, verifier);
+      if (remembered === undefined) {
+        return NFS4ERR_EXIST;
+      }
+      // The duplicate of a request whose reply never arrived: same file, same
+      // answer. The OPEN below it proceeds as it did the first time.
+      attrset.push(...remembered.attrset);
+      return undefined;
+    }
+    await this.#claim(path, cursor.creds, { parent, directory: false, mode });
+    const bits: number[] = [];
+    let status = NFS4_OK;
+    if (attrs !== undefined) {
+      // The mode went in as `open`'s third argument, so `#applyAttrs` must not
+      // see it — and must see everything else, size included.
+      const applied = await this.#applyAttrs(path, {
+        ...attrs,
+        values: { ...attrs.values, mode: undefined },
+      });
+      if (attrs.values.mode !== undefined) {
+        bits.push(FATTR4_MODE);
+      }
+      bits.push(...applied.bits);
+      status = applied.status;
+    }
+    // Re-recorded, now that there are bits to record, and still recorded when
+    // an attribute failed to land: the file exists and this verifier is what
+    // made it, so a resend must be recognised either way — and it is answered
+    // with the bits that *did* land, which is the partial `attrset` §18.16.4
+    // tells client implementors to check for.
+    this.#exclusives.set(path, verifier, bits);
+    attrset.push(...bits);
+    return status === NFS4_OK ? undefined : status;
+  }
+
+  /**
+   * Create a file, answering whether it was this call that created it.
+   *
+   * `onCreated` runs after the create wins and before the `close()`, i.e.
+   * before this function's next `await` — the only place a concurrent
+   * duplicate cannot already have overtaken. `#openCreateExclusive` records
+   * its verifier there and says why.
+   */
+  async #createFile(path: string, mode: number, onCreated?: () => void): Promise<boolean> {
+    let handle: FileHandleLike;
     try {
-      const handle = await this.driver.open(
+      handle = await this.driver.open(
         path,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
         mode,
       );
-      await this.#close(handle);
-      return true;
     } catch (error) {
       if ((error as { code?: string }).code === "EEXIST") {
         return false;
       }
       throw error;
     }
+    onCreated?.();
+    await this.#close(handle);
+    return true;
   }
 
   /**
