@@ -59,6 +59,30 @@ rather than by accident.
   `createP9Server` over TCP. Worth doing only if TCP serving — multiple VM
   guests, or several processes against one `attach()`ed server — grows real
   users; until then it is a documented gap, not a silent one.
+- **A driver → transport "path X changed underneath you" channel.** Half of this
+  already ships, and it is the transport-facing half: `notifyInvalInode()` /
+  `notifyInvalEntry()` on the FUSE session (`src/fuse/session.ts`) and on the
+  mount (`src/fuse/mount.ts`), pure encoders in `src/fuse/notify.ts`. What is
+  missing is the driver end — nothing in `FsDriver` can say a path changed, so
+  the only caller today is code that already knows because it made the change
+  itself. It is **not** a `mountx.*` member: every extension there is a
+  path-shaped call the session makes, and this is an event the driver raises
+  unprompted, so it wants a `watch`-shaped surface on `FsDriver` rather than a
+  method in the namespace. The FUSE half of the translation is already in place
+  — `InodeTable.byPath` turns the path into the `ino` a notification needs, and
+  a path the kernel never looked up has nothing cached, which is the natural
+  no-op.
+  **FUSE is the only transport that could consume it today, and the only one
+  that can without new protocol work.** 9P has no invalidation message at all
+  (below). NFSv3 is request/response only: client caching is bounded by
+  attribute timeouts and nothing server-initiated exists. NFSv4.1 does have a
+  back channel — delegation recall and `CB_NOTIFY` — but this server grants no
+  delegations, never sets `CREATE_SESSION4_FLAG_CONN_BACK_CHAN`, refuses a
+  `CDFC4_BACK` `BIND_CONN_TO_SESSION` with `NFS4ERR_INVAL` and answers
+  `BACKCHANNEL_CTL` the same way, so reaching it means building the callback
+  program, delegations, and `GET_DIR_DELEGATION` for the directory case — far
+  more work than the notification it would carry. The S3 gateway has neither a
+  channel nor a client cache to invalidate.
 - **9P has no FUSE-style invalidation channel.** `notify_inval_inode`/
   `notify_inval_entry` have no 9P analogue — nothing in the protocol lets a
   server tell a client that something it cached has changed — which is why
@@ -98,8 +122,9 @@ rather than by accident.
   backing store the FIFO would be real to the mounting process and absent to
   every other one.
 - **xattr and the rest of the `mountx.*` extension namespace** (byte-range
-  locks, `fallocate`/`lseek`, cache-invalidation `notify`) — `ENOTSUP` until a
-  real user needs one.
+  locks, `fallocate`/`lseek`) — `ENOTSUP` until a real user needs one.
+  Cache-invalidation `notify` used to be listed here and is not an extension at
+  all; it has its own entry above.
 - **NFS `CREATE` with `EXCLUSIVE`** — currently `NFS3ERR_NOTSUPP`; the verifier
   would have to be stored somewhere that survives a retry.
 - **FUSE over io_uring** (Linux 6.14+) — would replace the read/reply loop with
