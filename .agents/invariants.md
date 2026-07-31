@@ -50,8 +50,11 @@ no cast.
 positive `errno` and lets `src/fuse/native.ts` name it, rather than carrying a second
 copy of the table in another language where the two would drift. The same argument
 covers a wire format two transports share: RFC 9110's `HTTP-date`, `Range` and `ETag`
-spellings live in `src/http.ts`, which `src/s3/protocol.ts` re-exports under its own
-names and `src/webdav/` imports directly — one transcription, two HTTP transports.
+spellings live in `src/http.ts` — with the two entity-tag comparison functions and the
+§13.2.2 conditional-request rules built on them — and `src/s3/protocol.ts` re-exports
+them under its own names while `src/webdav/` imports them directly. One transcription,
+two HTTP transports; `evaluateConditionals` is wrapped rather than re-exported only
+because SigV4 makes the S3 gateway keep its headers as a signed list.
 
 ## Wire protocols
 

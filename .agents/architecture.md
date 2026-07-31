@@ -27,17 +27,17 @@ Deviations are noted per area below.
 
 ## Core (`src/`)
 
-| File           | What                                                                                                                                                          |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `types.ts`     | `FsDriver`, `FsCapabilities`, `StatsLike`/`DirentLike`/`FileHandleLike`, and the `mountx.*` namespace — **two live members**, `mknod` and `utimens`, no xattr |
-| `errors.ts`    | `ERRNO_CODES` (Linux), `fsError()` (byte-identical to `node:fs`'s), `errnoOf()` — the one errno table in the repo                                             |
-| `path.ts`      | absolute POSIX helpers, `..` clamps at root; canonical paths early-return, `resolvePath()` returns `{ path, segments }`                                       |
-| `harness.ts`   | `createLoopback(driver)` — normalize, fill gaps with `ENOSYS`, resolve capabilities. The method table is fixed **at construction**                            |
-| `lock.ts`      | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                 |
-| `subtree.ts`   | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                     |
-| `ownership.ts` | who a new entry belongs to: `inode_init_owner()`'s set-gid rule, plus the `lchown`/`chmod` that applies it. Internal; used by the two NFS sessions' `#claim`  |
-| `http.ts`      | RFC 9110's `HTTP-date`, `Range` and `ETag` quoting — the one copy, shared by the two HTTP transports; `mountx/s3` re-exports every symbol under its own name  |
-| `auto.ts`      | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                     |
+| File           | What                                                                                                                                                                                                            |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.ts`     | `FsDriver`, `FsCapabilities`, `StatsLike`/`DirentLike`/`FileHandleLike`, and the `mountx.*` namespace — **two live members**, `mknod` and `utimens`, no xattr                                                   |
+| `errors.ts`    | `ERRNO_CODES` (Linux), `fsError()` (byte-identical to `node:fs`'s), `errnoOf()` — the one errno table in the repo                                                                                               |
+| `path.ts`      | absolute POSIX helpers, `..` clamps at root; canonical paths early-return, `resolvePath()` returns `{ path, segments }`                                                                                         |
+| `harness.ts`   | `createLoopback(driver)` — normalize, fill gaps with `ENOSYS`, resolve capabilities. The method table is fixed **at construction**                                                                              |
+| `lock.ts`      | `PathLock` — `RENAME` takes it, `READ`/`WRITE` run outside it                                                                                                                                                   |
+| `subtree.ts`   | `remapSubtree()` — the rename rewrite; internal, deliberately not in the public `path.ts`                                                                                                                       |
+| `ownership.ts` | who a new entry belongs to: `inode_init_owner()`'s set-gid rule, plus the `lchown`/`chmod` that applies it. Internal; used by the two NFS sessions' `#claim`                                                    |
+| `http.ts`      | RFC 9110's `HTTP-date`, `Range`, `ETag` quoting, the two tag-comparison functions and §13.2.2's conditionals — the one copy, shared by the two HTTP transports; `mountx/s3` re-exports them under its own names |
+| `auto.ts`      | `mountx/auto` — probe, then FUSE → 9P → NFS, each behind `await import()`                                                                                                                                       |
 
 ### Drivers (`src/drivers/`)
 
@@ -140,8 +140,9 @@ and RFC 4331 for the quota pair.
 | `server.ts`    | the socket, and the only file here that imports `node:http`. Loopback-only without credentials; HTTP Basic with them                                                       |
 
 The deliberate gaps, each recorded at its own definition: no dead properties
-(`PROPPATCH` answers `403 cannot-modify-protected-property` — a driver has nowhere
-to keep one), no conditional requests yet, and no lock-null
+(`PROPPATCH` writes `getlastmodified` through `utimes` and answers `403
+cannot-modify-protected-property` for the rest — a driver has nowhere to keep a dead
+one), RFC 9110's conditionals on `GET`/`HEAD`/`PUT` only, and no lock-null
 resources (§7.3's _locked empty resource_ instead, which is a real file).
 
 ## CLI (`src/cli/`, the `mountx` bin, `pnpm mountx` from source)
@@ -231,10 +232,14 @@ The facts no single file's header can own.
   documents in full at its header. `xml.ts` pulls in only `s3/constants.ts`, so
   `mountx/webdav` does not load a signature or a chunked decoder.
 - **`src/http.ts` is the HTTP the two HTTP transports share** — `formatHttpDate` /
-  `parseHttpDate`, `parseRange` and the `Content-Range`/`ETag` spellings, all
-  RFC 9110. It was `src/s3/protocol.ts`'s until WebDAV needed the same three;
-  `s3/protocol.ts` re-exports every symbol under its old name, so `mountx/s3`'s
-  surface never moved.
+  `parseHttpDate`, `parseRange`, the `Content-Range`/`ETag` spellings, the strong
+  and weak entity-tag comparisons, and `evaluateConditionals`, all RFC 9110. It was
+  `src/s3/protocol.ts`'s until WebDAV needed the same rules; `s3/protocol.ts`
+  re-exports every symbol under its old name, so `mountx/s3`'s surface never moved.
+  `evaluateConditionals` is the one wrapped rather than re-exported: SigV4 signs
+  headers as they were sent, so that transport keeps a list and joins its repeated
+  `If-Match`/`If-None-Match` lines (RFC 9110 §5.3) into the record the shared rule
+  reads, while WebDAV hands over the one `node:http` already gave it.
 - **Platforms.** FUSE is Linux; 9P is Linux and root-only; NFS is Linux (root) and
   macOS (no root, behind a consent gate); S3 and WebDAV are anywhere. macOS gets NFS by necessity
   — macFUSE is a third-party kext with its own dialect, so `src/fuse/` cannot serve

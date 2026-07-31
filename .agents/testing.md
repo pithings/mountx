@@ -98,20 +98,26 @@ test:9p:mount` / `pnpm test:root`) — 9P has no unprivileged route on any host,
   `oracle.test.ts` — a real `rclone`/`curl` against the gateway, gated on `command -v
 rclone`/`curl` and needing no root, so it runs as part of `pnpm test` and skips
   clean when either binary is absent.
-- `test/webdav/` — Tier 0/1, all of it socket-optional: `protocol.test.ts` (the two
-  request grammars, the `multistatus`/`error` documents, and the target↔`href`
-  mapping round-tripped — the security-relevant half, since a name is the only thing
-  that decides which resource a request reaches), `session.test.ts` (in-process
-  against the memory driver, no sockets: RFC 4918's per-method semantics, the `207`
-  partial-failure shapes for `DELETE` and `COPY`, Basic auth, and the one-reply
-  discipline), and `server.test.ts` (real sockets driven with `fetch` plus one raw
-  one: the bind gate, keep-alive, an unread body drained, a short body taking the
-  connection with it, and an abandoned download releasing its handle), plus
-  `oracle.test.ts` — a real `rclone` and `curl` against the server, gated on
+- `test/webdav/` — Tier 0/1, all of it socket-optional: `protocol.test.ts` (the
+  three request grammars, the `If` header's disjunction-of-conjunctions, the
+  `multistatus`/`error`/lock documents, and the target↔`href` mapping round-tripped
+  — the security-relevant half, since a name is the only thing that decides which
+  resource a request reaches), `locks.test.ts` (the lock table alone, with `now` a
+  number the test moves and `newToken` a counter: §9.10.5's compatibility table,
+  both scopes, the lease, and §6.1's rule that a lock dies with its root),
+  `session.test.ts` (in-process against the memory driver, no sockets: RFC 4918's
+  per-method semantics, `LOCK`/`UNLOCK` and what a write lock refuses — `412`,
+  `423` and the `207` that names a locked member — RFC 9110's conditionals, the
+  `207` partial-failure shapes for `DELETE` and `COPY`, Basic auth, and the
+  one-reply discipline), and `server.test.ts` (real sockets driven with `fetch`
+  plus one raw one: the bind gate, keep-alive, an unread body drained, a short body
+  taking the connection with it, and an abandoned download releasing its handle),
+  plus `oracle.test.ts` — a real `rclone` and `curl` against the server, gated on
   `command -v` and needing no root, so it runs as part of `pnpm test` and skips
   clean when either binary is absent. That is the file that catches a symmetric
-  misreading of RFC 4918, the same role rclone plays for the S3 gateway. **No
-  conformance column yet** — see Known gaps.
+  misreading of RFC 4918 — including the whole class-2 round trip, where curl takes
+  a lock on an unmapped URL, is refused `423` for an untokened `PUT`, and gets
+  through with an `If` header. **No conformance column yet** — see Known gaps.
 - `test/auto.test.ts` — Tier 0 for `mountx/auto`: the preference order and the
   ruled-out reasons, answered for darwin and win32 from any host via the `platform`
   override. `test/auto-mount.test.ts` — Tier 2, whichever transport this host chose.
