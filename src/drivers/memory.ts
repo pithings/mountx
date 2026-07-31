@@ -92,30 +92,19 @@ const isSymlink = (node: MemNode): boolean => (node.mode & S_IFMT) === S_IFLNK;
 const SPECIAL_TYPES: ReadonlySet<number> = new Set([S_IFIFO, S_IFCHR, S_IFBLK, S_IFSOCK]);
 const isSpecial = (node: MemNode): boolean => SPECIAL_TYPES.has(node.mode & S_IFMT);
 
-/** Type predicates for `StatsLike` and `DirentLike` alike: one field decides all seven. */
-type TypePredicates = Pick<
-  StatsLike,
-  | "isFile"
-  | "isDirectory"
-  | "isSymbolicLink"
-  | "isBlockDevice"
-  | "isCharacterDevice"
-  | "isFIFO"
-  | "isSocket"
->;
-
-function typePredicates(mode: number): TypePredicates {
-  const type = mode & S_IFMT;
-  return {
-    isFile: () => type === S_IFREG,
-    isDirectory: () => type === S_IFDIR,
-    isSymbolicLink: () => type === S_IFLNK,
-    isBlockDevice: () => type === S_IFBLK,
-    isCharacterDevice: () => type === S_IFCHR,
-    isFIFO: () => type === S_IFIFO,
-    isSocket: () => type === S_IFSOCK,
-  };
-}
+/**
+ * The seven type predicates `StatsLike` and `DirentLike` both carry — one field
+ * of `mode` decides all of them — are written out at each of the two sites that
+ * build one, rather than shared by a helper the site spreads in.
+ *
+ * That looks like duplication worth removing, and removing it costs 2× on
+ * `readdir` and 1.4× on `stat` for the memory driver: `{...typePredicates(mode)}`
+ * is a runtime `CopyDataProperties` over an intermediate object per entry, where
+ * a literal is one allocation of a shape V8 already knows. It was measured going
+ * the wrong way — the helper landed in `5defab0` and the loopback column lost
+ * half its `readdir` throughput — so if this is factored out again, re-measure
+ * (`bench/`, the loopback column) rather than assuming the spread is free.
+ */
 
 function toMs(time: TimeLike): number {
   return typeof time === "number" ? time * 1000 : time.getTime();
@@ -297,6 +286,7 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
 
   function toStats(node: MemNode): StatsLike {
     const size = sizeOf(node);
+    const type = node.mode & S_IFMT;
     return {
       dev: 0,
       ino: node.ino,
@@ -312,7 +302,13 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
       mtimeMs: node.mtimeMs,
       ctimeMs: node.ctimeMs,
       birthtimeMs: node.birthtimeMs,
-      ...typePredicates(node.mode),
+      isFile: () => type === S_IFREG,
+      isDirectory: () => type === S_IFDIR,
+      isSymbolicLink: () => type === S_IFLNK,
+      isBlockDevice: () => type === S_IFBLK,
+      isCharacterDevice: () => type === S_IFCHR,
+      isFIFO: () => type === S_IFIFO,
+      isSocket: () => type === S_IFSOCK,
     };
   }
 
@@ -486,11 +482,20 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
       // per entry is all waste — and `nlinkOf` makes it worse than waste, by
       // rescanning every subdirectory's children to count links nobody reads.
       // The file type is one field of `mode`.
-      return [...node.children!].map(([name, child]) => ({
-        name,
-        parentPath,
-        ...typePredicates(child.mode),
-      }));
+      return [...node.children!].map(([name, child]) => {
+        const type = child.mode & S_IFMT;
+        return {
+          name,
+          parentPath,
+          isFile: () => type === S_IFREG,
+          isDirectory: () => type === S_IFDIR,
+          isSymbolicLink: () => type === S_IFLNK,
+          isBlockDevice: () => type === S_IFBLK,
+          isCharacterDevice: () => type === S_IFCHR,
+          isFIFO: () => type === S_IFIFO,
+          isSocket: () => type === S_IFSOCK,
+        };
+      });
     },
 
     async open(path, flags = "r", mode = 0o666) {
