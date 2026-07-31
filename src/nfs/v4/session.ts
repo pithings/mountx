@@ -2336,8 +2336,10 @@ export class Nfs4Session {
    * `parent` is therefore threaded in from the `stat` the caller already took —
    * CREATE reads the parent to check it is a directory, OPEN to build its
    * `change_info4` — so the rule adds no round trip of its own. A new directory
-   * taking the set-gid bit does cost a `chmod`, which is the one part of it
-   * that cannot be folded into the create.
+   * taking the set-gid bit does cost an `lstat` and a `chmod`, which is the one
+   * part of it that cannot be folded into the create: the mode the create asked
+   * for is not the mode it got (`../../ownership.ts` on the umask), so the bit
+   * goes on top of what the driver actually made.
    */
   async #claim(path: string, creds: RpcCredentials, entry: NewEntry): Promise<void> {
     if (this.options.claimOwnership === false) {
@@ -3246,7 +3248,17 @@ export class Nfs4Session {
       this.#settableOrRefuse(attrs);
     }
     const mode = (attrs?.values.mode ?? 0o666) & 0o7777;
-    const created = await this.#createFile(path, mode);
+    // Recorded from inside the create, before it awaits anything else: the
+    // duplicate these two modes exist for is a *retransmission*, sent because
+    // the reply was lost, and it therefore arrives while the original is still
+    // in flight. A verifier recorded after the `#claim` and `#applyAttrs`
+    // below is one the duplicate looks for, does not find, and is answered
+    // `NFS4ERR_EXIST` for, by the very create that succeeded. It goes in with
+    // no `attrset`, and is rewritten with the real one further down — an
+    // under-reported `attrset` is the case §18.16.4 already tells client
+    // implementors to check for and follow with a SETATTR, whereas an `EXIST`
+    // for one's own file is not recoverable at all.
+    const created = await this.#createFile(path, mode, () => this.#exclusives.set(path, verifier));
     if (!created) {
       const remembered = this.#exclusives.match(path, verifier);
       if (remembered === undefined) {
@@ -3273,31 +3285,41 @@ export class Nfs4Session {
       bits.push(...applied.bits);
       status = applied.status;
     }
-    // Recorded even when an attribute failed to land: the file exists and this
-    // verifier is what made it, so a resend must still be recognised — and it
-    // is answered with the bits that *did* land, which is the partial `attrset`
-    // §18.16.4 tells client implementors to check for.
+    // Re-recorded, now that there are bits to record, and still recorded when
+    // an attribute failed to land: the file exists and this verifier is what
+    // made it, so a resend must be recognised either way — and it is answered
+    // with the bits that *did* land, which is the partial `attrset` §18.16.4
+    // tells client implementors to check for.
     this.#exclusives.set(path, verifier, bits);
     attrset.push(...bits);
     return status === NFS4_OK ? undefined : status;
   }
 
-  /** Create a file, answering whether it was this call that created it. */
-  async #createFile(path: string, mode: number): Promise<boolean> {
+  /**
+   * Create a file, answering whether it was this call that created it.
+   *
+   * `onCreated` runs after the create wins and before the `close()`, i.e.
+   * before this function's next `await` — the only place a concurrent
+   * duplicate cannot already have overtaken. `#openCreateExclusive` records
+   * its verifier there and says why.
+   */
+  async #createFile(path: string, mode: number, onCreated?: () => void): Promise<boolean> {
+    let handle: FileHandleLike;
     try {
-      const handle = await this.driver.open(
+      handle = await this.driver.open(
         path,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
         mode,
       );
-      await this.#close(handle);
-      return true;
     } catch (error) {
       if ((error as { code?: string }).code === "EEXIST") {
         return false;
       }
       throw error;
     }
+    onCreated?.();
+    await this.#close(handle);
+    return true;
   }
 
   /**

@@ -47,6 +47,7 @@ import {
   NFS3ERR_TOOSMALL,
   NFS_PROGRAM,
   NFS_V3,
+  NFSPROC3_CREATE,
   NFSPROC3_LOOKUP,
   NFSPROC3_NULL,
   NFSPROC3_READ,
@@ -66,8 +67,10 @@ import {
   type OpaqueAuth,
 } from "../../../src/nfs/rpc.ts";
 import { encodeXdr } from "../../../src/nfs/xdr.ts";
+import { readCreateRes, writeCreateArgs } from "../../../src/nfs/v3/protocol.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
 import type { FsDriver, FullFsDriver } from "../../../src/types.ts";
+import { withLatency } from "../../latency.ts";
 import { withoutExtensions } from "../../no-extensions.ts";
 import { check, NfsClient, nfsDriver } from "./client.ts";
 import { createLoopback, type Loopback } from "../../../src/harness.ts";
@@ -796,6 +799,52 @@ describe("individual procedures", () => {
     );
   });
 
+  /**
+   * The same promise, kept against the duplicate that actually happens.
+   *
+   * A retransmission is sent because the reply was *lost*, which means it goes
+   * out while the original is still in flight — not after it has been answered.
+   * A verifier recorded any later than "the create won" is therefore a verifier
+   * the duplicate looks for, does not find, and is told `NFS3ERR_EXIST` about
+   * by the very request that succeeded.
+   *
+   * Driven through {@link withLatency}, because the ordering is only observable
+   * against a driver that takes a real turn to answer: 17 of 17 duplicates were
+   * told `EXIST` before the verifier moved ahead of the `close()`.
+   */
+  it("answers duplicates that arrive while the original is still in flight", async () => {
+    const { server, root } = await serve(withLatency(createMemoryDriver()));
+    // The same record 18 times — same xid and all, which is what an RPC
+    // retransmission *is* — handed to the session together rather than one
+    // after another, so none of them can see another's reply. The server
+    // dispatches every record it reads without awaiting it, so this is the
+    // arrival pattern a congested client produces, not a synthetic one.
+    const record = encodeCall({
+      xid: 0x3c_3c_3c_3c,
+      program: NFS_PROGRAM,
+      version: NFS_V3,
+      procedure: NFSPROC3_CREATE,
+      args: encodeXdr((w) =>
+        writeCreateArgs(w, {
+          where: { dir: root, name: "excl" },
+          mode: CREATE_EXCLUSIVE,
+          attributes: {},
+          verf: VERIFIER,
+        }),
+      ),
+    });
+    const replies = await Promise.all(
+      Array.from({ length: 18 }, () => server.session.handleCall(record)),
+    );
+    const results = replies.map((reply) => readCreateRes(decodeReply(reply!).results));
+    const first = check(results[0]!, "create");
+    for (const result of results) {
+      expect(result.status).toBe(NFS3_OK);
+      // Every one of them is the same file, which is the whole promise.
+      expect([...check(result, "create").obj!]).toEqual([...first.obj!]);
+    }
+  });
+
   it("forgets the verifier once the client commits with SETATTR", async () => {
     const { client, root } = await serve();
     const created = check(
@@ -1134,6 +1183,70 @@ describe("set-gid inheritance", () => {
       "create",
     );
     expect(plainMode.objAttributes!.mode).toBe(0o2664);
+  });
+
+  /**
+   * The bit goes on top of the mode the driver **made**, not the one the client
+   * asked for.
+   *
+   * `open`/`mkdir` mask their mode argument with the umask of the process the
+   * driver runs in and a `chmod` is not masked at all, so a rule that
+   * re-asserts the requested mode hands the caller *wider* permissions in a
+   * set-gid directory than the same call gets one directory over. The memory
+   * driver applies no umask by default, which is why every case above is blind
+   * to this; one that does is the smallest thing that can see it.
+   */
+  it("puts the bit on the mode the driver made, not the one the client asked for", async () => {
+    const driver = createMemoryDriver({ umask: 0o022 });
+    await driver.mkdir("/team");
+    await driver.chown("/team", 500, TEAM);
+    await driver.chmod("/team", 0o2775);
+    await driver.mkdir("/plain");
+    const { client, root } = await serve(driver, { cred: OUTSIDER });
+    const team = check(await client.lookup(root, "team"), "lookup").object!;
+    const plain = check(await client.lookup(root, "plain"), "lookup").object!;
+
+    // 0o775 asked for, 0o755 created, 0o2755 after the bit: the same mode the
+    // plain directory produces, plus the one bit that was inherited.
+    const inherited = check(await client.mkdir(team, "sub", { mode: 0o775 }), "mkdir");
+    const control = check(await client.mkdir(plain, "sub", { mode: 0o775 }), "mkdir");
+    expect(control.objAttributes!.mode).toBe(0o755);
+    expect(inherited.objAttributes!.mode).toBe(0o2755);
+
+    // The clearing half reads back the same way: 0o2775 asked for, 0o2755
+    // created, 0o755 once the bit this caller may not hand out comes off.
+    const executable = check(
+      await client.create(team, "run", CREATE_UNCHECKED, { mode: 0o2775 }),
+      "create",
+    );
+    expect(executable.objAttributes!.mode).toBe(0o755);
+  });
+
+  /**
+   * `#claim` is about a *new* entry, and an `UNCHECKED` CREATE is not always
+   * one: §3.3.8's UNCHECKED "does not check for the existence of the file", so
+   * it succeeds over a file somebody else made and owns. Claiming that file
+   * would hand it to whoever named it last — and, once the rule started
+   * `chmod`ing as well, would strip the set-gid bit off it on the way.
+   */
+  it("claims only the entry the call actually created", async () => {
+    const driver = await fixture();
+    // Somebody else's shared executable, already in the team directory.
+    await (await driver.open("/team/run", "w")).close();
+    await driver.chown("/team/run", 500, TEAM);
+    await driver.chmod("/team/run", 0o2775);
+
+    const { client, root } = await serve(driver, { cred: OUTSIDER });
+    const team = check(await client.lookup(root, "team"), "lookup").object!;
+    const over = check(await client.create(team, "run", CREATE_UNCHECKED), "create");
+    expect(over.objAttributes!.uid).toBe(500);
+    expect(over.objAttributes!.gid).toBe(TEAM);
+    expect(over.objAttributes!.mode).toBe(0o2775);
+
+    // ...and the file this call *did* create is claimed exactly as before.
+    const made = check(await client.create(team, "new", CREATE_UNCHECKED), "create");
+    expect(made.objAttributes!.uid).toBe(4242);
+    expect(made.objAttributes!.gid).toBe(TEAM);
   });
 
   it("does not claim at all with claimOwnership off", async () => {

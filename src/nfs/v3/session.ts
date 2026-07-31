@@ -1112,9 +1112,16 @@ export class Nfs3Session {
    * rule and where it comes from). That is why `parent` is threaded in from the
    * `lstat` `#preOpStats` already did for the reply's `wcc_data` rather than
    * stat'ed here — every creating operation in this file reads the parent
-   * anyway, so the rule costs no extra round trip. It does cost a `chmod` when
-   * a new directory has to take the bit, which is the one case that cannot be
-   * folded into the create.
+   * anyway, so the rule costs no extra round trip. It does cost an `lstat` and
+   * a `chmod` when a new directory has to take the bit, which is the one case
+   * that cannot be folded into the create: the mode the create asked for is not
+   * the mode it got (`../../ownership.ts` on the umask), so the bit goes on top
+   * of what the driver actually made.
+   *
+   * Only ever for something **this call created** — an `UNCHECKED` CREATE that
+   * found the file already there must not re-own it, and must not re-mode it
+   * either, which would strip the set-group-ID bit off a file the caller had
+   * nothing to do with.
    */
   async #claim(path: string, creds: RpcCredentials, entry: NewEntry): Promise<void> {
     if (this.options.claimOwnership === false) {
@@ -1139,14 +1146,25 @@ export class Nfs3Session {
         return;
       }
       const mode = (request.attributes?.mode ?? 0o666) & 0o7777;
-      const flags =
-        constants.O_WRONLY |
-        constants.O_CREAT |
-        (request.mode === CREATE_GUARDED ? constants.O_EXCL : 0);
-      const handle = await this.driver.open(path, flags, mode);
-      await handle.close();
+      const created = await this.#createFile(path, mode);
+      if (!created && request.mode === CREATE_GUARDED) {
+        // "GUARDED ... the server checks for the presence of a duplicate
+        // object by name before performing the create."
+        throw new NfsStatusError(NFS3ERR_EXIST, "an object of that name already exists");
+      }
       this.#invalidate(dir);
-      await this.#claim(path, creds, { parent, directory: false, mode });
+      if (created) {
+        await this.#claim(path, creds, { parent, directory: false, mode });
+      } else {
+        // `UNCHECKED` over an existing file is an `open(2)` of that file, and
+        // its refusals are this server's answer: `EISDIR` for a directory,
+        // `EACCES` for a file this caller may not write. Learning whether the
+        // create won had to be an `O_EXCL` attempt (a `stat` first would be a
+        // race, and would tell `#claim` to re-own and re-mode a file this call
+        // did not make), so the plain open is made here instead of skipped.
+        const handle = await this.driver.open(path, constants.O_WRONLY | constants.O_CREAT, mode);
+        await handle.close();
+      }
       // `UNCHECKED` over an existing file still applies the attributes, which
       // is how a client asks for `open(…, O_CREAT|O_TRUNC)` in one round trip.
       await this.#applySattr(path, { ...request.attributes, mode: undefined });
@@ -1189,17 +1207,14 @@ export class Nfs3Session {
     parent: StatsLike | undefined,
   ): Promise<void> {
     const verifier = verf ?? new Uint8Array(NFS3_CREATEVERFSIZE);
-    let handle: FileHandleLike;
-    try {
-      handle = await this.driver.open(
-        path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-        0o666,
-      );
-    } catch (error) {
-      if ((error as { code?: string }).code !== "EEXIST") {
-        throw error;
-      }
+    // Recorded from inside the create, before it awaits anything else: the
+    // duplicate this mode exists for is a *retransmission*, sent because the
+    // reply was lost, and it therefore arrives while the original is still in
+    // flight. A verifier recorded after the `close()` — or after the `#claim`
+    // below — is one the duplicate looks for, does not find, and is answered
+    // `NFS3ERR_EXIST` for, by the very create that succeeded.
+    const created = await this.#createFile(path, 0o666, () => this.#exclusives.set(path, verifier));
+    if (!created) {
       if (this.#exclusives.match(path, verifier) === undefined) {
         throw new NfsStatusError(NFS3ERR_EXIST, "a different file already has that name");
       }
@@ -1208,10 +1223,40 @@ export class Nfs3Session {
       // caller answers with the file this client already made.
       return;
     }
-    await handle.close();
-    this.#exclusives.set(path, verifier);
     this.#invalidate(dir);
     await this.#claim(path, creds, { parent, directory: false, mode: 0o666 });
+  }
+
+  /**
+   * Create a file, answering whether it was **this call** that created it.
+   *
+   * `O_EXCL` rather than a `stat` first, for the same reason `v4/session.ts`
+   * learns it the same way: a `stat` would be a race, and every caller here
+   * needs the answer to be the truth about its own create — `#claim` may only
+   * give away a file this call made, and an `UNCHECKED` CREATE over a file
+   * somebody else owns must not re-own it or strip the set-group-ID bit off it.
+   *
+   * `onCreated` runs after the create wins and before the `close()`, i.e.
+   * before this function's next `await`. That is the only place a concurrent
+   * duplicate cannot already have overtaken — see `#createExclusive`.
+   */
+  async #createFile(path: string, mode: number, onCreated?: () => void): Promise<boolean> {
+    let handle: FileHandleLike;
+    try {
+      handle = await this.driver.open(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        mode,
+      );
+    } catch (error) {
+      if ((error as { code?: string }).code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+    onCreated?.();
+    await handle.close();
+    return true;
   }
 
   async #mkdir(args: XdrReader, creds: RpcCredentials, writer: XdrWriter): Promise<void> {

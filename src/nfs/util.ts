@@ -21,7 +21,7 @@ import type { PathLock } from "../lock.ts";
 import type { StatsLike } from "../types.ts";
 import { S_IFDIR, S_IFMT } from "../types.ts";
 import { sameVerifier, type FileHandleTable } from "./handles.ts";
-import type { RpcCall, RpcCredentials } from "./rpc.ts";
+import { copyBytes, type RpcCall, type RpcCredentials } from "./rpc.ts";
 
 /**
  * The largest offset either version can name.
@@ -141,8 +141,10 @@ export interface NfsSessionOptions {
    * first past it. Default: no cap, which is what this server has always done.
    *
    * An eviction costs the client holding that handle an `ESTALE` and a
-   * re-lookup — and an NFSv4.1 client that had the file open rather more than
-   * that. See `./handles.ts` before setting it.
+   * re-lookup — and an NFSv4.1 client that had the file **open** its share
+   * reservation, since the re-lookup is a different entry id and so a different
+   * `FileState`. A cap below the largest READDIRPLUS page a client asks for is
+   * also self-defeating. Read `./handles.ts` before setting it.
    */
   maxHandles?: number;
   /** Largest `READ` answered. */
@@ -288,9 +290,13 @@ export class ExclusiveCreates {
   /** Remember `verifier` as the one that created `path`. */
   set(path: string, verifier: Uint8Array, attrset: readonly number[] = []): void {
     // Copied, both of them: this outlives the request they were decoded from,
-    // and `attrset` is the caller's own array, still being pushed to.
+    // and `attrset` is the caller's own array, still being pushed to. The copy
+    // is `copyBytes` and not `verifier.slice()` because `handleCall` is public
+    // and takes any `Uint8Array`: hand it a `Buffer` and `.slice()` is
+    // `subarray`, which would leave this table holding a view of somebody
+    // else's receive buffer for the next two minutes.
     const entry: ExclusiveCreate = {
-      verifier: verifier.slice(),
+      verifier: copyBytes(verifier),
       attrset: [...attrset],
       at: this.#now(),
     };

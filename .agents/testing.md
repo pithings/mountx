@@ -24,6 +24,13 @@ through its Tier-1 JS client, and FUSE contributes a real-mount column.
 - `test/no-extensions.ts` is the other side of the same seam: `withoutExtensions(driver)`
   drops the `mountx` key so the four sessions' no-extension paths keep being tested
   now that the memory driver has one.
+- `test/latency.ts` is the other driver wrapper: `withLatency(driver)` pushes every
+  call to the next macrotask, because the memory driver answers inside a microtask
+  and two requests that arrive together therefore run through it in lockstep. That
+  hides every "the duplicate reached the table before the original wrote to it"
+  bug — the NFS exclusive-create verifier was recorded a `close()` too late and
+  every suite was green over it — so a case about _ordering under concurrency_
+  belongs against this rather than against a bare memory driver.
 - A target declares `errors: "host"` when it forwards the host kernel's errors rather
   than carrying `src/errors.ts`'s table: on Linux that changes nothing, and on darwin
   it is what lets the suite hold the _code_ exact while allowing either number

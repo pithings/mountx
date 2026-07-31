@@ -126,12 +126,22 @@ rather than by accident.
   evicts least-recently-used past the cap, root exempt — but the cap is opt-in,
   so out of the box the table is still one entry per path a client currently has
   a name for, held for the life of the server. It is opt-in because an eviction
-  costs an NFSv4.1 client more than a re-`LOOKUP`: `src/nfs/v4/session.ts` keys
-  open and lock state by entry id, so evicting a handle a client has open costs
-  it an `OPEN` as well. Pinning entries with live v4 state — and only then
-  picking a default — is what is left. A directly constructed `Nfs3Session` /
-  `Nfs4Session` also builds its own table and ignores the option; every public
-  path goes through the router, so this is the tests and the CLI only.
+  costs an NFSv4.1 client **correctness**, not a re-`LOOKUP`:
+  `src/nfs/v4/session.ts` keys open and lock state by entry id (`#fileKey`), so
+  a file that is evicted and looked up again acquires a _second_ `FileState` —
+  and the two do not see each other, which means one client's
+  `OPEN4_SHARE_DENY_WRITE` is silently bypassed by another client's open through
+  the fresh entry (reproduced). Byte-range locks split the same way. **Pinning
+  entries with live v4 state is the work**, and only then is a default worth
+  picking. Two smaller things belong with it: nothing enforces a floor relative
+  to a READDIRPLUS page (at `maxHandles: 8` one 40-entry page returned 40
+  handles of which 33 were stale before the reply left — it converges, and it is
+  documented rather than clamped), and `MNT` binds the export root through an
+  ordinary lookup, so a _subdirectory_ export's mount root is evictable and a v3
+  client has no name above it to recover with. A directly constructed
+  `Nfs3Session` / `Nfs4Session` also builds its own table and ignores the option;
+  every public path goes through the router, so this is the tests and the CLI
+  only.
 - **Set-gid inheritance on the FUSE session.** The rule itself now exists —
   `src/ownership.ts`, a transcription of `inode_init_owner()` — and both NFS
   sessions apply it: a new entry in a set-gid directory takes the parent's

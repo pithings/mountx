@@ -52,18 +52,41 @@
  * to a different file, and that handle answers `ESTALE` ("unknown file handle")
  * rather than quietly naming somebody else's. What it costs an NFSv3 client is
  * one round trip: `ESTALE` means "drop the dentry and look the name up again",
- * which re-binds the path and mints a fresh handle. What it costs an NFSv4.1
- * client that had the file **open** is more — `v4/session.ts` keys open and
- * lock state by entry id, so the re-lookup is a different file as far as share
- * reservations are concerned and the client has to re-`OPEN`. That asymmetry is
- * why the cap is off unless asked for, rather than defaulted to some number.
+ * which re-binds the path and mints a fresh handle.
  *
- * The root is never a victim: `PUTROOTFH`, `PUTPUBFH` and `MNT` hand out its
- * handle from the `root` field rather than from a lookup, so an id that stopped
- * decoding would be a handle this server minted and immediately refused.
- * Neither is the entry currently being bound — the call that overflowed the cap
- * is about to answer with it — so the smallest table a cap can produce is those
- * two, whatever number it is given.
+ * **What it costs an NFSv4.1 client that had the file open is correctness, not
+ * a round trip.** `v4/session.ts` keys open and lock state by *entry id*
+ * (`#fileKey`), and a re-`LOOKUP` after an eviction mints a **new** id for the
+ * same file — so the file acquires a second `FileState`, and the two do not see
+ * each other. A share reservation stops being enforced: one client's
+ * `OPEN4_SHARE_DENY_WRITE` is silently bypassed by another client's write open
+ * through the fresh entry, which is a denial the protocol promised and this
+ * server then did not make. Byte-range locks split the same way. This is why
+ * the cap is off unless asked for, and why "pin entries with live v4 state" is
+ * named as the work in `.agents/roadmap.md`'s "A default for `maxHandles`"
+ * entry rather than a default simply being picked.
+ *
+ * **Do not set a cap below a READDIRPLUS page.** One page binds a handle per
+ * name it returns — at `maxHandles: 8`, a 40-entry page returned 40 handles of
+ * which 33 were already evicted before the reply left the server. It converges
+ * (the client re-`LOOKUP`s and each `bind` re-mints), so it is self-correcting
+ * rather than broken, but a cap smaller than the largest page a client asks for
+ * is a cap that spends its whole life evicting what it just handed out. The
+ * floor worth honouring is "comfortably more than `dircount`/`maxcount` can
+ * produce", which for the defaults real clients use is in the hundreds.
+ *
+ * The root is never a victim, and one operation depends on that outright:
+ * `PUTROOTFH` and `PUTPUBFH` hand out the root's handle from the `root` field
+ * rather than from a lookup, so an id that stopped decoding would be a handle
+ * this server minted and immediately refused. `MNT` is **not** in that list —
+ * `#mnt` binds through `#attrOf(path)` like any other lookup — so the mount
+ * root of a *subdirectory* export (`127.0.0.1:/sub`) is an ordinary evictable
+ * entry, and its eviction is the one `ESTALE` a v3 client cannot recover from
+ * by re-`LOOKUP`, having no name above it to look up. A cap and a subdirectory
+ * export together want a table far larger than the working set, or a fresh
+ * `MNT`. Neither is the entry currently being bound a victim — the call that
+ * overflowed the cap is about to answer with it — so the smallest table a cap
+ * can produce is the root plus that one, whatever number it is given.
  */
 
 import { randomFillSync } from "node:crypto";
@@ -126,9 +149,12 @@ export interface FileHandleTableOptions {
    *
    * The number counts everything {@link FileHandleTable.size} does, the root
    * included. The root and the entry being bound are never evicted, so a cap
-   * below two is honoured as far as it can be rather than refused. See the
-   * module docs for what an eviction costs a client still holding the handle —
-   * it is a real cost, which is why there is no default.
+   * below two is honoured as far as it can be rather than refused. Nothing
+   * enforces a floor, and there is one worth knowing: a cap smaller than the
+   * largest READDIRPLUS page a client asks for spends its life evicting the
+   * handles it just handed out, and an eviction costs an NFSv4.1 client with
+   * the file open a **share reservation**, not a round trip. Both are in the
+   * module docs, and both are why there is no default.
    */
   maxHandles?: number;
 }
@@ -142,10 +168,10 @@ export class FileHandleTable {
   readonly #useDriverIno: boolean;
   /** Entries to keep, or `0` for "no cap" — see {@link FileHandleTableOptions.maxHandles}. */
   readonly #maxHandles: number;
-  /** Doubles as the LRU order: insertion order, youngest last. See {@link FileHandleTable.touch}. */
+  /** Doubles as the LRU order: insertion order, youngest last. See `#touch`. */
   readonly #byId = new Map<bigint, HandleEntry>();
   readonly #byPath = new Map<string, HandleEntry>();
-  /** Only holds entries with at least one path — see {@link FileHandleTable.detachPath}. */
+  /** Only holds entries with at least one path — see `#detachPath`. */
   readonly #byKey = new Map<string, HandleEntry>();
   #nextId = ROOT_HANDLE_ID + 1n;
   /**
@@ -367,10 +393,10 @@ export class FileHandleTable {
    * with no idea anything moved.
    *
    * The walk itself is `src/subtree.ts`'s — the same one `InodeTable` and
-   * `FidTable` do — driven by *this* table's {@link FileHandleTable.detachPath}
-   * and {@link FileHandleTable.attachPath}, so what a replaced destination
-   * means here is unchanged: the entry loses its identity key and its id, and
-   * the handle the client still holds answers `ESTALE`. It costs two full scans
+   * `FidTable` do — driven by *this* table's `#detachPath` and `#attachPath`,
+   * so what a replaced destination means here is unchanged: the entry loses its
+   * identity key and its id, and the handle the client still holds answers
+   * `ESTALE`. It costs two full scans
    * of the path map per rename, i.e. O(tracked paths) rather than O(subtree);
    * see that module for why a prefix tree is the fix and why it is a
    * benchmark-milestone concern, not a v1 one.
@@ -439,8 +465,8 @@ export class FileHandleTable {
     // last sentence is the whole licence for evicting a *live* entry too: the
     // client is told `ESTALE`, never handed somebody else's file.
     //
-    // The root is the exception: `PUTROOTFH` and `MNT` hand out its handle from
-    // the `root` field rather than from a lookup, so an id that no longer
+    // The root is the exception: `PUTROOTFH` and `PUTPUBFH` hand out its handle
+    // from the `root` field rather than from a lookup, so an id that no longer
     // decodes would be a handle this server minted and immediately refuses.
     if (entry.id !== ROOT_HANDLE_ID) {
       this.#byId.delete(entry.id);
@@ -462,7 +488,7 @@ export class FileHandleTable {
    * `decode` is not free. The root is a no-op too, and for the opposite reason:
    * it can never be a victim, so its place in the order means nothing, and
    * leaving it where it was inserted — the old end, for the life of the table —
-   * is what keeps {@link FileHandleTable.lruVictim}'s scan to a step or two.
+   * is what keeps `#lruVictim`'s scan to a step or two.
    */
   #touch(entry: HandleEntry): void {
     if (this.#maxHandles <= 0 || entry.id === ROOT_HANDLE_ID) {
@@ -509,18 +535,17 @@ export class FileHandleTable {
   /**
    * Drop an entry the client may still be naming.
    *
-   * Name by name through {@link FileHandleTable.detachPath}, so this is the
-   * same teardown as a file whose last link went away rather than a second one
-   * beside it — the maps cannot end up disagreeing about an entry that is gone,
-   * because only one piece of code decides what "gone" does. The trailing
-   * {@link FileHandleTable.dropEntry} covers the case the loop cannot reach:
-   * `pathOf` forgets a name the path map no longer agrees with without going
-   * through `#detachPath` at all, so an entry can be down to no names and still
-   * be here. It is idempotent, so paying for it unconditionally is cheaper than
-   * asking.
+   * Name by name through `#detachPath`, so this is the same teardown as a file
+   * whose last link went away rather than a second one beside it — the maps
+   * cannot end up disagreeing about an entry that is gone, because only one
+   * piece of code decides what "gone" does. The trailing `#dropEntry` covers
+   * the case the loop cannot reach: `pathOf` forgets a name the path map no
+   * longer agrees with without going through `#detachPath` at all, so an entry
+   * can be down to no names and still be here. It is idempotent, so paying for
+   * it unconditionally is cheaper than asking.
    *
-   * Deleting the name being visited is what {@link FileHandleTable.pruneToNlink}
-   * already does to the same set, and is well defined for a `Set` iterator.
+   * Deleting the name being visited is what `#pruneToNlink` already does to the
+   * same set, and is well defined for a `Set` iterator.
    */
   #evict(entry: HandleEntry): void {
     for (const path of entry.paths) {

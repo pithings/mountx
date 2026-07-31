@@ -23,6 +23,7 @@
  * bottom is `ExclusiveCreates`' window and size cap.
  */
 
+import { Buffer } from "node:buffer";
 import { describe, expect, it } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
 import {
@@ -236,7 +237,11 @@ describe("ExclusiveCreates", () => {
 
   it("copies the verifier and the attrset it is handed", () => {
     const table = new ExclusiveCreates();
-    const verifier = Uint8Array.from(VERIFIER);
+    // A `Buffer`, deliberately: `NfsSession.handleCall` is public and takes any
+    // `Uint8Array`, and `Buffer.prototype.slice` **is `subarray`** — so a
+    // `verifier.slice()` here passes against a plain `Uint8Array` and quietly
+    // stores a *view* of a socket's receive pool against a real one.
+    const verifier = Buffer.from(VERIFIER);
     const attrset = [33];
     table.set("/f", verifier, attrset);
     // The request buffer is reused and the caller goes on pushing to its
@@ -244,6 +249,8 @@ describe("ExclusiveCreates", () => {
     verifier.fill(0);
     attrset.push(4);
     expect(table.match("/f", VERIFIER)?.attrset).toEqual([33]);
+    // ...and the bytes that were reused are not the ones now being matched.
+    expect(table.match("/f", verifier)).toBeUndefined();
   });
 
   it("forgets an entry past the window, and a lookup does not extend it", () => {

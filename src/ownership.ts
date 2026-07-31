@@ -57,18 +57,28 @@ export interface NewEntry {
   mode: number;
 }
 
-/** What the new entry's owner, group and mode should be. */
+/** What the new entry's owner, group and set-group-ID bit should be. */
 export interface NewEntryOwnership {
   /** For `lchown`; `-1` means "leave it alone". */
   uid: number;
   /** For `lchown`; `-1` means "leave it alone". */
   gid: number;
   /**
-   * The mode the entry must be changed to, or `undefined` when the mode the
-   * create used is already right — which is the overwhelmingly common answer,
-   * and the one that costs no extra driver call.
+   * The set-group-ID bit the entry has to end up with, or `undefined` when the
+   * create already settled it — which is the overwhelmingly common answer, and
+   * the one that costs no extra driver call.
+   *
+   * A **bit**, not a mode, and deliberately: the mode a create asks for is not
+   * the mode it gets. `open(2)` and `mkdir(2)` mask their mode argument with
+   * the umask of the process the driver runs in (and `vfs_mkdir` strips
+   * `S_ISGID` from it outright), so re-asserting the requested mode through
+   * `chmod` would hand the caller *wider* permissions than the same call gets
+   * one directory over — at umask 022, `mkdir 0775` coming out `2775` under a
+   * set-group-ID parent and `0755` under a plain one. {@link claimNewEntry}
+   * therefore reads back what the driver actually created and changes this one
+   * bit of it.
    */
-  mode: number | undefined;
+  setgid: boolean | undefined;
 }
 
 /**
@@ -85,13 +95,17 @@ export function newEntryOwnership(caller: CallerCredentials, entry: NewEntry): N
   const parent = entry.parent;
   if (parent === undefined || (parent.mode & S_ISGID) === 0) {
     // "} else inode->i_gid = current_fsgid();"
-    return { uid, gid: caller.gid ?? -1, mode: undefined };
+    return { uid, gid: caller.gid ?? -1, setgid: undefined };
   }
   // "if (dir && dir->i_mode & S_ISGID) { inode->i_gid = dir->i_gid;"
   const gid = parent.gid;
   if (entry.directory) {
-    // "Directories are special, and always inherit S_ISGID."
-    return { uid, gid, mode: (entry.mode & S_ISGID) === 0 ? entry.mode | S_ISGID : undefined };
+    // "Directories are special, and always inherit S_ISGID." Asked for even
+    // when the create named the bit itself: `mkdir(2)` is not allowed to set
+    // it ("mode &= (S_IRWXUGO | S_ISVTX);" in `vfs_mkdir()`), so whether it is
+    // there is a question for the driver rather than for the request, and
+    // `claimNewEntry` skips the `chmod` when the answer is already yes.
+    return { uid, gid, setgid: true };
   }
   // "else if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
   //  !in_group_p(inode->i_gid) && !capable_wrt_inode_uidgid(dir, CAP_FSETID))
@@ -100,15 +114,16 @@ export function newEntryOwnership(caller: CallerCredentials, entry: NewEntry): N
   const setgidExecutable = (entry.mode & (S_ISGID | S_IXGRP)) === (S_ISGID | S_IXGRP);
   const member = caller.gid === gid || caller.gids?.includes(gid) === true;
   if (setgidExecutable && !member && uid !== 0) {
-    return { uid, gid, mode: entry.mode & ~S_ISGID };
+    return { uid, gid, setgid: false };
   }
-  return { uid, gid, mode: undefined };
+  return { uid, gid, setgid: undefined };
 }
 
-/** The two driver calls giving an entry away can take. */
+/** The three driver calls giving an entry away can take. */
 interface OwnershipDriver {
   lchown(path: string, uid: number, gid: number): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
+  lstat(path: string): Promise<StatsLike>;
 }
 
 /**
@@ -117,10 +132,10 @@ interface OwnershipDriver {
  * Deliberately skipped when the answer is the state the driver already
  * produced — the caller *is* the server process and nothing was inherited —
  * because that is the common case and worth a round trip. Deliberately quiet
- * when the driver has no `lchown`/`chmod` (`ENOSYS`) or is not privileged
- * enough to hand ownership away (`EPERM`/`ENOTSUP`): a driver with no concept
- * of ownership is not thereby broken, and failing the create it just completed
- * would be the wrong answer to that.
+ * when the driver has no `lchown`/`lstat`/`chmod` (`ENOSYS`) or is not
+ * privileged enough to hand ownership away (`EPERM`/`ENOTSUP`): a driver with
+ * no concept of ownership is not thereby broken, and failing the create it just
+ * completed would be the wrong answer to that.
  *
  * The `chmod` runs **after** the `lchown`, not before: `chown(2)` clears
  * set-group-ID on an executable when an unprivileged caller changes ownership,
@@ -135,8 +150,28 @@ export async function claimNewEntry(
   if (!mine && (owner.uid !== -1 || owner.gid !== -1)) {
     await quietly(driver.lchown(path, owner.uid, owner.gid));
   }
-  if (owner.mode !== undefined) {
-    await quietly(driver.chmod(path, owner.mode));
+  if (owner.setgid !== undefined) {
+    await quietly(setgid(driver, path, owner.setgid));
+  }
+}
+
+/**
+ * Turn `S_ISGID` on (or off) on an entry that has just been created.
+ *
+ * The mode chmod'ed is the one the driver **made**, read back, not the one the
+ * create asked for: `open(2)`/`mkdir(2)` mask their mode argument with the
+ * umask of the process the driver runs in and a `chmod` is not masked at all,
+ * so re-asserting the requested mode here would silently widen the entry (see
+ * {@link NewEntryOwnership.setgid}). That `lstat` is paid **only under a
+ * set-group-ID parent** — every other create leaves `setgid` `undefined` and
+ * never reaches here — and it is the same call that lets a driver which already
+ * applied the rule itself be left alone.
+ */
+async function setgid(driver: OwnershipDriver, path: string, on: boolean): Promise<void> {
+  const current = (await driver.lstat(path)).mode & 0o7777;
+  const wanted = on ? current | S_ISGID : current & ~S_ISGID;
+  if (wanted !== current) {
+    await driver.chmod(path, wanted);
   }
 }
 

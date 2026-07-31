@@ -211,6 +211,7 @@ import { Nfs4Session } from "../../../src/nfs/v4/session.ts";
 import { XdrWriter } from "../../../src/nfs/xdr.ts";
 import { createLoopback } from "../../../src/harness.ts";
 import { createNfsServer, type NfsServer } from "../../../src/nfs/server.ts";
+import { withLatency } from "../../latency.ts";
 import { withoutExtensions } from "../../no-extensions.ts";
 import { CREATE_EXCLUSIVE, NFS3ERR_EXIST } from "../../../src/nfs/v3/constants.ts";
 import { check as check3, NfsClient as Nfs3Client, nfsDriver } from "../v3/client.ts";
@@ -2298,6 +2299,49 @@ describe("OPEN", () => {
         OPEN({ name: "exclusive", owner: 3, openhow: exclusiveHow(mode, OTHER_VERIFIER) }),
       ]);
       expect(rival.compound.status).toBe(NFS4ERR_EXIST);
+    }
+  });
+
+  /**
+   * The same promise, kept against the duplicate that actually happens.
+   *
+   * A retransmission is sent because the reply was *lost*, so it goes out while
+   * the original is still in flight rather than after it has been answered. A
+   * verifier recorded any later than "the create won" — after the `#claim`, or
+   * after the `cva_attrs` are applied — is one the duplicate looks for, does
+   * not find, and is told `NFS4ERR_EXIST` about by the very OPEN that
+   * succeeded. {@link withLatency} is what makes that ordering observable: the
+   * memory driver answers inside a microtask and no duplicate can lose to it.
+   */
+  it("answers duplicates that arrive while the original is still in flight", async () => {
+    for (const mode of [EXCLUSIVE4, EXCLUSIVE4_1]) {
+      const session = new Nfs4Session(withLatency(await populated()));
+      // Separate 4.1 sessions, because one slot table is one request at a time
+      // — which is the client-side reason a resend is a *new* connection's
+      // problem as often as it is a retransmission on this one.
+      const clients = await Promise.all(
+        Array.from({ length: 8 }, (_, index) => ready(session, `client-${index}`)),
+      );
+      const replies = await Promise.all(
+        clients.map((client, index) =>
+          client.run([
+            ...TO_DIR,
+            OPEN({
+              name: "exclusive",
+              owner: index + 1,
+              openhow: exclusiveHow(mode, VERIFIER),
+            }),
+            { op: OP_GETFH },
+          ]),
+        ),
+      );
+      const first = resFor<Getfh4res>(replies[0]!, OP_GETFH).object!;
+      for (const reply of replies) {
+        expect(reply.compound.status).toBe(NFS4_OK);
+        // Every one of them is the same file, which is the whole promise.
+        expect([...resFor<Getfh4res>(reply, OP_GETFH).object!]).toEqual([...first]);
+      }
+      expect(session.handles.resolve(first)).toBe("/dir/exclusive");
     }
   });
 
