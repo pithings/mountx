@@ -38,8 +38,17 @@ through its Tier-1 JS client, and FUSE contributes a real-mount column.
   directory.
 - `test/rooted-node-fs.ts` — `node:fs/promises` rooted at a directory; the oracle
   shared by `drivers.test.ts` and the FUSE conformance column.
-- `test/matrix.ts` generates `.agents/conformance-matrix.md` (`pnpm matrix`). Its
-  `unmetIn()` counts a capability as met when **at least one** target in the column
+- `test/matrix.ts` generates `.agents/conformance-matrix.md` (`pnpm matrix`). Only the
+  FUSE column _needs_ root, but every column is run through `test/root.sh` when root is
+  reachable (already uid 0, or `sudo -n`), because the suite's one root-gated case —
+  `lchown` handing a file away — would otherwise be skipped in five columns and report
+  an environment fact five times over. It is best-effort in both directions: no sudo and
+  the Tier-1 columns run unprivileged as before, and an elevated attempt that produces no
+  report falls back to an unprivileged one. `UNIMOUNT_MATRIX_SKIP_ROOT=1` opts out of all
+  of it. The run's uid is _recorded_ in the Environment column rather than derived from
+  which requirements went unmet — S3 skips that case for want of `symlinks` well before
+  privilege is reached, so "no `root` case passed" is not evidence about the uid.
+  Its `unmetIn()` counts a capability as met when **at least one** target in the column
   passed a case naming it, not every one — the drivers sharing a column need not have
   the same capabilities now that `unstorage` runs beside `memory`. A `mountx.*`
   requirement is dropped from the "capabilities lost" table (not from the per-case

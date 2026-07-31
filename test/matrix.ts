@@ -41,6 +41,19 @@
  * requirement counts as unmet in a column when no case naming it passed there,
  * which is how "NFSv3 loses `handles`" ends up in the report as a derived fact
  * rather than a claim this script was told.
+ *
+ * **Why a Tier-1 column is elevated too, when root is there for the asking.**
+ * `root` is one of those requirements, and unlike the others it is not a fact
+ * about a transport: the suite's one root-gated case hands a file away with
+ * `lchown`, which only root may do. Run unprivileged, every Tier-1 column
+ * reports it as skipped and the matrix says "not root" five times over — an
+ * environment fact repeated in five places rather than a measurement. So a
+ * column that does not *need* root is still run through `test/root.sh` when
+ * root is reachable (`{@link rootReachable}`), purely so that case runs; the
+ * suite has no case that expects a permission *denial*, so nothing else in it
+ * reads differently as root. It is a best-effort step in both directions: no
+ * sudo means the column runs unprivileged exactly as before, and an elevated
+ * attempt that produces no report falls back to one (`{@link run}`).
  */
 
 import { spawnSync } from "node:child_process";
@@ -54,7 +67,13 @@ interface Column {
   key: string;
   label: string;
   file: string;
-  /** Tier 2: run it through `test/root.sh`. */
+  /**
+   * Tier 2: this column *cannot* run without root, so a host that has none
+   * reports it unavailable rather than running it.
+   *
+   * A `false` here does not mean the column runs unprivileged — see the
+   * elevation note in this file's header. It means root is not a precondition.
+   */
   root: boolean;
   description: string;
 }
@@ -132,6 +151,16 @@ interface ColumnResult {
   targets: string[];
   /** Why the column could not run, if it could not. */
   unavailable?: string;
+  /**
+   * Did this column's run have root?
+   *
+   * Recorded rather than derived. The obvious derivation — "`root` is among the
+   * requirements no case in this column met" — cannot tell *why* a root-gated
+   * case did not run: the S3 column skips the one there is for want of
+   * `permissions` and `symlinks`, long before privilege is reached, so deriving
+   * it had the report say "not root" about a run that was root.
+   */
+  elevated: boolean;
 }
 
 const rows = new Map<string, Row>();
@@ -157,7 +186,24 @@ function untag(title: string): { text: string; requires: string[] } {
  */
 function run(column: Column, scratch: string): ColumnResult {
   const output = join(scratch, `${column.key}.json`);
-  const [command, args] = column.root
+  if (column.root || !elevate()) {
+    return runOnce(column, output, column.root);
+  }
+  // Elevation is an improvement, never a precondition, so a column that did not
+  // ask for root gets its unprivileged run back if the elevated one produced
+  // nothing. Losing a whole column to a sudo that misbehaved would trade five
+  // real measurements for one.
+  const elevated = runOnce(column, output, true);
+  if (elevated.unavailable === undefined) {
+    return elevated;
+  }
+  rmSync(output, { force: true });
+  return runOnce(column, output, false);
+}
+
+/** One spawn of one column, parsed into {@link rows}. */
+function runOnce(column: Column, output: string, elevated: boolean): ColumnResult {
+  const [command, args] = elevated
     ? ["sh", ["test/root.sh", "--reporter=json", `--outputFile=${output}`, column.file]]
     : [
         process.execPath,
@@ -175,6 +221,7 @@ function run(column: Column, scratch: string): ColumnResult {
     return {
       targets: [],
       unavailable: `vitest produced no report${detail === "" ? "" : `: ${detail}`}`,
+      elevated,
     };
   }
   const report = JSON.parse(readFileSync(output, "utf8")) as VitestJson;
@@ -215,7 +262,28 @@ function run(column: Column, scratch: string): ColumnResult {
       cells.set(target, assertion.status as Status);
     }
   }
-  return { targets };
+  return { targets, elevated };
+}
+
+/**
+ * Is root reachable from here — already ours, or one `sudo -n` away?
+ *
+ * Cached, because it spawns and every column asks. `-n` rather than a bare
+ * `sudo` so a host with a password prompt answers "no" instead of blocking a
+ * generator nobody is watching.
+ */
+let sudoUsable: boolean | undefined;
+function rootReachable(): boolean {
+  if ((process.getuid?.() ?? -1) === 0) {
+    return true;
+  }
+  sudoUsable ??= spawnSync("sudo", ["-n", "true"], { stdio: "ignore" }).status === 0;
+  return sudoUsable;
+}
+
+/** Should a column that does not need root be elevated anyway? */
+function elevate(): boolean {
+  return process.env.UNIMOUNT_MATRIX_SKIP_ROOT !== "1" && rootReachable();
 }
 
 /** Can the root column run here at all? A reason, or `undefined` for yes. */
@@ -229,11 +297,8 @@ function rootBlocker(): string | undefined {
   if (!existsSync("/dev/fuse")) {
     return "no /dev/fuse on this host";
   }
-  if ((process.getuid?.() ?? -1) !== 0) {
-    const sudo = spawnSync("sudo", ["-n", "true"], { stdio: "ignore" });
-    if (sudo.status !== 0) {
-      return "not root, and `sudo -n` is not available";
-    }
+  if (!rootReachable()) {
+    return "not root, and `sudo -n` is not available";
   }
   return undefined;
 }
@@ -322,7 +387,9 @@ function main(): void {
       const blocker = column.root ? rootBlocker() : undefined;
       process.stdout.write(`matrix: ${column.label} … `);
       const result =
-        blocker === undefined ? run(column, scratch) : { targets: [], unavailable: blocker };
+        blocker === undefined
+          ? run(column, scratch)
+          : { targets: [], unavailable: blocker, elevated: false };
       results.set(column.key, result);
       const { passed, skipped, failed } = counts(column.key);
       process.stdout.write(
@@ -373,7 +440,11 @@ function main(): void {
     "Derived from the run, not declared here: a requirement counts as unmet in a column when no " +
       "case that names it passed there. `root` is an environment fact rather than a transport " +
       "one — it gates the one case that hands a file away, which only root may do — so it is " +
-      "reported in its own column. A `mountx.*` requirement is left out of this table entirely: " +
+      "reported in its own column, and *recorded* there rather than derived: a column can skip " +
+      "that case for want of `symlinks` long before privilege is reached, so the absence of a " +
+      "pass is not evidence about the run's uid. Every column is run with root when root is " +
+      "reachable, including the five that do not need it. A `mountx.*` requirement is left out " +
+      "of this table entirely: " +
       "the suite calls an extension by name through `fs.mountx`, which only the loopback column " +
       "has, so a skip everywhere else is a fact about how the case is written and not about what " +
       "the transport carries (all four sessions do carry `mknod` — see the per-case rows below, " +
@@ -406,7 +477,7 @@ function main(): void {
     // calling it a loss would be a claim the run cannot make in either
     // direction. The per-case rows below still show the skips.
     const lost = missing.filter((name) => name !== "root" && !name.startsWith("mountx."));
-    const environment = missing.includes("root") ? "not root: `root` cases skipped" : "complete";
+    const environment = result.elevated ? "root" : "not root: `root` cases skipped";
     push(
       result.unavailable === undefined
         ? `| **${column.label}** | ${
