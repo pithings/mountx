@@ -141,10 +141,13 @@ export interface NfsSessionOptions {
    * first past it. Default: no cap, which is what this server has always done.
    *
    * An eviction costs the client holding that handle an `ESTALE` and a
-   * re-lookup — and an NFSv4.1 client that had the file **open** its share
-   * reservation, since the re-lookup is a different entry id and so a different
-   * `FileState`. A cap below the largest READDIRPLUS page a client asks for is
-   * also self-defeating. Read `./handles.ts` before setting it.
+   * re-lookup. An entry an NFSv4.1 client has **open** is never taken — its
+   * share reservations and byte-range locks are keyed to that entry's id — so
+   * this is a **soft cap**: a client holding more files open than the cap
+   * allows entries pushes the table past it, and the table will not evict its
+   * way back down until those opens close. A cap below the largest READDIRPLUS
+   * page a client asks for is also self-defeating. Read `./handles.ts` before
+   * setting it.
    */
   maxHandles?: number;
   /** Largest `READ` answered. */

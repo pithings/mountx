@@ -37,6 +37,14 @@
  * opens and closes its own handle per request, which is what `../v3/session.ts`
  * does for every request it answers.
  *
+ * That the `fileKey` is a handle-table entry id has one consequence running the
+ * other way: an entry the table evicted would come back under a *new* id, and
+ * the same file would then carry two `FileState`s that cannot see each other —
+ * a share reservation quietly stopping being enforced. So this file **pins** an
+ * entry for exactly as long as `./state.ts` holds state for its key
+ * (`onFileRetained`/`onFileReleased` → `#pinFile`/`#unpinFile`), and the cap in
+ * `../handles.ts` is soft as a result.
+ *
  * ## The current stateid
  *
  * A COMPOUND's cursor carries a stateid beside the two filehandles
@@ -782,6 +790,17 @@ function stateKey(other: Uint8Array): string {
   return hexOf(other);
 }
 
+/**
+ * The handle entry id a `fileKey` names — the inverse of `#fileKey`.
+ *
+ * `undefined` for anything that is not one of those keys, which is the reclaim
+ * arm's `""` and nothing else. Written as a test rather than a `try`, because
+ * `BigInt("0x")` throwing is not the reason this returns `undefined`.
+ */
+function entryIdOf(fileKey: string): bigint | undefined {
+  return /^[\da-f]+$/.test(fileKey) ? BigInt(`0x${fileKey}`) : undefined;
+}
+
 /** {@link allowedAccess}'s answer as `ACCESS4_*` bits (RFC 8881 §18.1.1). */
 function accessBits4(rights: AccessRights): number {
   return (
@@ -914,6 +933,20 @@ export class Nfs4Session {
    * encoded.
    */
   readonly #released: string[] = [];
+  /**
+   * The `fileKey`s whose handle entry this session is holding pinned.
+   *
+   * `../handles.ts` evicts least-recently-used entries under a cap, and this
+   * file keys every open and every byte-range lock by *entry id* — so an
+   * evicted entry would be looked up again under a new id and the same file
+   * would end up with two `FileState`s that cannot see each other, silently
+   * dropping a share reservation. `./state.ts` reports the exact span in which
+   * a key means something (`onFileRetained`/`onFileReleased`), and this set is
+   * the record of the pins taken for it: it makes the pins idempotent per key,
+   * and it is what `destroy()` hands back so a session teardown cannot leave an
+   * entry pinned for the rest of the table's life.
+   */
+  readonly #pinnedFiles = new Set<string>();
   /** The verifiers of OPEN with `EXCLUSIVE4`/`EXCLUSIVE4_1` — see `../util.ts`. */
   readonly #exclusives: ExclusiveCreates;
   #destroyed = false;
@@ -943,6 +976,8 @@ export class Nfs4Session {
     this.state = new Nfs4State({
       ...knobs,
       onOpenReleased: (other) => this.#released.push(stateKey(other)),
+      onFileRetained: (fileKey) => this.#pinFile(fileKey),
+      onFileReleased: (fileKey) => this.#unpinFile(fileKey),
     });
     this.#maxOperations = Math.max(1, options.nfs4?.maxOperations ?? DEFAULT_MAX_OPERATIONS);
   }
@@ -997,8 +1032,14 @@ export class Nfs4Session {
   }
 
   /**
-   * Drop every cached listing, close every driver handle still held open, and
-   * stop. Idempotent. File *handles* (the wire kind) are the router's.
+   * Drop every cached listing, release every pinned handle entry, close every
+   * driver handle still held open, and stop. Idempotent. File *handles* (the
+   * wire kind) are the router's.
+   *
+   * The pins have to go here precisely *because* the table is the router's:
+   * this session's state dies with it, but the entries it was holding against
+   * eviction do not, and a pin nobody can ever release again is an entry the
+   * cap can never reclaim.
    *
    * The driver handles are this session's own: an open state that is still
    * open when the server stops has nobody left to CLOSE it, and a driver whose
@@ -1011,6 +1052,12 @@ export class Nfs4Session {
     this.#snapshots.clear();
     this.#exclusives.clear();
     this.#maxOpsBySession.clear();
+    // Not through `#unpinFile`: the whole set goes at once here, so it is
+    // emptied in one step rather than deleted from under its own iterator.
+    for (const fileKey of this.#pinnedFiles) {
+      this.handles.unpin(entryIdOf(fileKey)!);
+    }
+    this.#pinnedFiles.clear();
     const open = [...this.#openHandles.keys(), ...this.#released];
     this.#released.length = 0;
     for (const key of open) {
@@ -2823,6 +2870,36 @@ export class Nfs4Session {
    */
   #fileKey(entry: HandleEntry): string {
     return entry.id.toString(16);
+  }
+
+  /**
+   * Hold the handle entry a `fileKey` names against LRU eviction, for as long
+   * as `./state.ts` has state on that file.
+   *
+   * The key is hex of an entry id and nothing else, so it inverts — which is
+   * the only reason this can be driven by the state table, which knows nothing
+   * about handles. A key that is not one is ignored rather than refused: the
+   * reclaim arm of {@link Nfs4Session.#open} passes `""` deliberately, having
+   * no file to name, and a `FileState` is never created for it.
+   *
+   * Idempotent per key, and paired with {@link Nfs4Session.#unpinFile} through
+   * `#pinnedFiles`, so an unpin can only ever release a pin this session took.
+   */
+  #pinFile(fileKey: string): void {
+    const id = entryIdOf(fileKey);
+    if (id === undefined || this.#pinnedFiles.has(fileKey)) {
+      return;
+    }
+    this.#pinnedFiles.add(fileKey);
+    this.handles.pin(id);
+  }
+
+  /** Release {@link Nfs4Session.#pinFile}'s pin, if this session took one. */
+  #unpinFile(fileKey: string): void {
+    if (!this.#pinnedFiles.delete(fileKey)) {
+      return;
+    }
+    this.handles.unpin(entryIdOf(fileKey)!);
   }
 
   /** The current filehandle as the pair a stateful operation needs. */

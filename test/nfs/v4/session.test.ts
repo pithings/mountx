@@ -3071,6 +3071,170 @@ describe("byte-range locks", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// a capped handle table under live v4.1 state
+// ---------------------------------------------------------------------------
+
+/**
+ * What a handle eviction must **not** cost a client that has the file open.
+ *
+ * `../../src/nfs/v4/session.ts` keys open and lock state by handle table entry
+ * id, so an entry evicted under `maxHandles` and looked up again would come
+ * back with a *new* id — and one file would carry two `FileState`s that cannot
+ * see each other. That is not a round trip, it is a share reservation the
+ * server promised and then did not keep, and it was reproduced exactly as
+ * written here before the fix: the second OPEN was granted.
+ *
+ * The table is the router's, so these go through `NfsSession` — a directly
+ * constructed `Nfs4Session` builds its own table and ignores `maxHandles`.
+ */
+describe("a capped handle table under live v4.1 state", () => {
+  const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
+
+  /** `/dir/file`, plus enough decoys to push anything unpinned out of a small cap. */
+  async function crowded(): Promise<FullFsDriver> {
+    const driver = await populated();
+    for (let index = 0; index < 12; index++) {
+      const decoy = await driver.open(`/dir/decoy${index}`, "w");
+      await decoy.close();
+    }
+    return driver;
+  }
+
+  /** Look each decoy up in turn: twelve binds into a table that holds four. */
+  async function walk(client: Client): Promise<void> {
+    for (let index = 0; index < 12; index++) {
+      const reply = await client.run([
+        ...TO_DIR,
+        { op: OP_LOOKUP, args: { objname: `decoy${index}` } },
+      ]);
+      expect(reply.compound.status).toBe(NFS4_OK);
+    }
+  }
+
+  it("keeps a share reservation across the eviction pressure of another client", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const holder = await ready(session.v4, "client-a");
+    const rival = await ready(session.v4, "client-b");
+
+    const held = await holder.run([
+      ...TO_DIR,
+      OPEN({ access: OPEN4_SHARE_ACCESS_READ, deny: OPEN4_SHARE_DENY_WRITE }),
+    ]);
+    expect(held.compound.status).toBe(NFS4_OK);
+    const entry = session.handles.at("/dir/file")!;
+    expect(entry.pins).toBe(1);
+
+    await walk(rival);
+    // The pin held: same entry, same id, so the same `fileKey` and the same
+    // `FileState`. Twelve lookups into a table of four, and what is left is the
+    // root, `/dir`, the pinned file and the last decoy — the twelve decoys took
+    // each other's places instead.
+    expect(session.handles.at("/dir/file")).toBe(entry);
+    expect(session.handles.size).toBe(4);
+
+    const clash = await rival.run([...TO_DIR, OPEN({ access: OPEN4_SHARE_ACCESS_WRITE })]);
+    expect(clash.compound.status).toBe(NFS4ERR_SHARE_DENIED);
+  });
+
+  it("keeps a byte-range lock across the same pressure", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const holder = await ready(session.v4, "client-a");
+    const rival = await ready(session.v4, "client-b");
+
+    const open = await opened(holder, { access: OPEN4_SHARE_ACCESS_BOTH });
+    const locked = await holder.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCK,
+        args: {
+          locktype: WRITE_LT,
+          reclaim: false,
+          offset: 0n,
+          length: 10n,
+          locker: {
+            newLockOwner: true,
+            openOwner: {
+              openSeqid: 1,
+              openStateid: open,
+              lockSeqid: 1,
+              lockOwner: { clientid: 0n, owner: Uint8Array.from([5]) },
+            },
+          },
+        },
+      },
+    ]);
+    expect(locked.compound.status).toBe(NFS4_OK);
+
+    await walk(rival);
+
+    // The granted range is `state.locksOf(fileKey)`, so it follows the entry id
+    // exactly as the reservation above does.
+    const test = await rival.run([
+      ...TO_FILE,
+      {
+        op: OP_LOCKT,
+        args: {
+          locktype: WRITE_LT,
+          offset: 4n,
+          length: 2n,
+          owner: { clientid: 0n, owner: Uint8Array.from([6]) },
+        },
+      },
+    ]);
+    expect(test.compound.status).toBe(NFS4ERR_DENIED);
+    expect(resFor<Lockt4res>(test, OP_LOCKT).denied!.owner.clientid).toBe(holder.clientid);
+  });
+
+  it("lets the entry go once the state does, and leaves no pin behind", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const client = await ready(session.v4, "client-a");
+    const stateid = await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    const entry = session.handles.at("/dir/file")!;
+    expect(entry.pins).toBe(1);
+
+    const closed = await client.run([
+      ...TO_FILE,
+      { op: OP_CLOSE, args: { seqid: 1, openStateid: stateid } },
+    ]);
+    expect(closed.compound.status).toBe(NFS4_OK);
+    // A leaked pin is a permanently unevictable entry, so the count is asserted
+    // rather than inferred from the eviction that follows.
+    expect(entry.pins).toBe(0);
+
+    await walk(client);
+    expect(session.handles.get(entry.id)).toBeUndefined();
+    expect(session.handles.size).toBe(4);
+  });
+
+  it("releases the pins a teardown finds still held", async () => {
+    const session = new NfsSession(await crowded(), { maxHandles: 4 });
+    const client = await ready(session.v4, "client-a");
+    // Two files open at once, and no CLOSE for either: `destroy()` is the only
+    // thing left that can give the entries back.
+    await opened(client, { access: OPEN4_SHARE_ACCESS_READ });
+    await opened(client, { name: "decoy0", owner: 2, access: OPEN4_SHARE_ACCESS_READ });
+    const file = session.handles.at("/dir/file")!;
+    const decoy = session.handles.at("/dir/decoy0")!;
+    expect([file.pins, decoy.pins]).toEqual([1, 1]);
+
+    // The v4 session alone, not the router: `NfsSession.destroy()` ends in
+    // `handles.clear()`, which would drop the entries and make any answer look
+    // right. What has to be proved is that the session gives its pins *back*,
+    // into a table that outlives it.
+    await session.v4.destroy();
+    expect([file.pins, decoy.pins]).toEqual([0, 0]);
+    // The table outlives the session that pinned into it — it is the router's —
+    // so it must be evictable again for whatever serves next.
+    for (let index = 0; index < 12; index++) {
+      const path = `/dir/decoy${index}`;
+      session.handles.bind(path, await session.driver.lstat(path));
+    }
+    expect(session.handles.size).toBe(4);
+    expect(session.handles.get(file.id)).toBeUndefined();
+  });
+});
+
 describe("the current stateid", () => {
   const TO_FILE: Op[] = [...TO_DIR, { op: OP_LOOKUP, args: { objname: "file" } }];
 

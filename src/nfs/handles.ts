@@ -38,8 +38,10 @@
  * Unset — the default — nothing is evicted, and the table grows to one entry
  * per path the client currently has a name for: a client that walks a
  * million-file tree leaves a million entries, and nothing on the wire will ever
- * say they can go. Set, the table keeps at most that many entries (the root
- * counted) and drops the least recently *used* one past the cap. Recency is
+ * say they can go. Set, the table aims at that many entries (the root counted)
+ * and drops the least recently *used* one past the cap — aims, because it will
+ * not take an entry with live NFSv4.1 state on it, which is "Pins" below.
+ * Recency is
  * stamped by every path that reaches an entry — `decode`, `at`, `pathOf`, and
  * every `bind`/`remap` attach — not only by the call that created it, so the
  * entries a client is working with are the last ones considered, and the one it
@@ -53,18 +55,6 @@
  * rather than quietly naming somebody else's. What it costs an NFSv3 client is
  * one round trip: `ESTALE` means "drop the dentry and look the name up again",
  * which re-binds the path and mints a fresh handle.
- *
- * **What it costs an NFSv4.1 client that had the file open is correctness, not
- * a round trip.** `v4/session.ts` keys open and lock state by *entry id*
- * (`#fileKey`), and a re-`LOOKUP` after an eviction mints a **new** id for the
- * same file — so the file acquires a second `FileState`, and the two do not see
- * each other. A share reservation stops being enforced: one client's
- * `OPEN4_SHARE_DENY_WRITE` is silently bypassed by another client's write open
- * through the fresh entry, which is a denial the protocol promised and this
- * server then did not make. Byte-range locks split the same way. This is why
- * the cap is off unless asked for, and why "pin entries with live v4 state" is
- * named as the work in `.agents/roadmap.md`'s "A default for `maxHandles`"
- * entry rather than a default simply being picked.
  *
  * **Do not set a cap below a READDIRPLUS page.** One page binds a handle per
  * name it returns — at `maxHandles: 8`, a 40-entry page returned 40 handles of
@@ -87,6 +77,38 @@
  * `MNT`. Neither is the entry currently being bound a victim — the call that
  * overflowed the cap is about to answer with it — so the smallest table a cap
  * can produce is the root plus that one, whatever number it is given.
+ *
+ * ## Pins ({@link FileHandleTable.pin}), and why the cap is soft
+ *
+ * An NFSv4.1 client that had the file *open* could not have paid in round trips
+ * the way the v3 client above does. `v4/session.ts` keys open and lock state by
+ * entry id (`#fileKey`), so an evicted entry re-`LOOKUP`ed under a new id would
+ * give one file a second `FileState`, and the two would not see each other: one
+ * client's `OPEN4_SHARE_DENY_WRITE` would be silently bypassed by another
+ * client's write open through the fresh entry — a denial the protocol promised
+ * and this server then did not make — and byte-range locks would split the same
+ * way.
+ *
+ * So an entry with live v4.1 state is **pinned**, and `#lruVictim` walks past
+ * pinned entries. The v4 session pins a key for exactly as long as
+ * `v4/state.ts` holds a `FileState` for it (`onFileRetained`/`onFileReleased`,
+ * which bracket the one `Map` those states live in), and unpins whatever is
+ * left on `destroy()`.
+ *
+ * **The cap is therefore a soft one, deliberately.** When every candidate is
+ * pinned there is no victim to take, and `#enforceLimit` stops rather than
+ * breaking a share reservation: the table exceeds `maxHandles` and does *not*
+ * evict its way back down — it comes down as the opens close and ordinary
+ * binds find victims again. A client holding a thousand files open against
+ * `maxHandles: 100` gets a thousand-entry table, and that is the trade being
+ * made: the bound is advice, the reservation is a promise.
+ *
+ * A pin is about the LRU and nothing else. An entry whose **last path** goes
+ * away is still dropped outright, pinned or not: a removed file's handles are
+ * `ESTALE` whether or not somebody has it open (this server was never told a
+ * file was opened — see the third bullet at the top), and letting a pin keep a
+ * deleted file's entry alive would be a leak with a `rm` trigger rather than a
+ * reservation being kept.
  */
 
 import { randomFillSync } from "node:crypto";
@@ -119,6 +141,12 @@ export interface HandleEntry {
   fileid: bigint;
   /** Insertion-ordered; the first is the primary path every driver call uses. */
   readonly paths: Set<string>;
+  /**
+   * Holds against LRU eviction while it is above zero — see
+   * {@link FileHandleTable.pin}. Bookkeeping, not state a caller sets: go
+   * through `pin`/`unpin`, which are the only things that can keep it balanced.
+   */
+  pins: number;
 }
 
 function identityKey(stats: StatsLike): string | undefined {
@@ -148,13 +176,18 @@ export interface FileHandleTableOptions {
    * option existed.
    *
    * The number counts everything {@link FileHandleTable.size} does, the root
-   * included. The root and the entry being bound are never evicted, so a cap
-   * below two is honoured as far as it can be rather than refused. Nothing
-   * enforces a floor, and there is one worth knowing: a cap smaller than the
-   * largest READDIRPLUS page a client asks for spends its life evicting the
-   * handles it just handed out, and an eviction costs an NFSv4.1 client with
-   * the file open a **share reservation**, not a round trip. Both are in the
-   * module docs, and both are why there is no default.
+   * included. **It is a soft cap.** The root, the entry being bound and every
+   * entry {@link FileHandleTable.pin}ned by live NFSv4.1 state are not
+   * evictable, so a table with nothing else to take simply grows past this
+   * number rather than breaking a share reservation, and it does not evict its
+   * way back down afterwards — a client holding more files open than the cap
+   * allows entries is a table the size of its opens. A cap below two is
+   * likewise honoured as far as it can be rather than refused.
+   *
+   * Nothing enforces a floor, and there is one worth knowing: a cap smaller
+   * than the largest READDIRPLUS page a client asks for spends its life
+   * evicting the handles it just handed out. That, and the soft cap above, are
+   * in the module docs, and they are why there is no default.
    */
   maxHandles?: number;
 }
@@ -197,6 +230,7 @@ export class FileHandleTable {
       key: undefined,
       fileid: ROOT_HANDLE_ID,
       paths: new Set(["/"]),
+      pins: 0,
     };
     this.#byId.set(ROOT_HANDLE_ID, this.root);
     this.#byPath.set("/", this.root);
@@ -204,9 +238,10 @@ export class FileHandleTable {
 
   /**
    * Entries currently known — one per file that still has at least one name,
-   * plus the root, and never more than
-   * {@link FileHandleTableOptions.maxHandles} when one was given. See the
-   * module docs for what is and is not dropped.
+   * plus the root. A cap holds this down to
+   * {@link FileHandleTableOptions.maxHandles} as far as it can: pinned entries
+   * are not evictable, so the number can sit above the cap. See the module
+   * docs for what is and is not dropped.
    */
   get size(): number {
     return this.#byId.size;
@@ -271,6 +306,40 @@ export class FileHandleTable {
     return this.#byId.get(id);
   }
 
+  /**
+   * Hold an entry against LRU eviction until the matching
+   * {@link FileHandleTable.unpin}.
+   *
+   * A refcount rather than a flag, because the caller's own reasons to hold an
+   * entry nest: `v4/state.ts` keeps one `FileState` per file for opens *and*
+   * byte-range locks, and a second holder must not be able to release the
+   * first one's claim. **Every path that takes a pin has to drop it, error
+   * paths included** — a leaked pin is an entry the table can never evict
+   * again, which is the failure this is worth testing for.
+   *
+   * Only the LRU is affected. A pinned entry whose last path is detached is
+   * still dropped (see `#detachPath`), and both calls are no-ops for an id the
+   * table no longer has — which is what makes them safe to leave balanced
+   * across a `REMOVE` that took the entry out from under the holder.
+   *
+   * The root is pinnable like anything else and gains nothing by it: it is
+   * never a victim.
+   */
+  pin(id: bigint): void {
+    const entry = this.#byId.get(id);
+    if (entry !== undefined) {
+      entry.pins++;
+    }
+  }
+
+  /** Release one {@link FileHandleTable.pin}. Never goes below zero. */
+  unpin(id: bigint): void {
+    const entry = this.#byId.get(id);
+    if (entry !== undefined && entry.pins > 0) {
+      entry.pins--;
+    }
+  }
+
   at(path: string): HandleEntry | undefined {
     const entry = this.#byPath.get(path);
     if (entry !== undefined) {
@@ -323,7 +392,7 @@ export class FileHandleTable {
 
     if (entry === undefined) {
       const id = this.#nextId++;
-      entry = { id, key, fileid: fileidOf(stats, id), paths: new Set() };
+      entry = { id, key, fileid: fileidOf(stats, id), paths: new Set(), pins: 0 };
       this.#byId.set(entry.id, entry);
     } else {
       entry.fileid = fileidOf(stats, entry.id);
@@ -405,11 +474,19 @@ export class FileHandleTable {
     remapSubtree(this.#byPath, from, to, this.#remapOps);
   }
 
-  /** Forget everything but the root. Teardown, and tests. */
+  /**
+   * Forget everything but the root. Teardown, and tests.
+   *
+   * Pins go with the entries that carried them, the root's included: this is
+   * the whole table being thrown away, so there is no claim left to honour. A
+   * holder that unpins afterwards is a no-op — `unpin` neither resurrects an id
+   * nor goes below zero.
+   */
   clear(): void {
     this.#byId.clear();
     this.#byPath.clear();
     this.#byKey.clear();
+    this.root.pins = 0;
     this.root.paths.clear();
     this.root.paths.add("/");
     this.#byId.set(ROOT_HANDLE_ID, this.root);
@@ -506,8 +583,10 @@ export class FileHandleTable {
     }
     while (this.#byId.size > this.#maxHandles) {
       const victim = this.#lruVictim(keep);
-      // Root plus the entry just bound, and a cap of one or two asking for
-      // less than that. Honour what can be honoured and stop.
+      // Nothing left that may go: the root, the entry just bound, and every
+      // entry pinned by live NFSv4.1 state. The cap is soft — honour what can
+      // be honoured and stop, rather than take an entry somebody's share
+      // reservation is keyed to. See the module docs.
       if (victim === undefined) {
         return;
       }
@@ -516,16 +595,19 @@ export class FileHandleTable {
   }
 
   /**
-   * The oldest entry that may go — anything but the root and the entry the
-   * caller is in the middle of binding.
+   * The oldest entry that may go — anything but the root, the entry the caller
+   * is in the middle of binding, and the pinned.
    *
-   * The scan is not the linear cost it looks like: the root is inserted first
-   * and never touched, so it sits at the old end for the life of the table and
-   * this walks past it and one more entry at most.
+   * The scan is not the linear cost it looks like *for the first two*: the root
+   * is inserted first and never touched, so it sits at the old end for the life
+   * of the table and this walks past it and one more entry at most. Pins can
+   * lengthen it — a run of pinned entries at the old end is walked every time —
+   * and that is bounded by the opens a client holds, which is the same number
+   * `v4/state.ts` already caps per file.
    */
   #lruVictim(keep: HandleEntry): HandleEntry | undefined {
     for (const entry of this.#byId.values()) {
-      if (entry.id !== ROOT_HANDLE_ID && entry !== keep) {
+      if (entry.id !== ROOT_HANDLE_ID && entry !== keep && entry.pins === 0) {
         return entry;
       }
     }

@@ -357,6 +357,117 @@ describe("the handle-table bound", () => {
     expect(table.pathCount).toBe(4);
   });
 
+  it("never takes a pinned entry, however long it has been idle", () => {
+    const table = new FileHandleTable({ maxHandles: 3 });
+    const pinned = table.bind("/open", stats(2));
+    const held = table.encode(pinned);
+    table.pin(pinned.id);
+    // Never touched again: under the LRU alone this is the first thing to go,
+    // every single time.
+    for (let index = 0; index < 50; index++) {
+      table.bind(`/tmp${index}`, stats(100 + index));
+    }
+    expect(table.get(pinned.id)).toBe(pinned);
+    expect(table.resolve(held)).toBe("/open");
+    expect(table.size).toBe(3);
+  });
+
+  it("makes an unpinned entry the first victim again", () => {
+    const table = new FileHandleTable({ maxHandles: 3 });
+    const entry = table.bind("/open", stats(2));
+    table.pin(entry.id);
+    table.bind("/a", stats(3));
+    table.bind("/b", stats(4));
+    expect(table.get(entry.id)).toBe(entry);
+
+    table.unpin(entry.id);
+    // Nothing re-evicts on unpin — the cap is only enforced by a `bind` — so
+    // the next one is what takes it, and it takes the oldest, which is this.
+    table.bind("/c", stats(5));
+    expect(table.get(entry.id)).toBeUndefined();
+    expect(table.size).toBe(3);
+  });
+
+  it("counts pins, so one holder cannot release another's", () => {
+    const table = new FileHandleTable({ maxHandles: 2 });
+    const entry = table.bind("/open", stats(2));
+    table.pin(entry.id);
+    table.pin(entry.id);
+    table.unpin(entry.id);
+    expect(entry.pins).toBe(1);
+    table.bind("/a", stats(3));
+    expect(table.get(entry.id)).toBe(entry);
+
+    table.unpin(entry.id);
+    expect(entry.pins).toBe(0);
+    table.bind("/b", stats(4));
+    expect(table.get(entry.id)).toBeUndefined();
+  });
+
+  it("never counts a pin below zero, so a lapsed holder cannot go negative", () => {
+    const table = new FileHandleTable({ maxHandles: 2 });
+    const entry = table.bind("/open", stats(2));
+    table.unpin(entry.id);
+    expect(entry.pins).toBe(0);
+    // And an id the table no longer has is neither pinnable nor a throw: a
+    // holder whose file was removed unpins into thin air.
+    table.unbind("/open");
+    expect(table.get(entry.id)).toBeUndefined();
+    table.pin(entry.id);
+    table.unpin(entry.id);
+    expect(table.size).toBe(1);
+  });
+
+  it("exceeds the cap rather than evicting a pinned entry", () => {
+    const table = new FileHandleTable({ maxHandles: 3 });
+    const pinned: bigint[] = [];
+    for (let index = 0; index < 10; index++) {
+      const entry = table.bind(`/open${index}`, stats(100 + index));
+      table.pin(entry.id);
+      pinned.push(entry.id);
+    }
+    // Root plus ten, at a cap of three: the soft cap, which is the accepted
+    // trade — a broken share reservation is worse than a table over its bound.
+    expect(table.size).toBe(11);
+    for (const id of pinned) {
+      expect(table.get(id)).toBeDefined();
+    }
+    // And it does not evict its way back down when the pins go: it comes down
+    // as the next binds find victims again.
+    for (const id of pinned) {
+      table.unpin(id);
+    }
+    expect(table.size).toBe(11);
+    table.bind("/next", stats(200));
+    expect(table.size).toBe(3);
+  });
+
+  it("still drops a pinned entry whose last path is gone", () => {
+    const table = new FileHandleTable({ maxHandles: 4 });
+    const entry = table.bind("/doomed", stats(2));
+    table.pin(entry.id);
+    // A pin is about the LRU and nothing else: a removed file's handles are
+    // ESTALE whether or not somebody has it open, and keeping the entry alive
+    // for the pin would be a leak with a `rm` trigger.
+    table.unbind("/doomed");
+    expect(table.get(entry.id)).toBeUndefined();
+    expect(table.size).toBe(1);
+  });
+
+  it("drops the pins with the entries on clear()", () => {
+    const table = new FileHandleTable({ maxHandles: 3 });
+    const entry = table.bind("/open", stats(2));
+    table.pin(entry.id);
+    table.pin(table.root.id);
+    table.clear();
+    expect(table.root.pins).toBe(0);
+    expect(table.get(entry.id)).toBeUndefined();
+    for (let index = 0; index < 10; index++) {
+      table.bind(`/f${index}`, stats(100 + index));
+    }
+    expect(table.size).toBe(3);
+  });
+
   it("restamps a renamed subtree, and moves it whole", () => {
     const table = new FileHandleTable({ maxHandles: 5 });
     const stale = table.bind("/old", stats(2));
