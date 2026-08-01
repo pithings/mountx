@@ -45,6 +45,24 @@ export interface ConformanceTarget {
    *   downstream of them rely on.
    */
   errors?: "linux" | "host";
+  /**
+   * What this target carries of an extension it *has* — narrower than the
+   * presence of the call, and unset when the two are the same thing.
+   *
+   * `capabilities.extensions` answers "can this target be asked at all", which
+   * is the only question a driver has. A transport column has a second one: a
+   * wire can have the operation and still not carry every argument to it. The
+   * `mknod` case is the whole reason this field exists — NFSv3 and NFSv4.1 put
+   * the file type in `ftype3`/`nfs_ftype4`, a four-member enum, so the `mode`'s
+   * `S_IFMT` never reaches the driver and a type outside those four cannot be
+   * asked for, let alone refused by whoever should refuse it.
+   *
+   * Declared-or-inferred, as capabilities are: unset means the extension is
+   * carried whole, so every target that had one before this field existed still
+   * claims what it always did, and a column that carries less says so in the one
+   * place its other losses are already declared.
+   */
+  carries?: readonly Carried[];
 }
 
 const decoder = new TextDecoder();
@@ -64,8 +82,25 @@ async function rejectsRange(promise: Promise<unknown>): Promise<void> {
 }
 
 /**
- * Something a case needs before it can mean anything: a capability, root, or
- * one named member of the `mountx.*` extension namespace.
+ * A part of an extension a target may carry or not, having the call either
+ * way — see {@link ConformanceTarget.carries}.
+ *
+ * One member, and it is deliberately about an *argument* rather than about an
+ * operation: `mknod`'s `mode` naming a type outside the four a device-ish enum
+ * can spell. A case gated on this is one whose answer has to come from the
+ * driver, and a wire that cannot ask the question cannot carry the answer back
+ * either — which is why the alternative to skipping is a client inventing an
+ * errno, and that is the thing invariant 5 forbids.
+ */
+export type Carried = "mknod.anyType";
+
+/** Every {@link Carried} member, for the matrix's benefit. */
+export const CARRIED: readonly Carried[] = ["mknod.anyType"];
+
+/**
+ * Something a case needs before it can mean anything: a capability, root, one
+ * named member of the `mountx.*` extension namespace, or one {@link Carried}
+ * part of such a member.
  *
  * The extensions are spelled `mountx.<name>` rather than folded into
  * `capabilities`, because `extensions` is a *list* — `capabilities.extensions`
@@ -75,7 +110,8 @@ async function rejectsRange(promise: Promise<unknown>): Promise<void> {
 export type Requirement =
   | Exclude<keyof ResolvedCapabilities, "extensions">
   | "root"
-  | `mountx.${keyof MountxExtensions}`;
+  | `mountx.${keyof MountxExtensions}`
+  | Carried;
 
 const EXTENSION_PREFIX = "mountx.";
 
@@ -85,6 +121,16 @@ export const REQUIREMENT_TAG = /\s\[needs ([^\]]+)]$/;
 export function conformance(target: ConformanceTarget): void {
   const { capabilities } = target;
   const hostErrors = target.errors === "host";
+
+  /**
+   * The {@link Carried} parts this target has, inferred when it does not say.
+   *
+   * An extension declared and nothing else said is an extension carried whole:
+   * that is what every target meant before `carries` existed, and it keeps the
+   * narrowing where the transport that needs it can explain itself.
+   */
+  const carried: readonly Carried[] =
+    target.carries ?? (capabilities.extensions.includes("mknod") ? ["mknod.anyType"] : []);
 
   /** Every `errno` this target is allowed to report for `code`. */
   const errnosFor = (code: ErrnoCode): number[] => {
@@ -128,6 +174,9 @@ export function conformance(target: ConformanceTarget): void {
   const met = (requirement: Requirement): boolean => {
     if (requirement === "root") {
       return isRoot;
+    }
+    if (CARRIED.includes(requirement as Carried)) {
+      return carried.includes(requirement as Carried);
     }
     if (requirement.startsWith(EXTENSION_PREFIX)) {
       const name = requirement.slice(EXTENSION_PREFIX.length) as keyof MountxExtensions;
@@ -715,18 +764,21 @@ export function conformance(target: ConformanceTarget): void {
         expect(block.rdev).toBe(loopDev);
       });
 
-      it("creates a regular file from a mode naming one, or naming no type", async () => {
-        // The fallback every session already has when no driver implements the
-        // extension, and which a driver that does implement it must not lose:
-        // `mknod(path, S_IFREG)` — and `mknod(path, 0)`, which POSIX reads the
-        // same way — is how a few tools still create an empty file.
-        await mknod("/plain", 0o644);
-        await mknod("/regular", S_IFREG | 0o600);
-        expect((await fs.stat("/plain")).isFile()).toBe(true);
-        expect((await fs.stat("/regular")).isFile()).toBe(true);
-        expect((await fs.stat("/regular")).size).toBe(0);
-        expect(await read("/regular")).toBe("");
-      });
+      itNeeds("mknod.anyType")(
+        "creates a regular file from a mode naming one, or naming no type",
+        async () => {
+          // The fallback every session already has when no driver implements the
+          // extension, and which a driver that does implement it must not lose:
+          // `mknod(path, S_IFREG)` — and `mknod(path, 0)`, which POSIX reads the
+          // same way — is how a few tools still create an empty file.
+          await mknod("/plain", 0o644);
+          await mknod("/regular", S_IFREG | 0o600);
+          expect((await fs.stat("/plain")).isFile()).toBe(true);
+          expect((await fs.stat("/regular")).isFile()).toBe(true);
+          expect((await fs.stat("/regular")).size).toBe(0);
+          expect(await read("/regular")).toBe("");
+        },
+      );
 
       it("is an ordinary name once it exists: rename, unlink, stat again", async () => {
         await mknod("/fifo", S_IFIFO | 0o644);
@@ -737,10 +789,16 @@ export function conformance(target: ConformanceTarget): void {
         await rejects(fs.stat("/moved"), "ENOENT");
       });
 
-      it("refuses an existing name, a missing directory and a type with its own call", async () => {
+      it("refuses an existing name and a missing directory", async () => {
         await fs.writeFile("/taken", "x");
         await rejects(mknod("/taken", S_IFIFO | 0o644), "EEXIST");
         await rejects(mknod("/nowhere/fifo", S_IFIFO | 0o644), "ENOENT");
+      });
+
+      // Split from the two refusals above rather than asserted beside them:
+      // those name a FIFO, which every carrier of the extension can ask for,
+      // and this one names a type that only a `mode` can express.
+      itNeeds("mknod.anyType")("refuses a type with its own call", async () => {
         // `mknod(2)` answers `EPERM` for a directory: `mkdir` is that call, and
         // this one must not become a second way in.
         await rejects(mknod("/dir", S_IFDIR | 0o755), "EPERM");

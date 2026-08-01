@@ -60,7 +60,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REQUIREMENT_TAG } from "./conformance.ts";
+import { CARRIED, REQUIREMENT_TAG } from "./conformance.ts";
 
 /** One column of the matrix. */
 interface Column {
@@ -481,8 +481,14 @@ function main(): void {
     // session's (see the preamble above). A skip says nothing about whether the
     // transport carries the *operation* (all four sessions carry `mknod`), so
     // calling it a loss would be a claim the run cannot make in either
-    // direction. The per-case rows below still show the skips.
-    const lost = missing.filter((name) => name !== "root" && !name.startsWith("mountx."));
+    // direction. A `Carried` requirement is dropped for the same reason and one
+    // more: it is a part of an extension, so a column that skips it is a column
+    // whose client does not offer the extension by name at all, or one that
+    // narrowed it — and both are already said above. The per-case rows below
+    // still show the skips.
+    const lost = missing.filter(
+      (name) => name !== "root" && !name.startsWith("mountx.") && !CARRIED.includes(name as never),
+    );
     const environment = result.elevated ? "root" : "not root: `root` cases skipped";
     push(
       result.unavailable === undefined
