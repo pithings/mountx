@@ -144,6 +144,11 @@ beforeAll(async () => {
     credentials: { username: USERNAME, password: PASSWORD },
   });
   await server.listen();
+  /* The server is all curl needs, so it is built whatever is on PATH. The
+     remote below is not: `obscure` is rclone's own password encoding, and only
+     rclone can produce it. Without this guard a host with curl and no rclone
+     fails the whole file in setup instead of skipping the half it cannot run. */
+  if (rclone === undefined) return;
   rcloneEnv = {
     ...process.env,
     RCLONE_CONFIG: "",
