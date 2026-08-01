@@ -224,13 +224,23 @@ The facts no single file's header can own.
   contract is a mountpoint, and neither serving transport produces one. WebDAV is
   the one whose _client_ can produce one (`davfs2`, `mount_webdav`), which is a fact
   about the host's tooling rather than something this package does.
-- **`src/webdav/protocol.ts` imports `src/s3/xml.ts`.** The second deliberate
-  cross-transport dependency, after 9P→`fuse/flags.ts`, and the same argument: a
-  bounded XML encoder and a copying, DOCTYPE-refusing parser are facts about XML, not
-  about S3, and a second hardened parser is a second thing to get wrong. What it
-  costs is namespaces — the parser reports local names — which `webdav/protocol.ts`
-  documents in full at its header. `xml.ts` pulls in only `s3/constants.ts`, so
-  `mountx/webdav` does not load a signature or a chunked decoder.
+- **`src/xml.ts` is the XML the two HTTP transports share** — the character rules,
+  the `XmlNode` serializer and the copying, DOCTYPE-refusing parser, all facts about
+  XML rather than about either protocol, and a second hardened parser would be a
+  second thing to get wrong. It was `src/s3/xml.ts`'s until WebDAV needed it, and
+  moved for the same reason `src/http.ts` did; `s3/xml.ts` re-exports every symbol,
+  so `mountx/s3`'s surface never moved, and keeps what only S3 has (the eight
+  response documents and the two request bodies). `mountx/webdav` therefore loads no
+  signature and no chunked decoder.
+- **The parser resolves namespaces; the two callers read different halves.** S3
+  matches on the local name alone — AWS publishes those grammars without a namespace
+  and SDKs send them three ways — while WebDAV compares the pair, because RFC 4918 §4
+  makes a property name a (namespace, local name) and two properties sharing a local
+  name in different namespaces are two properties. That is not a stylistic split: the
+  `PROPPATCH` path turns a property name into a `driver.utimes()`, so reading half a
+  name there is a write decided by a misreading. Structural elements
+  (`<propfind>`, `<set>`, `<lockinfo>`) are still matched by local name, since they
+  identify nothing and checking them would only refuse clients that declare nothing.
 - **`src/http.ts` is the HTTP the two HTTP transports share** — `formatHttpDate` /
   `parseHttpDate`, `parseRange`, the `Content-Range`/`ETag` spellings, the strong
   and weak entity-tag comparisons, and `evaluateConditionals`, all RFC 9110. It was

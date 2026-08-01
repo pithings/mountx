@@ -54,7 +54,10 @@ spellings live in `src/http.ts` — with the two entity-tag comparison functions
 §13.2.2 conditional-request rules built on them — and `src/s3/protocol.ts` re-exports
 them under its own names while `src/webdav/` imports them directly. One transcription,
 two HTTP transports; `evaluateConditionals` is wrapped rather than re-exported only
-because SigV4 makes the S3 gateway keep its headers as a signed list.
+because SigV4 makes the S3 gateway keep its headers as a signed list. `src/xml.ts`
+is the same arrangement for XML 1.0 and Namespaces in XML — the character rules, the
+serializer and the bounded parser, re-exported by `src/s3/xml.ts`, imported directly
+by `src/webdav/`.
 
 ## Wire protocols
 

@@ -29,6 +29,7 @@ any rule below that looks removable.
 | `src/lock.ts`    | `PathLock`, taken by `RENAME` on every transport                                                       |
 | `src/subtree.ts` | `remapSubtree()` — the rename rewrite all three handle tables share (internal)                         |
 | `src/http.ts`    | RFC 9110's `HTTP-date`, `Range` and `ETag` quoting — shared by the two HTTP transports                 |
+| `src/xml.ts`     | the bounded XML codec and its namespace resolution — shared by the two HTTP transports                 |
 | `src/auto.ts`    | `mountx/auto`: probe, then FUSE → 9P → NFS, each via `await import()`                                  |
 | `src/drivers/`   | `memory` (the only `mountx.mknod` implementation), `node-fs`, `unstorage`, `handle.ts`                 |
 | `src/fuse/`      | `mountx/fuse` — protocol 7.41, root and `fusermount3` mount paths, `exec.ts` (shared spawn/`Deadline`) |

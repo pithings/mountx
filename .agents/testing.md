@@ -115,6 +115,14 @@ test:9p:mount` / `pnpm test:root`) — 9P has no unprivileged route on any host,
   and the Tier-1 JS client (`client.ts`, which does its own path-walking and
   POSIX-vs-NFSv4 op-collapsing — `unlink` vs `rmdir`, OPEN not being for directories)
   plus `driver.ts` (the `FsDriver` over it) and `conformance.test.ts`.
+- `test/xml.test.ts` — Tier 0 for the shared codec's own contract: namespaces, in
+  both directions, against Namespaces in XML 1.0. Prefix resolution and scoping, the
+  two rules that are deliberately lenient rather than conformant (an unbound prefix
+  is no namespace, not a refusal; `xmlns:foo=""` unbinds), and the `xmlns` the
+  serializer writes — including the `xmlns=""` that says "in no namespace" inside a
+  document with a default. Everything else about that module — the character rules,
+  the caps, the hostile bodies, the fuzzer — is driven through the S3 grammars in
+  `test/s3/xml.test.ts`, which is where a real body arrives.
 - `test/s3/` — Tier 0 (`sigv4.test.ts` against the official `aws-sig-v4-test-suite`
   goldens, `xml`, `chunked`, `protocol`, `constants` — the errno↔S3-error table's
   totality), `server.test.ts` (real sockets, driven with `fetch`), the Tier-1 signing
@@ -127,7 +135,9 @@ rclone`/`curl` and needing no root, so it runs as part of `pnpm test` and skips
   three request grammars, the `If` header's disjunction-of-conjunctions, the
   `multistatus`/`error`/lock documents, and the target↔`href` mapping round-tripped
   — the security-relevant half, since a name is the only thing that decides which
-  resource a request reaches), `locks.test.ts` (the lock table alone, with `now` a
+  resource a request reaches, which is also why a property name is asserted as the
+  (namespace, local name) pair RFC 4918 §4 makes it and never as the local name
+  alone), `locks.test.ts` (the lock table alone, with `now` a
   number the test moves and `newToken` a counter: §9.10.5's compatibility table,
   both scopes, the lease, and §6.1's rule that a lock dies with its root),
   `session.test.ts` (in-process against the memory driver, no sockets: RFC 4918's

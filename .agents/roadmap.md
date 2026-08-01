@@ -243,13 +243,6 @@ area whose code it changes, not the area that motivated it.
 
 ## WebDAV
 
-- **Requested properties lose their namespace.** `src/s3/xml.ts`'s parser
-  reports an element's local name and drops its prefix, which is right for the
-  grammar and wrong for a property in a namespace other than `DAV:` — Finder's
-  and Office's `Win32*` properties come back as bare local names in `DAV:`,
-  inside the `404` propstat. Bounded to properties this server does not have,
-  and fixing it means teaching that parser to track `xmlns` bindings, which is a
-  change to a module the S3 gateway depends on.
 - **No dead properties.** `PROPPATCH` writes `getlastmodified` (through
   `driver.utimes()`, on a driver declaring `times`) and refuses everything else
   with `403 cannot-modify-protected-property`, which is truthful for a server
