@@ -246,11 +246,47 @@ area whose code it changes, not the area that motivated it.
 - **No dead properties.** `PROPPATCH` writes `getlastmodified` (through
   `driver.utimes()`, on a driver declaring `times`) and refuses everything else
   with `403 cannot-modify-protected-property`, which is truthful for a server
-  whose other properties are all live — and is also what makes a client that
-  sets `Win32LastModifiedTime` (Finder, Explorer) report a failure it did not
-  expect. Storing one needs a place to put it that the driver interface does not
-  have: a sidecar file would show up in every listing, so this waits for a
-  driver-level property store rather than for a WebDAV-level workaround.
+  whose other properties are all live. Storing one needs a place to put it that
+  the driver interface does not have: a sidecar file would show up in every
+  listing, so this waits for a driver-level property store rather than for a
+  WebDAV-level workaround. What such a store must **not** be used for is the
+  `Win32*` family — see the next entry, where storing is actively worse than
+  refusing.
+- **The `Win32*` family is refused, and only fidelity is lost.** Explorer
+  `PROPPATCH`es `Win32CreationTime`, `Win32LastAccessTime`,
+  `Win32LastModifiedTime` and `Win32FileAttributes` (all in
+  `urn:schemas-microsoft-com:`) after a write, and this server answers `403` to
+  every one. **The redirector swallows that by design** — it continues to the
+  content `PUT` and Microsoft's client logs an event rather than raising a
+  dialog, on the stated grounds that "the PUT (if one was needed) has
+  succeeded". So the cost is a wrong timestamp in Explorer and nothing else: no
+  failed copy, no error the user sees, on every Windows from XP to 11.
+  Implementing the family is fidelity, not compatibility. Three facts shape what
+  implementing it would have to look like:
+  - **A stored value would be permanently wrong.** The redirector prefers
+    `Win32LastModifiedTime` and falls back to `getlastmodified` only when it is
+    absent, so a stale stored copy overrides the correct live one forever. Any
+    of these that is ever emitted has to be derived from the `stat` on each
+    request, exactly like every other property here — which is the one thing
+    this architecture can do anyway.
+  - **The three times map onto POSIX and the attribute mask does not.**
+    `Win32LastModifiedTime` and `Win32LastAccessTime` are the two arguments
+    `driver.utimes()` already takes; `Win32CreationTime` is readable from
+    `birthtimeMs` and settable by nothing in `node:fs/promises`, so it would
+    need a `mountx.*` member (`utimens` carries atime and mtime only).
+    `Win32FileAttributes` is a single mask whose `READONLY` bit is the mode's
+    write bits and whose `HIDDEN`/`SYSTEM`/`ARCHIVE` bits have no honest POSIX
+    home — Samba maps them to the execute bits, which would make every
+    Windows-written file executable. §9.2.1 has one status per property and none
+    per bit, so a mask cannot be half-honoured, and Windows sets `ARCHIVE` on
+    essentially everything it writes.
+  - **Windows sends only what changed**, so the four do not always travel
+    together — but every observed copy-in carries all four, which is the case
+    where refusing the mask still `424`s the timestamps beside it.
+- **Answering `200` to a `Win32*` set and storing nothing is not on the table.**
+  It is what several servers do (`dav-server-rs` says so in a comment) and it is
+  a plain invariant-5 violation: a capability claimed and not met. Recorded here
+  because it will be proposed again.
 - **RFC 9110's conditional requests are honoured on `GET`, `HEAD` and `PUT`
   only.** `DELETE`, `COPY` and `MOVE` ignore `If-Match` and the other three;
   RFC 4918's own `If` header is what a WebDAV client uses on those, and it _is_
@@ -282,12 +318,35 @@ area whose code it changes, not the area that motivated it.
   into `kNetFSAlternatePortKey` and then never reads it — it goes to port 111
   and fails `ECONNREFUSED`, fatal for a server with no portmapper. Worth it only
   if someone actually needs the volume to appear where Finder puts one.
-- **Windows is still not designed against.** `mountx/webdav` is the
+- **Windows has still not been run against.** `mountx/webdav` is the
   unprivileged, zero-native-code path that could reach it — the Windows
-  redirector mounts a WebDAV share with no kernel module and no root, and the
-  class-2 locking it wants before it will write is now there — but nothing here
-  has been run on Windows, so "the redirector should be happy" is a prediction
-  from the RFC and not a verified fact. The same goes for macOS's
-  `mount_webdav`, which mounts a class-1 share read-only: this host is Linux.
-  Windows also has no `mount(8)`, so it stays out of the NFS transport's
+  redirector mounts a WebDAV share with no kernel module and no root, the
+  class-2 locking it wants before it will write is there, and so is the
+  `MS-Author-Via: DAV` header it checks before treating an origin as a share at
+  all. Nothing here has been run on Windows, so that remains a prediction; what
+  a survey of the client's own strings and of other servers' bug trails has
+  since settled is **where the risk is not**:
+  - **`LOCK`, not `PROPPATCH`, is what breaks a Windows copy.** Every report of
+    a visible failure — the 0-byte file, "cannot read from the source file or
+    disk" — turns out to have a failing `LOCK` underneath it, and with locking
+    refused the redirector never attempts the `PROPPATCH` at all. This server
+    answers both, so the first thing to verify on a real Windows host is the
+    lock round trip, and the `Win32*` refusals are the least interesting thing
+    in the capture.
+  - **The client never negotiates.** Its capability probe was compiled out
+    after XP and is absent from the shipping DLL, so there is no `OPTIONS`
+    answer that makes Windows stop trying `PROPPATCH`. A server's only choice is
+    what to answer.
+  - **Unverified, and the reason to take a capture:** what the redirector does
+    with a `409` or a `424` propstat — no evidence either way, and this server
+    is the kind that emits `424` — and whether Windows 7 and earlier really
+    cannot read a `<multistatus xmlns="DAV:">` with unprefixed children
+    (golang/go#11177), which is the form `src/xml.ts` deliberately writes. Win7
+    has been out of support since 2020, so that is a fact to establish before it
+    is a design to revisit.
+
+  macOS's `mount_webdav` is the other unrun client, and a stricter one — it
+  mounts a class-1 share read-only. Whether Finder reports a `403` on a
+  `Win32*`/`PROPPATCH` the way Explorer declines to is unexamined. This host is
+  Linux. Windows also has no `mount(8)`, so it stays out of the NFS transport's
   platform switch either way.

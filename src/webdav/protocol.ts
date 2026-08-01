@@ -32,7 +32,7 @@
  * - **A property name is read as the pair** it is, {@link DavPropertyName}, and
  *   both halves decide which property was named. This is the whole of §4:
  *   `getlastmodified` in `DAV:` is this server's, and the same local name in
- *   `urn:schemas-microsoft-com:` — which is what Finder and Explorer send — is
+ *   `urn:schemas-microsoft-com:` — which is what the Windows redirector sends — is
  *   a property it does not have. Answering the second with the first's value
  *   would be answering a question nobody asked, and on `PROPPATCH` it would be
  *   a *write* decided by a misread name.
