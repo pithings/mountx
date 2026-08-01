@@ -16,24 +16,32 @@
  * and nothing more — whether a condition is true needs a driver and a lock
  * table, so `session.ts` evaluates what this file parsed.
  *
- * ## Namespaces, and the one thing this layer loses
+ * ## Namespaces, and the one place they are read
  *
  * Documents go out with `DAV:` as the **default** namespace —
  * `<multistatus xmlns="DAV:">` with unprefixed children — rather than with the
  * `D:` prefix RFC 4918's examples use. The two are the same document to a
  * namespace-aware parser (§14 binds names to the namespace, never to a prefix),
  * and the default form is what the shared encoder produces without a second
- * spelling of every element name.
+ * spelling of every element name. An element in another namespace — a property
+ * this server does not have, an `<owner>` written under someone else's prefix —
+ * re-declares as it is written, so the pair goes back out as it came in.
  *
- * Coming in, the XML parser this module borrows (`src/xml.ts`) reports an
- * element's **local name** and drops its prefix, which is exactly right for the
- * grammar — `<D:propfind>` and `<a:propfind>` are one element — and lossy for
- * one thing: a requested property in some *other* namespace, which Finder and
- * Office both send. `Z:Win32CreationTime` comes back as `Win32CreationTime`
- * in the `DAV:` namespace, inside the `404` propstat where the client is
- * looking only at the status. It is a real deviation, it is bounded to
- * properties this server does not have, and undoing it means a
- * namespace-tracking parser — see `.agents/roadmap.md`.
+ * Coming in, the split is deliberate and it is not symmetric:
+ *
+ * - **A property name is read as the pair** it is, {@link DavPropertyName}, and
+ *   both halves decide which property was named. This is the whole of §4:
+ *   `getlastmodified` in `DAV:` is this server's, and the same local name in
+ *   `urn:schemas-microsoft-com:` — which is what Finder and Explorer send — is
+ *   a property it does not have. Answering the second with the first's value
+ *   would be answering a question nobody asked, and on `PROPPATCH` it would be
+ *   a *write* decided by a misread name.
+ * - **Every structural element is read by local name alone**, and its namespace
+ *   is not checked: `<propfind>`, `<prop>`, `<set>`, `<lockinfo>`, `<exclusive>`
+ *   and the rest. They carry no identity to confuse — a `<propfind>` body
+ *   arriving on a `PROPFIND` is the document it says it is — so checking would
+ *   buy nothing and would newly refuse the clients that send these grammars
+ *   with no declaration at all, which is a thing clients do.
  */
 
 import { normalizePath, splitPath } from "../path.ts";
@@ -714,11 +722,39 @@ export async function collectBody(
   return buffer;
 }
 
+/**
+ * One property name: the pair RFC 4918 §4 defines a property to be named by,
+ * a namespace and a local name.
+ *
+ * Both halves are compared. `<D:getlastmodified xmlns:D="DAV:">` is this
+ * server's `getlastmodified`; `<Z:getlastmodified xmlns:Z="urn:example">` is a
+ * property it has never heard of that happens to share the local name, and
+ * answering it with the `DAV:` value would be answering a question nobody
+ * asked. §4: "properties are named with a URI ... the namespace partitions the
+ * set of property names".
+ */
+export interface DavPropertyName {
+  /** The namespace URI, `""` for a name in none. */
+  ns: string;
+  /** The local name, with any prefix already resolved away. */
+  name: string;
+}
+
+/** Are these the same property? */
+export function samePropertyName(a: DavPropertyName, b: DavPropertyName): boolean {
+  return a.ns === b.ns && a.name === b.name;
+}
+
+/** One property of this server's own, which is every one it can answer. */
+export function davProperty(name: string): DavPropertyName {
+  return { ns: DAV_NS, name };
+}
+
 /** What a `PROPFIND` body asked for (RFC 4918 §9.1, §14.2, §14.20, §14.21). */
 export type PropfindRequest =
   | { kind: "allprop" }
   | { kind: "propname" }
-  | { kind: "prop"; names: string[] };
+  | { kind: "prop"; names: DavPropertyName[] };
 
 /**
  * Parse a `PROPFIND` body.
@@ -738,7 +774,7 @@ export function parsePropfind(body: Uint8Array): PropfindRequest {
     return { kind: "allprop" };
   }
   const root = parseDocument(body, "propfind");
-  const names: string[] = [];
+  const names: DavPropertyName[] = [];
   let sawProp = false;
   for (const child of root.children) {
     if (child.name === "propname") {
@@ -750,8 +786,9 @@ export function parsePropfind(body: Uint8Array): PropfindRequest {
     if (child.name === "prop") {
       sawProp = true;
       for (const property of child.children) {
-        if (!names.includes(property.name)) {
-          names.push(property.name);
+        const asked = { ns: property.ns, name: property.name };
+        if (!names.some((seen) => samePropertyName(seen, asked))) {
+          names.push(asked);
         }
       }
     }
@@ -764,7 +801,7 @@ export function parsePropfind(body: Uint8Array): PropfindRequest {
 
 /** One `<set>` instruction: a property name and the value it was given. */
 export interface ProppatchSet {
-  name: string;
+  name: DavPropertyName;
   /**
    * The element's text content, which is the whole value for every property
    * this server can store — `getlastmodified` is an `HTTP-date` (§15.7) and
@@ -791,7 +828,7 @@ export interface ProppatchRequest {
   /** Property names and values under `<set>`, in request order. */
   set: ProppatchSet[];
   /** Property names under `<remove>`, in request order. */
-  remove: string[];
+  remove: DavPropertyName[];
 }
 
 /**
@@ -802,7 +839,7 @@ export interface ProppatchRequest {
 export function parseProppatch(body: Uint8Array): ProppatchRequest {
   const root = parseDocument(body, "propertyupdate");
   const set: ProppatchSet[] = [];
-  const remove: string[] = [];
+  const remove: DavPropertyName[] = [];
   for (const child of root.children) {
     const setting = child.name === "set";
     if (!setting && child.name !== "remove") {
@@ -813,10 +850,11 @@ export function parseProppatch(body: Uint8Array): ProppatchRequest {
         continue;
       }
       for (const property of prop.children) {
+        const named = { ns: property.ns, name: property.name };
         if (setting) {
-          set.push({ name: property.name, text: property.text });
+          set.push({ name: named, text: property.text });
         } else {
-          remove.push(property.name);
+          remove.push(named);
         }
       }
     }
@@ -888,19 +926,25 @@ export function parseLockInfo(body: Uint8Array): LockInfoRequest | undefined {
 
 /**
  * A parsed element as an encodable one, so an `<owner>` can go back out the way
- * it came in (§9.10.1).
+ * it came in (§9.10.1: "the server ... MUST return the value of the owner
+ * element as submitted by the client").
  *
- * Lossy in exactly one way, and it is this layer's known namespace loss rather
- * than a new one: the parser reports local names, so an owner written with a
- * prefix bound to some other namespace comes back in `DAV:` (see the module
- * docs). Mixed content is flattened the same way the parser flattens it — every
- * text run of an element concatenated ahead of its children — which is enough
- * for the `<owner><href>…</href></owner>` and `<owner>a name</owner>` forms
- * clients actually send.
+ * Namespaces come back with it — an owner written under a prefix bound
+ * somewhere other than `DAV:` is re-declared on the way out rather than
+ * silently re-rooted, which is what makes "as submitted" true of the pair and
+ * not only of the local name. The prefix itself is not preserved and does not
+ * need to be: §14 binds a name to its namespace, never to the spelling of the
+ * prefix that reached it.
+ *
+ * Still lossy for mixed content, which is flattened the same way the parser
+ * flattens it — every text run of an element concatenated ahead of its children
+ * — and that is enough for the `<owner><href>…</href></owner>` and
+ * `<owner>a name</owner>` forms clients actually send.
  */
 function toXmlNode(element: ReturnType<typeof parseXml>): XmlNode {
   return {
     name: element.name,
+    ns: element.ns,
     text: element.text === "" ? undefined : element.text,
     children: element.children.map((child) => toXmlNode(child)),
   };

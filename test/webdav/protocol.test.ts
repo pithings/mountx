@@ -63,6 +63,9 @@ function refusedWith(fn: () => unknown): number | undefined {
 
 const utf8 = (text: string): Uint8Array => Buffer.from(text, "utf8");
 
+/** One of this server's own property names — every one of them is in `DAV:`. */
+const dav = (name: string) => ({ ns: "DAV:", name });
+
 // ---------------------------------------------------------------------------
 // paths and hrefs
 // ---------------------------------------------------------------------------
@@ -224,13 +227,40 @@ describe("parsePropfind", () => {
             `<zz:propfind xmlns:zz="DAV:"><zz:prop><zz:getetag/><zz:resourcetype/></zz:prop></zz:propfind>`,
         ),
       ),
-    ).toEqual({ kind: "prop", names: ["getetag", "resourcetype"] });
+    ).toEqual({ kind: "prop", names: [dav("getetag"), dav("resourcetype")] });
+  });
+
+  it("names a property by its namespace as well as its local name", () => {
+    /* §4: the namespace partitions the set of property names, so these are two
+       properties and not one asked for twice. */
+    expect(
+      parsePropfind(
+        utf8(
+          `<propfind xmlns="DAV:" xmlns:Z="urn:z">` +
+            `<prop><getetag/><Z:getetag/><Z:Win32CreationTime/></prop></propfind>`,
+        ),
+      ),
+    ).toEqual({
+      kind: "prop",
+      names: [
+        dav("getetag"),
+        { ns: "urn:z", name: "getetag" },
+        { ns: "urn:z", name: "Win32CreationTime" },
+      ],
+    });
+  });
+
+  it("puts a property under an undeclared prefix in no namespace", () => {
+    // Not a refusal, and the local name survives for the 404 propstat to name.
+    expect(
+      parsePropfind(utf8(`<propfind xmlns="DAV:"><prop><Z:Win32/></prop></propfind>`)),
+    ).toEqual({ kind: "prop", names: [{ ns: "", name: "Win32" }] });
   });
 
   it("keeps each name once, in request order", () => {
     expect(
       parsePropfind(utf8(`<propfind xmlns="DAV:"><prop><a/><b/><a/></prop></propfind>`)),
-    ).toEqual({ kind: "prop", names: ["a", "b"] });
+    ).toEqual({ kind: "prop", names: [dav("a"), dav("b")] });
   });
 
   it("refuses a body that is not a propfind", () => {
@@ -259,7 +289,10 @@ describe("parseProppatch", () => {
             `</D:propertyupdate>`,
         ),
       ),
-    ).toEqual({ set: [{ name: "displayname", text: "x" }], remove: ["mine"] });
+    ).toEqual({
+      set: [{ name: dav("displayname"), text: "x" }],
+      remove: [{ ns: "urn:z", name: "mine" }],
+    });
   });
 
   it("ignores a set child that is not a prop, and a child that is neither set nor remove", () => {
@@ -270,7 +303,7 @@ describe("parseProppatch", () => {
             `<prop><displayname>v</displayname></prop></set></propertyupdate>`,
         ),
       ),
-    ).toEqual({ set: [{ name: "displayname", text: "v" }], remove: [] });
+    ).toEqual({ set: [{ name: dav("displayname"), text: "v" }], remove: [] });
   });
 
   it("ignores a child that is neither set nor remove", () => {
@@ -281,7 +314,7 @@ describe("parseProppatch", () => {
             `<set><prop><displayname/></prop></set></propertyupdate>`,
         ),
       ),
-    ).toEqual({ set: [{ name: "displayname", text: "" }], remove: [] });
+    ).toEqual({ set: [{ name: dav("displayname"), text: "" }], remove: [] });
   });
 
   it("refuses a body naming nothing", () => {
@@ -575,8 +608,11 @@ describe("parseLockInfo", () => {
       exclusive: true,
       owner: {
         name: "owner",
+        ns: "DAV:",
         text: undefined,
-        children: [{ name: "href", text: "http://example.org/~ejw/contact.html", children: [] }],
+        children: [
+          { name: "href", ns: "DAV:", text: "http://example.org/~ejw/contact.html", children: [] },
+        ],
       },
     });
   });
@@ -591,8 +627,36 @@ describe("parseLockInfo", () => {
       ),
     ).toEqual({
       exclusive: false,
-      owner: { name: "owner", text: "Ada Lovelace", children: [] },
+      owner: { name: "owner", ns: "DAV:", text: "Ada Lovelace", children: [] },
     });
+  });
+
+  it("carries a foreign namespace back out of the owner it came in on", () => {
+    /* §9.10.1 makes the owner the client's to get back verbatim, so a name
+       under someone else's prefix is re-declared rather than re-rooted in
+       `DAV:` — which would name an element the client never wrote. */
+    const parsed = parseLockInfo(
+      lockinfo(
+        `<D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype>` +
+          `<D:owner><Z:who xmlns:Z="urn:z">Ada</Z:who></D:owner>`,
+      ),
+    );
+    expect(parsed?.owner?.children?.[0]).toMatchObject({ name: "who", ns: "urn:z" });
+    expect(
+      encodeLockResponse(
+        {
+          token: "urn:uuid:1",
+          path: "/f",
+          collection: false,
+          depth: 0,
+          exclusive: true,
+          owner: parsed?.owner,
+          expiresAt: 1000,
+          timeoutSeconds: 60,
+        },
+        0,
+      ),
+    ).toContain(`<who xmlns="urn:z">Ada</who>`);
   });
 
   it("is undefined for the empty body that means refresh (§7.7)", () => {

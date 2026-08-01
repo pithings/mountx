@@ -169,6 +169,7 @@ import {
   ALLOW_HEADER,
   COLLECTION_CONTENT_TYPE,
   DAV_COMPLIANCE,
+  DAV_NS,
   MAX_XML_BYTES,
   MS_AUTHOR_VIA,
   READ_CHUNK_BYTES,
@@ -177,6 +178,7 @@ import {
 import { DavLockTable, type DavLock, type DavLockTableOptions } from "./locks.ts";
 import {
   collectBody,
+  davProperty,
   encodeLockResponse,
   encodeMultistatus,
   faultResponse,
@@ -195,11 +197,13 @@ import {
   parseTargetPath,
   parseTimeout,
   refuse,
+  samePropertyName,
   statusOfError,
   submittedTokens,
   supportedLockNode,
   xmlBody,
   type DavFault,
+  type DavPropertyName,
   type Depth,
   type IfCondition,
   type IfList,
@@ -340,12 +344,25 @@ interface Failure {
  * neither.
  */
 interface PropertyOutcome {
-  name: string;
+  name: DavPropertyName;
   status: number;
   /** A §16 condition for the propstat this outcome lands in. */
   condition?: string;
   /** The write itself, run only if nothing in the request failed. */
   apply?: () => Promise<void>;
+}
+
+/**
+ * A property name as the empty element that names it in a `propstat`.
+ *
+ * The namespace rides along, so a name this server does not have is reported
+ * back **in the namespace it was asked about** — `<Win32CreationTime
+ * xmlns="urn:schemas-microsoft-com:"/>` inside the `404` block, which is the
+ * property the client named. `DAV:` is the enclosing default, so this writes no
+ * declaration at all for the properties the server does own.
+ */
+function propertyNode(property: DavPropertyName): XmlNode {
+  return { name: property.name, ns: property.ns };
 }
 
 /**
@@ -368,9 +385,9 @@ function propstatsOf(outcomes: readonly PropertyOutcome[], blocked: boolean): Pr
       (propstat) => propstat.status === status && propstat.condition === condition,
     );
     if (existing === undefined) {
-      propstats.push({ status, condition, props: [{ name: outcome.name }] });
+      propstats.push({ status, condition, props: [propertyNode(outcome.name)] });
     } else {
-      existing.props.push({ name: outcome.name });
+      existing.props.push(propertyNode(outcome.name));
     }
   }
   return propstats;
@@ -1316,18 +1333,18 @@ export class WebdavSession {
     now: number,
   ): Promise<Propstat[]> {
     const explicit = request.kind === "prop";
-    const names = explicit ? request.names : [...ALLPROP_NAMES];
+    const names = explicit ? request.names : ALLPROP_NAMES.map((name) => davProperty(name));
     const found: XmlNode[] = [];
     const missing: XmlNode[] = [];
-    for (const name of names) {
-      const node = await this.#property(name, path, stats, now);
+    for (const property of names) {
+      const node = await this.#property(property, path, stats, now);
       if (node === undefined) {
         if (explicit) {
-          missing.push({ name });
+          missing.push(propertyNode(property));
         }
         continue;
       }
-      found.push(request.kind === "propname" ? { name } : node);
+      found.push(request.kind === "propname" ? propertyNode(property) : node);
     }
     const propstats: Propstat[] = [];
     if (found.length > 0 || missing.length === 0) {
@@ -1346,14 +1363,24 @@ export class WebdavSession {
    * taken. `getcontentlength` and `getetag` are answered for non-collections
    * only: RFC 4918 §15.4 defines the first as the `Content-Length` a `GET`
    * would carry, and a `GET` of a collection here is `405`.
+   *
+   * **Every property this server has is in `DAV:`** — RFC 4918's own and RFC
+   * 4331's quota pair alike — so a name in any other namespace is one it does
+   * not have, whatever its local name says. That check is the difference
+   * between reporting `getlastmodified` and reporting somebody else's property
+   * that happens to be spelled the same way.
    */
   async #property(
-    name: string,
+    property: DavPropertyName,
     path: string,
     stats: StatsLike,
     now: number,
   ): Promise<XmlNode | undefined> {
+    if (property.ns !== DAV_NS) {
+      return undefined;
+    }
     const collection = stats.isDirectory();
+    const name = property.name;
     switch (name) {
       case "creationdate": {
         return { name, text: formatIsoDate(stats.birthtimeMs) };
@@ -1514,7 +1541,10 @@ export class WebdavSession {
    */
   #settable(instruction: ProppatchSet, path: string, stats: StatsLike): PropertyOutcome {
     const { name, text } = instruction;
-    if (name !== "getlastmodified") {
+    /* The namespace is half the name, and this is the path where reading only
+       the other half would turn somebody else's `getlastmodified` into a real
+       `utimes` on the driver. */
+    if (!samePropertyName(name, davProperty("getlastmodified"))) {
       return { name, status: 403, condition: "cannot-modify-protected-property" };
     }
     if (!this.driver.capabilities.times) {

@@ -724,6 +724,42 @@ describe("PROPFIND", () => {
     );
   });
 
+  it("does not answer a foreign property that shares a local name with one of its own", async () => {
+    /* §4 names a property with a namespace *and* a local name. Finder and
+       Explorer ask for `urn:schemas-microsoft-com:` properties; answering one
+       of those with the `DAV:` value would be answering a question nobody
+       asked. Both are in the one request so the two propstats are the same
+       resource's. */
+    const reply = await request(session, "PROPFIND", "/dir/file.txt", {
+      headers: { depth: "0" },
+      body:
+        `<propfind xmlns="DAV:" xmlns:Z="urn:schemas-microsoft-com:">` +
+        `<prop><getlastmodified/><Z:getlastmodified/><Z:Win32CreationTime/></prop></propfind>`,
+    });
+    expect(reply.status).toBe(207);
+    expect(statuses(reply.text)).toEqual([200, 404]);
+    // The 404 block names both foreign properties, each in the namespace it was asked in.
+    expect(reply.text).toContain(
+      `<getlastmodified xmlns="urn:schemas-microsoft-com:"></getlastmodified>`,
+    );
+    expect(reply.text).toContain(
+      `<Win32CreationTime xmlns="urn:schemas-microsoft-com:"></Win32CreationTime>`,
+    );
+    // ...and the 200 block holds exactly one `getlastmodified`, the server's own.
+    expect(reply.text.split("<getlastmodified>")).toHaveLength(2);
+  });
+
+  it("names a property asked for under an undeclared prefix, without the prefix", async () => {
+    const reply = await request(session, "PROPFIND", "/dir/file.txt", {
+      headers: { depth: "0" },
+      body: `<propfind xmlns="DAV:"><prop><Z:Win32FileAttributes/></prop></propfind>`,
+    });
+    expect(statuses(reply.text)).toEqual([404]);
+    /* In no namespace, said with an empty declaration — writing it bare would
+       put it in `DAV:` and claim the client named a property of this server's. */
+    expect(reply.text).toContain(`<Win32FileAttributes xmlns=""></Win32FileAttributes>`);
+  });
+
   it("is 400 for a body that is not a propfind", async () => {
     const reply = await request(session, "PROPFIND", "/dir", {
       headers: { depth: "0" },
@@ -749,7 +785,9 @@ describe("PROPPATCH", () => {
     expect(reply.status).toBe(207);
     expect(statuses(reply.text)).toEqual([403]);
     expect(reply.text).toContain("<displayname></displayname>");
-    expect(reply.text).toContain("<mine></mine>");
+    /* Named back in the namespace it was asked about, not re-rooted in `DAV:`
+       where it would be a different property. */
+    expect(reply.text).toContain(`<mine xmlns="urn:z"></mine>`);
     expect(reply.text).toContain("<cannot-modify-protected-property>");
   });
 
@@ -774,6 +812,26 @@ describe("PROPPATCH", () => {
     // The driver really has it, and a GET reports it back.
     expect((await driver.stat("/dir/file.txt")).mtimeMs).toBe(Date.parse(when));
     expect((await request(session, "HEAD", "/dir/file.txt")).headers["last-modified"]).toBe(when);
+  });
+
+  it("will not write a foreign getlastmodified onto the driver", async () => {
+    /* The one place reading half a name would have been a *mutation* decided
+       by a misread: same local name, somebody else's namespace, and `utimes`
+       on the other side of it. */
+    const before = (await driver.stat("/dir/file.txt")).mtimeMs;
+    const reply = await request(session, "PROPPATCH", "/dir/file.txt", {
+      body:
+        `<propertyupdate xmlns="DAV:" xmlns:Z="urn:schemas-microsoft-com:">` +
+        `<set><prop><Z:getlastmodified>Sun, 06 Nov 1994 08:49:37 GMT</Z:getlastmodified></prop></set>` +
+        `</propertyupdate>`,
+    });
+    expect(reply.status).toBe(207);
+    expect(statuses(reply.text)).toEqual([403]);
+    expect(reply.text).toContain("cannot-modify-protected-property");
+    expect(reply.text).toContain(
+      `<getlastmodified xmlns="urn:schemas-microsoft-com:"></getlastmodified>`,
+    );
+    expect((await driver.stat("/dir/file.txt")).mtimeMs).toBe(before);
   });
 
   it("is 409 for a value that is not an HTTP-date (§9.2.1)", async () => {
