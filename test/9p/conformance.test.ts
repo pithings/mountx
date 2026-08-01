@@ -43,11 +43,22 @@ import { P9Client, p9Driver } from "./client.ts";
  *   closes it — so a file unlinked while open stays readable through the fid
  *   that holds it, with no silly-rename anywhere. This is the capability the
  *   plan's `["fuse", "9p", "nfs"]` preference order is *about*.
- * - **`extensions: []`**, as in both other transports: the `mountx.*` namespace
- *   is a driver-to-session channel with no wire representation. `mountx.mknod`
- *   and `mountx.utimens` are reachable from `Tmknod` and `Tsetattr`, but a
- *   client cannot ask for them by name and the suite's extension cases are not
- *   about what a transport happens to route.
+ * - **`extensions: ["mknod"]`**, which the other transport columns do not
+ *   claim. 9P2000.L has an operation for it and carries the whole `mode`, type
+ *   bits included: `p9Driver`'s `mountx.mknod` is a `Tmknod`,
+ *   `P9Session.#mknod` passes the mode to the driver's extension unchanged, and
+ *   every refusal the cases assert — `EEXIST`, `ENOENT`, `EPERM` for a
+ *   directory — is the far side's answer arriving as `Rlerror`. That is the
+ *   capability *carried*, not declared over: a client offering a by-name handle
+ *   onto a wire operation is what a driver adapter is. `utimens` stays off the
+ *   list: `Tsetattr` carries the nanoseconds, but this client spends them
+ *   through `utimes`/`lutimes` and never asks for the extension by name.
+ *
+ *   What the extension cases buy over `session.test.ts`'s dispatch tests is the
+ *   rest of the surface: `stat` and `readdir` agreeing on the seven type
+ *   predicates off the wire's own encoding, `rdev` surviving the `major`/`minor`
+ *   split and `Rgetattr`'s single `rdev[8]` rejoining it, and a FIFO behaving
+ *   as an ordinary name under `rename` and `unlink` afterwards.
  *
  * Everything else — hardlinks, symlinks, permissions, times, truncate, atomic
  * rename, `statfs` — crosses intact, and each of those is a message of its own
@@ -71,7 +82,7 @@ const THROUGH_9P: ResolvedCapabilities = {
   caseSensitive: true,
   statfs: true,
   readOnly: false,
-  extensions: [],
+  extensions: ["mknod"],
 };
 
 /**
@@ -137,7 +148,15 @@ describe("over a 9P2000.L session", () => {
 
   conformance({
     name: "node-fs oracle, over 9P",
-    capabilities: THROUGH_9P,
+    /*
+     * `THROUGH_9P`, minus the one entry that is the *driver's* to answer rather
+     * than the transport's: the oracle implements no `mountx.mknod`, so
+     * `#mknod` answers `ENOSYS` for every type but a regular file, exactly as
+     * it should. The column carries the extension; this target has none to
+     * carry, and declaring one here is the difference between a capability and
+     * a claim.
+     */
+    capabilities: { ...THROUGH_9P, extensions: [] },
     /*
      * The oracle forwards the host kernel's errors, so the *code* is pinned and
      * the *number* is allowed to be either family's.

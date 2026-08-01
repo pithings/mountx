@@ -60,7 +60,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { REQUIREMENT_TAG } from "./conformance.ts";
+import { CARRIED, REQUIREMENT_TAG } from "./conformance.ts";
 
 /** One column of the matrix. */
 interface Column {
@@ -444,11 +444,18 @@ function main(): void {
       "that case for want of `symlinks` long before privilege is reached, so the absence of a " +
       "pass is not evidence about the run's uid. Every column is run with root when root is " +
       "reachable, including the five that do not need it. A `mountx.*` requirement is left out " +
-      "of this table entirely: " +
-      "the suite calls an extension by name through `fs.mountx`, which only the loopback column " +
-      "has, so a skip everywhere else is a fact about how the case is written and not about what " +
-      "the transport carries (all four sessions do carry `mknod` — see the per-case rows below, " +
-      "and the FUSE column's own `mkfifo`/`mknod`/`bind` case over a real mount).",
+      "of this table entirely: the suite calls an extension by name through `fs.mountx`, so a " +
+      "skip is a fact about whether that column's client offers the name, not about what the " +
+      "transport carries. Four columns do offer it — the loopback one directly, the 9P one " +
+      "because `Tmknod` carries the whole `mode` and `p9Driver` can hand it over unchanged, and " +
+      "both NFS ones because MKNOD and CREATE are operations their clients can call by name. " +
+      "The NFS pair offers it in part: `ftype3`/`nfs_ftype4` carries the file type and the mode " +
+      "carries only permission bits, so the two cases needing a mode to name a type are gated on " +
+      "`mknod.anyType` and skip there rather than let a client decide them itself. The remaining " +
+      "columns skip for reasons of their own: FUSE drives a real mount with `node:fs` as the " +
+      "client, and `node:fs` cannot `mknod(2)`; S3 has no way to name a FIFO at all. All four " +
+      "sessions do carry `mknod` — see the per-case rows below, and the FUSE column's own " +
+      "`mkfifo`/`mknod`/`bind` case over a real mount.",
   );
   push();
   push(
@@ -470,13 +477,20 @@ function main(): void {
     const missing = [...(unmet.get(column.key) ?? [])];
     // `root` is an environment fact, reported in its own cell. A `mountx.*`
     // requirement is neither a capability nor a loss: the suite reaches an
-    // extension by name through `fs.mountx`, which only the loopback column
-    // has — every other column is a client on the far side of a wire, and the
-    // wire has no such handle. A skip there says nothing about whether the
+    // extension by name through `fs.mountx`, and whether a column's client
+    // offers that name is a fact about the client. The loopback, 9P and two NFS
+    // columns do; the others skip for reasons that are theirs rather than the
+    // session's (see the preamble above). A skip says nothing about whether the
     // transport carries the *operation* (all four sessions carry `mknod`), so
     // calling it a loss would be a claim the run cannot make in either
-    // direction. The per-case rows below still show the skips.
-    const lost = missing.filter((name) => name !== "root" && !name.startsWith("mountx."));
+    // direction. A `Carried` requirement is dropped for the same reason and one
+    // more: it is a part of an extension, so a column that skips it is a column
+    // whose client does not offer the extension by name at all, or one that
+    // narrowed it — and both are already said above. The per-case rows below
+    // still show the skips.
+    const lost = missing.filter(
+      (name) => name !== "root" && !name.startsWith("mountx.") && !CARRIED.includes(name as never),
+    );
     const environment = result.elevated ? "root" : "not root: `root` cases skipped";
     push(
       result.unavailable === undefined
