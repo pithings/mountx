@@ -44,8 +44,12 @@ import {
   toTime4,
 } from "../../../src/nfs/v4/attr.ts";
 import {
+  NF4BLK,
+  NF4CHR,
   NF4DIR,
+  NF4FIFO,
   NF4LNK,
+  NF4SOCK,
   NFS4_OK,
   NFS4ERR_NOENT,
   OP_GETATTR,
@@ -66,7 +70,16 @@ import type {
   TimeLike,
   WriteResult,
 } from "../../../src/types.ts";
-import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../../src/types.ts";
+import {
+  S_IFBLK,
+  S_IFCHR,
+  S_IFDIR,
+  S_IFIFO,
+  S_IFLNK,
+  S_IFMT,
+  S_IFREG,
+  S_IFSOCK,
+} from "../../../src/types.ts";
 import {
   ANONYMOUS_STATEID,
   type Nfs4Client,
@@ -106,6 +119,54 @@ const BLOCK_SIZE = 4096;
  * `errors: "host"`.
  */
 const UNLINK_DIR_CODE: ErrnoCode = process.platform === "linux" ? "EISDIR" : "EPERM";
+
+/**
+ * The `nfs_ftype4` a `mknod` mode is asking for — and a plain `Error` when it
+ * is asking for something CREATE has no way to say.
+ *
+ * v4 has no MKNOD: a special file is a CREATE, and `createtype4` switches on
+ * `nfs_ftype4` (§18.4). The mode's `S_IFMT` reaches the wire *only* here —
+ * `fattr4`'s `mode` is permission bits, and `Nfs4Session.#create` takes the
+ * type from `objtype` and nothing else — so the four device-ish types route
+ * faithfully and the rest do not route at all:
+ *
+ * - `NF4REG` is `NFS4ERR_BADTYPE` by §15.1.4.1, because a regular file is
+ *   created with OPEN. Diverting there would test this adapter's routing rather
+ *   than the session's own regular-file fallback.
+ * - `NF4DIR` *is* `mkdir` on this wire, so a mode naming a directory would
+ *   quietly make one instead of earning the `EPERM` `mknod(2)` owes it.
+ *
+ * What is thrown is deliberately **not** errno-shaped: no `code`, no `errno`,
+ * nothing `rejects()` in the conformance suite could match. Invariant 5 is the
+ * whole point — deciding `EPERM` here would be this client inventing a refusal
+ * that belongs to the driver on the far side, and the column would pass a case
+ * it never carried. The cases that need it are gated on `mknod.anyType`, which
+ * this column does not claim; anyone who un-gates one gets this, loudly,
+ * instead of a fabricated errno.
+ */
+function ftype4Of(mode: number): number {
+  switch (mode & S_IFMT) {
+    case S_IFBLK: {
+      return NF4BLK;
+    }
+    case S_IFCHR: {
+      return NF4CHR;
+    }
+    case S_IFSOCK: {
+      return NF4SOCK;
+    }
+    case S_IFIFO: {
+      return NF4FIFO;
+    }
+    default: {
+      throw new Error(
+        `NFSv4.1 CREATE cannot ask for the type in mode 0o${mode.toString(8)}: ` +
+          "`createtype4` names a block device, a character device, a socket, a FIFO " +
+          "and a symlink, a regular file is OPEN's and a directory is mkdir's",
+      );
+    }
+  }
+}
 
 /** A `fattr4`'s worth of values as the `StatsLike` a driver has to return. */
 export function stats4Of(values: Fattr4Values): StatsLike {
@@ -422,7 +483,43 @@ export function nfs4Driver(client: Nfs4Client, root: Uint8Array): FsDriver {
     // same thing where it declines to advertise `OPEN4_RESULT_PRESERVE_UNLINKED`.
     // So an open file does not survive `unlink` here either; the capability is
     // declared lost in `./conformance.test.ts`, with the reasoning.
+    // `extensions` is inferred from the keys of `mountx` below, so it is not
+    // here.
     capabilities: { handles: false, atomicRename: true },
+
+    mountx: {
+      /**
+       * CREATE of a device, a socket or a FIFO — the one place this adapter
+       * offers a `mountx.*` member by name.
+       *
+       * It is not the extension crossing the wire — it is the wire operation
+       * that already exists wearing the name the driver interface has for it.
+       * The type travels in `createtype4` (see {@link ftype4Of}), the
+       * permission bits in `fattr4`'s `mode`, and `Nfs4Session.#create` puts
+       * the two back together for the driver. So the four device-ish types
+       * route faithfully and nothing else does, which is what `carries` in
+       * `./conformance.test.ts` says.
+       *
+       * `dev` comes apart the way `Nfs4Session.#create` puts it back together —
+       * one 8-bit split across the project — which is what makes the round trip
+       * through `specdata4`'s `major`/`minor` and back out of `rawdev` worth
+       * testing at all. Every refusal the cases assert is the far side's,
+       * arriving as an `nfsstat4`: nothing is decided here.
+       */
+      async mknod(path, mode, dev) {
+        const type = ftype4Of(mode);
+        const { dir, name } = await parentOf(path, "mknod");
+        await client
+          .mknod(dir, name, type, {
+            mode: mode & 0o7777,
+            major: dev >>> 8,
+            minor: dev & 0xff,
+          })
+          .catch((error: unknown) => {
+            throw retarget(error, path);
+          });
+      },
+    },
 
     async stat(path) {
       return stats4Of((await walk(path, true)).values);
