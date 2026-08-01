@@ -48,7 +48,13 @@ no cast.
 
 **The errno table is transcribed once**, in `src/errors.ts`. The addon reports a raw
 positive `errno` and lets `src/fuse/native.ts` name it, rather than carrying a second
-copy of the table in another language where the two would drift.
+copy of the table in another language where the two would drift. The same argument
+covers a wire format two transports share: RFC 9110's `HTTP-date`, `Range` and `ETag`
+spellings live in `src/http.ts` — with the two entity-tag comparison functions and the
+§13.2.2 conditional-request rules built on them — and `src/s3/protocol.ts` re-exports
+them under its own names while `src/webdav/` imports them directly. One transcription,
+two HTTP transports; `evaluateConditionals` is wrapped rather than re-exported only
+because SigV4 makes the S3 gateway keep its headers as a signed list.
 
 ## Wire protocols
 
@@ -56,9 +62,11 @@ copy of the table in another language where the two would drift.
 FUSE constants come from the kernel's `include/uapi/linux/fuse.h`; NFS constants come
 from RFC 1813/5531/4506 and, for v4.1, RFC 8881 with RFC 5662 for the XDR it does not
 spell out; 9P constants come from the kernel's `include/net/9p/9p.h` (both header
-sources pinned at tag v6.12) with diod's `protocol.md` as the prose reference; the
-`fusermount3` handshake and the Node-API declarations come from libfuse's and Node's
-own sources, both named where they are used.
+sources pinned at tag v6.12) with diod's `protocol.md` as the prose reference; WebDAV's methods,
+statuses, properties and precondition names come from RFC 4918, with RFC 4331 for the
+quota pair and RFC 9110 for the HTTP underneath; the `fusermount3` handshake and the
+Node-API declarations come from libfuse's and Node's own sources, both named where
+they are used.
 
 **The wire's `O_*` and a driver's `O_*` are different namespaces.**
 `fuse_open_in.flags` is the Linux kernel's; `FsDriver` is a subset of
@@ -77,7 +85,9 @@ NFSv4.1, since COMPOUND is the one procedure everything else travels inside.
 one, a thrown value becomes a negative errno on FUSE (unknown → `EIO`), a positive
 Linux errno in an `Rlerror` on 9P, an `nfsstat3` on NFSv3, a legal `nfsstat4` on
 NFSv4.1 (an escaped `XdrError` → `NFS4ERR_BADXDR`, anything else →
-`NFS4ERR_SERVERFAULT`) and one S3 XML error body on the gateway, and a dev-mode
+`NFS4ERR_SERVERFAULT`), one S3 XML error body on the gateway, and one HTTP status —
+mapped from the errno by `src/webdav/constants.ts`'s table, with a `DAV:` `<error>`
+document when there is a §16 condition to carry — on WebDAV, and a dev-mode
 assertion tracks it per request id. A retried `(session, slot, sequence)` on v4.1
 answers from the slot's reply cache and re-runs nothing.
 

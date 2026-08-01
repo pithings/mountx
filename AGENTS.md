@@ -1,9 +1,9 @@
 # mountx
 
 Mount a JavaScript filesystem: one driver interface (a subset of `node:fs/promises`),
-multiple transports — FUSE, 9P, NFS (v3 and v4.1) — plus an S3 gateway (`mountx/s3`)
-that serves the same driver to an S3 client instead of mounting it, deliberately
-outside `mountx/auto`.
+multiple transports — FUSE, 9P, NFS (v3 and v4.1) — plus two that serve the same
+driver over HTTP instead of mounting it, an S3 gateway (`mountx/s3`) and a WebDAV
+server (`mountx/webdav`), both deliberately outside `mountx/auto`.
 
 **Conventions:** pure JS/TS, zero runtime deps, pure-JS-first. Single package with
 subpath exports. Small conventional commits to `main`, `pnpm test` green before each
@@ -28,12 +28,14 @@ any rule below that looks removable.
 | `src/harness.ts` | `createLoopback(driver)` — what driver authors test against                                            |
 | `src/lock.ts`    | `PathLock`, taken by `RENAME` on every transport                                                       |
 | `src/subtree.ts` | `remapSubtree()` — the rename rewrite all three handle tables share (internal)                         |
+| `src/http.ts`    | RFC 9110's `HTTP-date`, `Range` and `ETag` quoting — shared by the two HTTP transports                 |
 | `src/auto.ts`    | `mountx/auto`: probe, then FUSE → 9P → NFS, each via `await import()`                                  |
 | `src/drivers/`   | `memory` (the only `mountx.mknod` implementation), `node-fs`, `unstorage`, `handle.ts`                 |
 | `src/fuse/`      | `mountx/fuse` — protocol 7.41, root and `fusermount3` mount paths, `exec.ts` (shared spawn/`Deadline`) |
 | `src/9p/`        | `mountx/9p` — 9P2000.L, `trans=unix` by default, one session per connection                            |
 | `src/nfs/`       | `mountx/nfs` — a version router over `v3/` (RFC 1813 + MOUNT) and `v4/` (NFSv4.1); Linux and macOS     |
 | `src/s3/`        | `mountx/s3` — SigV4 gateway over HTTP, path-style, one bucket per driver                               |
+| `src/webdav/`    | `mountx/webdav` — RFC 4918 classes 1, 2 and 3 over HTTP: every method, write locks, `If`               |
 | `src/cli/`       | the `mountx` bin — a demo and test bench that mounts this package's README                             |
 | `native/`        | the Zig Node-API addon and its generated embed (`prebuilt.mjs`)                                        |
 | `test/`          | Tier 0/1/2 suites and the shared conformance suite — see `.agents/testing.md`                          |

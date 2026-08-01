@@ -48,6 +48,15 @@ import {
   MAX_PARTS,
   MULTIPART_PREFIX,
 } from "./constants.ts";
+import {
+  evaluateConditionals as evaluateHttpConditionals,
+  formatContentRange,
+  formatETag,
+  formatHttpDate,
+  MAX_TIMESTAMP_MS,
+  type ConditionalResult,
+  type ConditionalTarget,
+} from "../http.ts";
 import { normalizePath } from "../path.ts";
 import type { HeaderEntry, QueryEntry, SigV4RefusalReason } from "./sigv4.ts";
 import type { XmlRefusal } from "./xml.ts";
@@ -489,151 +498,35 @@ export function s3ErrorResponse(error: S3ErrorSpec, extra: S3ErrorExtra = {}): S
 }
 
 // ---------------------------------------------------------------------------
-// dates
+// dates, Range and ETag: RFC 9110, and shared
 // ---------------------------------------------------------------------------
 
-const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-const MONTH_NAMES = [
-  "Jan",
-  "Feb",
-  "Mar",
-  "Apr",
-  "May",
-  "Jun",
-  "Jul",
-  "Aug",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Dec",
-];
-
-/** The widest millisecond timestamp `Date` represents (ECMA-262, `Date` range). */
-export const MAX_TIMESTAMP_MS = 8.64e15;
-
-function two(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
-/**
- * An `IMF-fixdate`, the one format a sender may use (RFC 9110 §5.6.7):
- * `Sun, 06 Nov 1994 08:49:37 GMT`.
- *
- * Built from the UTC fields rather than `toUTCString()` so the output is this
- * module's own, and so a non-finite timestamp is a caller error here rather
- * than the string `"Invalid Date"` on the wire.
+/*
+ * `HTTP-date`, the `Range` grammar, the `ETag` quoting, the entity-tag
+ * comparison functions and the conditional-request rules are RFC 9110 rather
+ * than S3, and `mountx/webdav` answers the same ones — its `If` header
+ * (RFC 4918 §10.4) matches entity tags with the very same list parser. They
+ * live in `src/http.ts` and are re-exported here under the names they have
+ * always had, so this module's surface — and `mountx/s3`'s — is unchanged.
+ * `evaluateConditionals` is the one that is wrapped rather than re-exported: it
+ * takes this transport's header list and hands the shared rule a lookup.
  */
-export function formatHttpDate(timestamp: number): string {
-  const date = new Date(timestamp);
-  return (
-    `${DAY_NAMES[date.getUTCDay()]}, ${two(date.getUTCDate())} ` +
-    `${MONTH_NAMES[date.getUTCMonth()]} ${date.getUTCFullYear()} ` +
-    `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}:${two(date.getUTCSeconds())} GMT`
-  );
-}
-
-/**
- * The ISO 8601 form S3 puts in XML documents (`LastModified`, `CreationDate`):
- * `1994-11-06T08:49:37.000Z`, always with milliseconds and always UTC.
- */
-export function formatIsoDate(timestamp: number): string {
-  return new Date(timestamp).toISOString();
-}
-
-const IMF_FIXDATE =
-  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) ([A-Za-z]{3}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
-
-const RFC850_DATE =
-  /^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), (\d{2})-([A-Za-z]{3})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) GMT$/;
-
-const ASCTIME_DATE =
-  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Za-z]{3}) ([ \d]\d) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/;
-
-function utcOf(
-  year: number,
-  monthName: string,
-  day: number,
-  hour: number,
-  minute: number,
-  second: number,
-): number | undefined {
-  const month = MONTH_NAMES.indexOf(monthName);
-  /* `year < 100` is refused rather than passed to `Date.UTC`, which maps 0..99
-     onto 1900..1999 — so `0099` would silently become 1999. A four-digit year
-     under 100 is not a date any client meant. */
-  if (
-    month === -1 ||
-    year < 100 ||
-    day < 1 ||
-    day > 31 ||
-    hour > 23 ||
-    minute > 59 ||
-    second > 60
-  ) {
-    return undefined;
-  }
-  const timestamp = Date.UTC(year, month, day, hour, minute, Math.min(second, 59));
-  /* Date.UTC rolls a day past the month's end forward; a date that does not
-     survive the round trip was never a real one. */
-  if (!Number.isFinite(timestamp) || new Date(timestamp).getUTCDate() !== day) {
-    return undefined;
-  }
-  return timestamp;
-}
-
-/**
- * Parse an `HTTP-date` into a millisecond epoch, or `undefined` for anything
- * that is not one.
- *
- * All three formats RFC 9110 §5.6.7 requires a recipient to accept: the
- * preferred `IMF-fixdate`, the obsolete RFC 850 form, and `asctime()`. A
- * two-digit RFC 850 year uses the fixed `69`/`70` split rather than the
- * "50 years in the future" rule, because that rule needs a clock and this
- * module does not have one — the difference only shows up for dates after 2069,
- * in a format no client has sent this century.
- *
- * A leap second (`:60`) is accepted and read as `:59`, which is what RFC 9110
- * recommends. Never throws: an unparseable date is `undefined`, and every
- * conditional header treats that as absent (RFC 9110 §13.1.3/§13.1.4).
- */
-export function parseHttpDate(value: string): number | undefined {
-  const fixdate = IMF_FIXDATE.exec(value);
-  if (fixdate !== null) {
-    return utcOf(
-      Number(fixdate[3]),
-      fixdate[2] as string,
-      Number(fixdate[1]),
-      Number(fixdate[4]),
-      Number(fixdate[5]),
-      Number(fixdate[6]),
-    );
-  }
-  const rfc850 = RFC850_DATE.exec(value);
-  if (rfc850 !== null) {
-    const short = Number(rfc850[3]);
-    return utcOf(
-      short >= 70 ? 1900 + short : 2000 + short,
-      rfc850[2] as string,
-      Number(rfc850[1]),
-      Number(rfc850[4]),
-      Number(rfc850[5]),
-      Number(rfc850[6]),
-    );
-  }
-  const asctime = ASCTIME_DATE.exec(value);
-  if (asctime !== null) {
-    return utcOf(
-      Number(asctime[6]),
-      asctime[1] as string,
-      Number(asctime[2]),
-      Number(asctime[3]),
-      Number(asctime[4]),
-      Number(asctime[5]),
-    );
-  }
-  return undefined;
-}
+export {
+  formatContentRange,
+  formatETag,
+  formatHttpDate,
+  formatIsoDate,
+  formatUnsatisfiedRange,
+  MAX_TIMESTAMP_MS,
+  parseETagList,
+  parseHttpDate,
+  parseRange,
+  type ConditionalResult,
+  type ConditionalTarget,
+  type ETag,
+  type ETagList,
+  type RangeSpec,
+} from "../http.ts";
 
 // ---------------------------------------------------------------------------
 // the request target
@@ -1636,260 +1529,33 @@ export function routeRequest(
 }
 
 // ---------------------------------------------------------------------------
-// Range
-// ---------------------------------------------------------------------------
-
-/**
- * What a `Range` header asked for, against a known object size.
- *
- * - `full` — no range, or one this server must ignore. RFC 9110 §14.2 is
- *   explicit that an unsatisfiable *syntax* is ignored rather than refused, and
- *   S3 additionally ignores a multi-range request: "Amazon S3 doesn't support
- *   retrieving multiple ranges of data per GET request", and what it sends back
- *   is `200` with the whole object, not a `multipart/byteranges` document.
- * - `range` — a satisfiable single range, already clamped to the object.
- * - `unsatisfiable` — the 416 case (`InvalidRange`, `Content-Range: bytes * /n`).
- */
-export type RangeSpec =
-  | { kind: "full" }
-  | { kind: "range"; start: number; end: number; length: number }
-  | { kind: "unsatisfiable" };
-
-/* Fresh objects rather than shared constants: a route object handed to a
-   caller should never be a value another request can see mutated. */
-function full(): RangeSpec {
-  return { kind: "full" };
-}
-
-function unsatisfiable(): RangeSpec {
-  return { kind: "unsatisfiable" };
-}
-
-/**
- * A `first-byte-pos`/`last-byte-pos`/`suffix-length`: digits only, and read as
- * a plain number even past `Number.MAX_SAFE_INTEGER` — a position that large is
- * only ever compared against a size, and `1e20 >= size` is true whether or not
- * the digits were exact.
- */
-function rangeNumber(value: string): number | undefined {
-  return /^\d+$/.test(value) ? Number(value) : undefined;
-}
-
-/**
- * Parse a `Range` header against an object of `size` bytes (RFC 9110 §14.1).
- *
- * The three forms: `bytes=a-b`, `bytes=a-` and `bytes=-n`. A range unit other
- * than `bytes`, more than one range, or anything that does not parse is
- * **ignored** — the whole object, status 200 — which is both what RFC 9110
- * requires of an unparseable header and what S3 does with a multi-range
- * request.
- *
- * Unsatisfiable, per §14.1.1 and §14.4: `first-byte-pos` at or past the end of
- * the object, or a `suffix-length` of zero. An empty object therefore refuses
- * every byte range, including `bytes=0-`, since there is no byte 0 to serve.
- */
-export function parseRange(value: string | undefined, size: number): RangeSpec {
-  if (value === undefined || value === "") {
-    return full();
-  }
-  const equals = value.indexOf("=");
-  if (equals === -1 || value.slice(0, equals).trim().toLowerCase() !== "bytes") {
-    return full();
-  }
-  const spec = value.slice(equals + 1).trim();
-  if (spec.includes(",")) {
-    return full();
-  }
-  const dash = spec.indexOf("-");
-  if (dash === -1) {
-    return full();
-  }
-  const firstText = spec.slice(0, dash).trim();
-  const lastText = spec.slice(dash + 1).trim();
-  if (firstText === "") {
-    /* `bytes=-n`: the last n bytes. */
-    const suffix = rangeNumber(lastText);
-    if (suffix === undefined) {
-      return full();
-    }
-    if (suffix === 0 || size === 0) {
-      return unsatisfiable();
-    }
-    const start = Math.max(0, size - suffix);
-    return { kind: "range", start, end: size - 1, length: size - start };
-  }
-  const first = rangeNumber(firstText);
-  if (first === undefined) {
-    return full();
-  }
-  if (lastText === "") {
-    /* `bytes=a-`: to the end. */
-    if (first >= size) {
-      return unsatisfiable();
-    }
-    return { kind: "range", start: first, end: size - 1, length: size - first };
-  }
-  const last = rangeNumber(lastText);
-  if (last === undefined || last < first) {
-    /* An invalid range spec makes the whole header invalid (§14.1.1). */
-    return full();
-  }
-  if (first >= size) {
-    return unsatisfiable();
-  }
-  const end = Math.min(last, size - 1);
-  return { kind: "range", start: first, end, length: end - first + 1 };
-}
-
-// ---------------------------------------------------------------------------
 // conditional requests
 // ---------------------------------------------------------------------------
 
-/** One entity tag, with the weakness marker kept: `W/` is part of the tag. */
-export interface ETag {
-  /** The opaque value, without quotes and without the `W/` prefix. */
-  value: string;
-  /** Was it sent as `W/"..."`? */
-  weak: boolean;
-}
-
-/** An entity tag list: `*`, or the tags as sent. */
-export type ETagList = { any: true } | { any: false; tags: ETag[] };
-
-/** Take a tag apart: `W/"abc"` is `{ value: "abc", weak: true }`. */
-function parseETag(value: string): ETag {
-  const weak = value.startsWith("W/");
-  const withoutWeak = weak ? value.slice(2) : value;
-  const unquoted =
-    withoutWeak.startsWith(`"`) && withoutWeak.endsWith(`"`) && withoutWeak.length >= 2
-      ? withoutWeak.slice(1, -1)
-      : withoutWeak;
-  return { value: unquoted, weak };
-}
-
 /**
- * Parse an `If-Match`/`If-None-Match` value (RFC 9110 §13.1.1/§13.1.2).
+ * Evaluate the four conditional headers in RFC 9110 §13.2.2's order.
  *
- * The weakness marker is **kept**, because the two headers do not compare tags
- * the same way: `If-Match` uses the strong comparison function and `If-None-
- * Match` the weak one (§8.8.3.2). The client controls its side of that
- * comparison, so `If-Match: W/"x"` never matches anything — including an object
- * whose strong ETag is `x` — while `If-None-Match: W/"x"` does.
- */
-export function parseETagList(value: string): ETagList {
-  if (value.trim() === "*") {
-    return { any: true };
-  }
-  const tags: ETag[] = [];
-  for (const part of value.split(",")) {
-    const trimmed = part.trim();
-    if (trimmed !== "") {
-      tags.push(parseETag(trimmed));
-    }
-  }
-  return { any: false, tags };
-}
-
-/**
- * The **strong** comparison function (RFC 9110 §8.8.3.2): the values match and
- * *neither* tag is weak. `*` matches any existing representation.
- */
-function etagMatchesStrongly(list: ETagList, etag: string): boolean {
-  if (list.any) {
-    return true;
-  }
-  const target = parseETag(etag);
-  return !target.weak && list.tags.some((tag) => !tag.weak && tag.value === target.value);
-}
-
-/**
- * The **weak** comparison function: the values match, whatever either side's
- * weakness marker says.
- */
-function etagMatchesWeakly(list: ETagList, etag: string): boolean {
-  if (list.any) {
-    return true;
-  }
-  const target = parseETag(etag);
-  return list.tags.some((tag) => tag.value === target.value);
-}
-
-/** What the conditional headers are evaluated against. */
-export interface ConditionalTarget {
-  /** The object's ETag, quoted or not — both compare the same. */
-  etag: string;
-  /** The object's modification time, in milliseconds. */
-  mtimeMs: number;
-}
-
-/** The outcome: serve it, answer `304`, or answer `412`. */
-export interface ConditionalResult {
-  status: 200 | 304 | 412;
-}
-
-/**
- * Evaluate the four conditional headers in RFC 9110 §13.2.2's order:
- *
- * 1. `If-Match` — no match is `412`.
- * 2. `If-Unmodified-Since`, **only when `If-Match` is absent** — modified since
- *    is `412`.
- * 3. `If-None-Match` — a match is `304` for `GET`/`HEAD` and `412` for every
- *    other method.
- * 4. `If-Modified-Since`, **only when `If-None-Match` is absent and the method
- *    is `GET` or `HEAD`** — not modified is `304`.
- *
- * `If-Match` compares strongly and `If-None-Match` weakly (§8.8.3.2), which is
- * a difference a client can see even though every ETag this gateway produces is
- * strong: a weak tag *from the client* fails `If-Match` and passes
- * `If-None-Match`.
- *
- * A date that does not parse is ignored, as §13.1.3 and §13.1.4 require ("a
- * recipient MUST ignore the header field if the value is not a valid
- * HTTP-date"). Comparison is at one-second resolution, because that is all an
- * `HTTP-date` carries: an object modified 300 ms after the date in the header
- * counts as *not* modified.
+ * The rules are HTTP's rather than S3's and live in `src/http.ts` beside the
+ * entity-tag comparison functions they use; this is the S3 spelling of the same
+ * call, taking the header list this transport carries (SigV4 signs headers as
+ * they were sent, so they stay a list of entries here) and joining the two
+ * list-based fields the way RFC 9110 §5.3 permits.
  */
 export function evaluateConditionals(
   target: ConditionalTarget,
   headers: readonly HeaderEntry[],
   method: string,
 ): ConditionalResult {
-  const safe = method === "GET" || method === "HEAD";
-  const modifiedSeconds = Math.floor(target.mtimeMs / 1000);
-
-  const ifMatch = headerList(headers, "if-match");
-  if (ifMatch !== undefined) {
-    if (!etagMatchesStrongly(parseETagList(ifMatch), target.etag)) {
-      return { status: 412 };
-    }
-  } else {
-    const ifUnmodifiedSince = headerValue(headers, "if-unmodified-since");
-    if (ifUnmodifiedSince !== undefined) {
-      const at = parseHttpDate(ifUnmodifiedSince);
-      if (at !== undefined && modifiedSeconds > Math.floor(at / 1000)) {
-        return { status: 412 };
-      }
-    }
-  }
-
-  const ifNoneMatch = headerList(headers, "if-none-match");
-  if (ifNoneMatch !== undefined) {
-    if (etagMatchesWeakly(parseETagList(ifNoneMatch), target.etag)) {
-      return { status: safe ? 304 : 412 };
-    }
-    return { status: 200 };
-  }
-
-  if (safe) {
-    const ifModifiedSince = headerValue(headers, "if-modified-since");
-    if (ifModifiedSince !== undefined) {
-      const at = parseHttpDate(ifModifiedSince);
-      if (at !== undefined && modifiedSeconds <= Math.floor(at / 1000)) {
-        return { status: 304 };
-      }
-    }
-  }
-  return { status: 200 };
+  return evaluateHttpConditionals(
+    target,
+    {
+      "if-match": headerList(headers, "if-match"),
+      "if-none-match": headerList(headers, "if-none-match"),
+      "if-modified-since": headerValue(headers, "if-modified-since"),
+      "if-unmodified-since": headerValue(headers, "if-unmodified-since"),
+    },
+    method,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1933,22 +1599,6 @@ export function formatMetaMtime(timestamp: number): string {
   const seconds = timestamp / 1000;
   return Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(3);
 }
-
-/** Wrap an ETag in quotes if it is not already quoted. */
-export function formatETag(etag: string): string {
-  return etag.startsWith(`"`) && etag.endsWith(`"`) && etag.length >= 2 ? etag : `"${etag}"`;
-}
-
-/** `Content-Range: bytes 0-99/1234` (RFC 9110 §14.4). */
-export function formatContentRange(start: number, end: number, total: number): string {
-  return `bytes ${start}-${end}/${total}`;
-}
-
-/** The `Content-Range` of a 416 reply: `bytes * /n`, the "unsatisfied-range" form. */
-export function formatUnsatisfiedRange(total: number): string {
-  return `bytes */${total}`;
-}
-
 /** What an object reply's headers are built from. */
 export interface ObjectHeadersInput {
   /** The derived ETag; quoted for you. */
