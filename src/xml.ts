@@ -18,6 +18,21 @@
  * left out is one that cannot be turned against a server. It grows for a
  * document one of the two actually receives, and for nothing else.
  *
+ * ## Namespaces, in both directions
+ *
+ * A prefix is **resolved, not dropped**: the parser tracks the `xmlns` and
+ * `xmlns:*` declarations in scope and reports each element as the pair
+ * Namespaces in XML defines it to be — a local name and a namespace URI, `""`
+ * for none. `<D:prop xmlns:D="DAV:">` and `<prop xmlns="DAV:">` are the same
+ * element, and `<Z:prop xmlns:Z="urn:example">` is a different one. A caller
+ * reads whichever field its protocol identifies elements by, which is not the
+ * same choice for the two here — see {@link ParsedElement}.
+ *
+ * Going out, an element carries its namespace as a **default declaration**
+ * rather than a prefix (`<multistatus xmlns="DAV:">` with unprefixed children),
+ * which is the same document to a namespace-aware reader and needs no prefix
+ * table on either side. {@link XmlNode.ns} says when to write one.
+ *
  * ## One notion of a valid character, applied in both directions
  *
  * XML 1.0 cannot carry every code point, and the values reaching this module
@@ -176,6 +191,23 @@ export type XmlText = string | number | bigint | boolean;
  */
 export interface XmlNode {
   name: string;
+  /**
+   * The namespace this element is in.
+   *
+   * **Omitted means inherit**, which is what every element of a document with
+   * one namespace wants and is why nothing already written here carries the
+   * field. Set it and the serializer writes a `xmlns` on this element when it
+   * differs from the enclosing default — including `xmlns=""` for an element in
+   * **no** namespace inside one that has a default.
+   *
+   * Declared as a default namespace rather than with a generated prefix, so
+   * there is no prefix table, no collision to resolve and no name that means
+   * one thing at the root and another six elements down. `<Win32CreationTime
+   * xmlns="urn:schemas-microsoft-com:"/>` is that property, unambiguously, and
+   * a namespace-aware client reads it as the same node either spelling would
+   * have produced.
+   */
+  ns?: string;
   text?: XmlText;
   children?: readonly (XmlNode | undefined)[];
 }
@@ -184,23 +216,31 @@ function renderText(value: XmlText): string {
   return typeof value === "string" ? value : String(value);
 }
 
-function renderElement(node: XmlNode, attributes = ""): string {
+function renderElement(node: XmlNode, inherited: string): string {
+  const declaring = node.ns !== undefined && node.ns !== inherited;
+  const ns = declaring ? (node.ns as string) : inherited;
   let inner = node.text === undefined ? "" : escapeXmlText(renderText(node.text));
   for (const child of node.children ?? []) {
     if (child !== undefined) {
-      inner += renderElement(child);
+      inner += renderElement(child, ns);
     }
   }
+  const attributes = declaring ? ` xmlns="${escapeXmlText(ns)}"` : "";
   return `<${node.name}${attributes}>${inner}</${node.name}>`;
 }
 
 /**
  * A whole document: the declaration, then the root element, with no whitespace
- * anywhere between them. `xmlns` is written on the root when given.
+ * anywhere between them.
+ *
+ * `xmlns` is the root's namespace, and is shorthand for setting `ns` on it —
+ * the spelling every caller here already used, kept because a document with one
+ * namespace should not have to say so on the node. It wins over the root's own
+ * `ns` if both are given.
  */
 export function xmlDocument(root: XmlNode, options: { xmlns?: string } = {}): string {
-  const attributes = options.xmlns === undefined ? "" : ` xmlns="${escapeXmlText(options.xmlns)}"`;
-  return XML_DECLARATION + renderElement(root, attributes);
+  const node = options.xmlns === undefined ? root : { ...root, ns: options.xmlns };
+  return XML_DECLARATION + renderElement(node, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -309,8 +349,15 @@ export interface XmlParseLimits {
 }
 
 /**
- * One parsed element: its **local** name (any namespace prefix is dropped), its
+ * One parsed element: its **local** name, the namespace that name is in, its
  * text content, and its children.
+ *
+ * The two name fields are separate on purpose, and a caller reads whichever its
+ * protocol identifies elements by. S3 reads `name` alone — `s3:Delete`,
+ * `<Delete xmlns="…">` and a bare `<Delete>` are one element to it, which is
+ * what AWS's namespace-less grammars and its SDKs require. WebDAV reads both,
+ * because a property name in RFC 4918 *is* the pair and two properties with the
+ * same local name in different namespaces are two different properties.
  *
  * Text is the concatenation of every text run and CDATA section directly inside
  * the element; for the leaves these grammars read, that is the value. Mixed
@@ -318,9 +365,81 @@ export interface XmlParseLimits {
  * models beyond this.
  */
 export interface ParsedElement {
+  /** The local name: the part after the prefix, which is dropped from it. */
   name: string;
+  /**
+   * The namespace URI {@link name} is in, resolved against the `xmlns`
+   * declarations in scope — `""` for an element in no namespace. See
+   * {@link parseXml} for what an unbound prefix does.
+   */
+  ns: string;
   text: string;
   children: ParsedElement[];
+}
+
+/** A prefix bound to a namespace URI. `prefix` is `""` for the default one. */
+interface NamespaceDeclaration {
+  prefix: string;
+  uri: string;
+}
+
+/** The declarations in scope at one element: prefix → URI. */
+type Namespaces = ReadonlyMap<string, string>;
+
+/**
+ * The one binding every document has without declaring it (Namespaces in XML
+ * §3): `xml` is always this URI, and it may not be rebound.
+ */
+export const XML_PREFIX_NS = "http://www.w3.org/XML/1998/namespace";
+
+/** What is in scope before the root element declares anything. */
+const ROOT_NAMESPACES: Namespaces = new Map([["xml", XML_PREFIX_NS]]);
+
+/**
+ * The scope inside an element that declared these, or the enclosing scope
+ * unchanged when it declared none — which is the common case and allocates
+ * nothing.
+ *
+ * `xmlns:foo=""` **unbinds** `foo`. XML 1.0 namespaces makes that an error and
+ * XML 1.1 makes it legal; unbinding is what both then agree the *intent* is,
+ * and it lands in the same place as an unbound prefix, so there is nothing to
+ * gain by refusing it. `xmlns:xmlns` is not a declaration and `xml` may not be
+ * rebound: both are ignored rather than refused, for the reason in
+ * {@link parseXml}.
+ */
+function scopeWith(
+  inherited: Namespaces,
+  declarations: NamespaceDeclaration[] | undefined,
+): Namespaces {
+  if (declarations === undefined) {
+    return inherited;
+  }
+  const scope = new Map(inherited);
+  for (const { prefix, uri } of declarations) {
+    if (prefix === "xmlns" || prefix === "xml") {
+      continue;
+    }
+    if (uri === "") {
+      scope.delete(prefix);
+    } else {
+      scope.set(prefix, uri);
+    }
+  }
+  return scope;
+}
+
+/**
+ * The namespace a qname resolves to in this scope, `""` for none.
+ *
+ * The prefix is split off at the **same** colon {@link localName} splits at, so
+ * the two halves of a name always describe the same split. For a well-formed
+ * QName there is at most one colon and the question does not arise; for `a:b:c`
+ * — which no protocol here sends and XML does not define — the pair stays
+ * consistent rather than each half reading a different name out of it.
+ */
+function namespaceOf(qname: string, scope: Namespaces): string {
+  const colon = qname.lastIndexOf(":");
+  return scope.get(colon === -1 ? "" : qname.slice(0, colon)) ?? "";
 }
 
 /**
@@ -423,10 +542,10 @@ function isNameChar(code: number): boolean {
  * A recursive-descent parser over the subset of XML these protocols send.
  *
  * What it accepts: an optional declaration, comments and processing
- * instructions anywhere they are legal, namespace prefixes (dropped), the five
- * predefined entities, numeric character references, CDATA sections, and
- * attributes (parsed for well-formedness, then discarded — the only one these
- * bodies carry is `xmlns`).
+ * instructions anywhere they are legal, namespace prefixes (resolved against
+ * the declarations in scope), the five predefined entities, numeric character
+ * references, CDATA sections, and attributes (parsed for well-formedness, then
+ * discarded — `xmlns` and `xmlns:*` are the only ones whose values are kept).
  *
  * What it refuses, by construction rather than by check: **there is no DTD
  * subsystem**. `<!DOCTYPE` is a refusal wherever it appears and no other `<!`
@@ -522,9 +641,17 @@ class XmlParser {
     return this.#text.slice(start, this.#at);
   }
 
-  /** Well-formedness only: the value is parsed and thrown away. */
-  #attribute(): void {
-    this.#qname();
+  /**
+   * One attribute, and the namespace declaration it was if it was one.
+   *
+   * Every attribute is parsed for well-formedness, exactly as before; the
+   * **value** is kept only for `xmlns` and `xmlns:*`, which are the only
+   * attributes either grammar reads. A body full of long attribute values still
+   * costs this parser the scan and no allocation.
+   */
+  #attribute(): NamespaceDeclaration | undefined {
+    const qname = this.#qname();
+    const declaring = qname === "xmlns" || qname.startsWith("xmlns:");
     this.#skipSpace();
     if (this.#text.charCodeAt(this.#at) !== 0x3d) {
       throw this.#fail("malformed", "expected = after an attribute name");
@@ -536,23 +663,33 @@ class XmlParser {
       throw this.#fail("malformed", "attribute value is not quoted");
     }
     this.#at++;
+    let uri = "";
     for (;;) {
-      const code = this.#text.charCodeAt(this.#at);
-      if (Number.isNaN(code)) {
-        throw this.#fail("malformed", "unterminated attribute value");
-      }
-      if (code === quote) {
+      const start = this.#at;
+      for (;;) {
+        const code = this.#text.charCodeAt(this.#at);
+        if (Number.isNaN(code)) {
+          throw this.#fail("malformed", "unterminated attribute value");
+        }
+        if (code === quote || code === 0x26) {
+          break;
+        }
+        if (code === 0x3c) {
+          throw this.#fail("malformed", "< in an attribute value");
+        }
         this.#at++;
-        return;
       }
-      if (code === 0x3c) {
-        throw this.#fail("malformed", "< in an attribute value");
+      if (declaring) {
+        uri += this.#text.slice(start, this.#at);
       }
-      if (code === 0x26) {
-        this.#entity();
-        continue;
+      if (this.#text.charCodeAt(this.#at) === quote) {
+        this.#at++;
+        return declaring ? { prefix: qname === "xmlns" ? "" : qname.slice(6), uri } : undefined;
       }
-      this.#at++;
+      const resolved = this.#entity();
+      if (declaring) {
+        uri += resolved;
+      }
     }
   }
 
@@ -634,7 +771,13 @@ class XmlParser {
     }
   }
 
-  #element(depth: number): ParsedElement {
+  /**
+   * The element is built **after** its start tag is read, because a declaration
+   * anywhere in that tag binds the element's own prefix: `<D:prop xmlns:D="…">`
+   * is in `DAV:`, and a parser that resolved the name before reaching the
+   * attribute would have said it was in no namespace.
+   */
+  #element(depth: number, inherited: Namespaces): ParsedElement {
     if (depth > this.#maxDepth) {
       throw this.#fail("depth", `nested deeper than ${this.#maxDepth} elements`);
     }
@@ -644,7 +787,8 @@ class XmlParser {
     }
     this.#at++;
     const qname = this.#qname();
-    const element: ParsedElement = { name: localName(qname), text: "", children: [] };
+    let declarations: NamespaceDeclaration[] | undefined;
+    let empty = false;
     for (;;) {
       const spaced = SPACE.has(this.#text.charCodeAt(this.#at));
       this.#skipSpace();
@@ -658,7 +802,8 @@ class XmlParser {
           throw this.#fail("malformed", "expected /> to close an empty element");
         }
         this.#at += 2;
-        return element;
+        empty = true;
+        break;
       }
       if (Number.isNaN(code)) {
         throw this.#fail("malformed", `unterminated <${qname}> start tag`);
@@ -666,13 +811,25 @@ class XmlParser {
       if (!spaced) {
         throw this.#fail("malformed", "expected whitespace before an attribute");
       }
-      this.#attribute();
+      const declaration = this.#attribute();
+      if (declaration !== undefined) {
+        (declarations ??= []).push(declaration);
+      }
     }
-    this.#content(element, qname, depth);
+    const scope = scopeWith(inherited, declarations);
+    const element: ParsedElement = {
+      name: localName(qname),
+      ns: namespaceOf(qname, scope),
+      text: "",
+      children: [],
+    };
+    if (!empty) {
+      this.#content(element, qname, depth, scope);
+    }
     return element;
   }
 
-  #content(element: ParsedElement, qname: string, depth: number): void {
+  #content(element: ParsedElement, qname: string, depth: number, scope: Namespaces): void {
     for (;;) {
       const before = this.#at;
       if (this.#at >= this.#text.length) {
@@ -704,7 +861,7 @@ class XmlParser {
       } else if (this.#starts("<?")) {
         this.#skipProcessingInstruction();
       } else if (this.#text.charCodeAt(this.#at) === 0x3c) {
-        element.children.push(this.#element(depth + 1));
+        element.children.push(this.#element(depth + 1, scope));
       } else {
         element.text += this.#textRun();
       }
@@ -722,7 +879,7 @@ class XmlParser {
     if (this.#text.charCodeAt(this.#at) !== 0x3c) {
       throw this.#fail("malformed", "no root element");
     }
-    const root = this.#element(1);
+    const root = this.#element(1, ROOT_NAMESPACES);
     this.#skipMisc();
     if (this.#at < this.#text.length) {
       throw this.#fail("malformed", "trailing content after the root element");
@@ -731,7 +888,7 @@ class XmlParser {
   }
 }
 
-/** `s3:Delete` is `Delete`: prefixes are dropped, not resolved. */
+/** `s3:Delete` is `Delete`; {@link namespaceOf} takes the other half. */
 function localName(qname: string): string {
   const colon = qname.lastIndexOf(":");
   return colon === -1 ? qname : qname.slice(colon + 1);
@@ -740,6 +897,16 @@ function localName(qname: string): string {
 /**
  * Parse a bounded XML document to its element tree. Throws {@link XmlError} and
  * nothing else, for any input at all.
+ *
+ * **An unbound prefix is not a refusal.** Namespaces in XML makes one an error;
+ * here the element is reported in no namespace instead, which for both
+ * protocols means "not one of ours" — the safe reading, and the one that
+ * arrives at the same answer as refusing without the collateral. Refusing would
+ * be a new way for an S3 body to fail, on a path where prefixes have been
+ * dropped unresolved since the gateway shipped and a client that never declared
+ * one has always been answered; a WebDAV `PROPFIND` naming a property under an
+ * undeclared prefix gets a `404` for a property this server does not have,
+ * which is true.
  */
 export function parseXml(input: Uint8Array | string, limits: XmlParseLimits = {}): ParsedElement {
   return new XmlParser(bodyText(input, capOf(limits.maxBytes, XML_MAX_BYTES)), limits).parse();
