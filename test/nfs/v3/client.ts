@@ -34,8 +34,12 @@ import {
   MOUNTPROC3_NULL,
   MOUNTPROC3_UMNT,
   MOUNTPROC3_UMNTALL,
+  NF3BLK,
+  NF3CHR,
   NF3DIR,
+  NF3FIFO,
   NF3LNK,
+  NF3SOCK,
   NFS3_COOKIEVERFSIZE,
   NFS3_OK,
   NFS_PROGRAM,
@@ -137,7 +141,16 @@ import type {
   TimeLike,
   WriteResult,
 } from "../../../src/types.ts";
-import { S_IFDIR, S_IFLNK, S_IFMT, S_IFREG } from "../../../src/types.ts";
+import {
+  S_IFBLK,
+  S_IFCHR,
+  S_IFDIR,
+  S_IFIFO,
+  S_IFLNK,
+  S_IFMT,
+  S_IFREG,
+  S_IFSOCK,
+} from "../../../src/types.ts";
 
 /** An RPC that came back as anything other than an accepted success. */
 export class RpcError extends Error {
@@ -685,6 +698,48 @@ function timeOf(value: TimeLike): { seconds: number; nseconds: number } {
   return toTime(ms);
 }
 
+/**
+ * The `ftype3` a `mknod` mode is asking for — and a plain `Error` when it is
+ * asking for something MKNOD has no way to say.
+ *
+ * `mknoddata3` switches on `ftype3` and MKNOD's four legal arms are BLK, CHR,
+ * SOCK and FIFO (§3.3.11); the mode's `S_IFMT` reaches the wire *only* here,
+ * because `sattr3.mode` is masked to `0o7777` on the way out and again by
+ * `NfsSession.#mknod` on the way in. So a type outside those four cannot be
+ * asked for over NFSv3 at all.
+ *
+ * What is thrown for one is deliberately **not** errno-shaped: no `code`, no
+ * `errno`, nothing `rejects()` in the conformance suite could match. Invariant
+ * 5 is the whole point — a client that answered `EPERM` for `S_IFDIR` here
+ * would be inventing the refusal that the driver on the far side is supposed to
+ * make, and the column would pass a case it never carried. The cases that need
+ * it are gated on `mknod.anyType`, which this column does not claim; anyone who
+ * un-gates one gets this, loudly, instead of a fabricated errno.
+ */
+function ftype3Of(mode: number): number {
+  switch (mode & S_IFMT) {
+    case S_IFBLK: {
+      return NF3BLK;
+    }
+    case S_IFCHR: {
+      return NF3CHR;
+    }
+    case S_IFSOCK: {
+      return NF3SOCK;
+    }
+    case S_IFIFO: {
+      return NF3FIFO;
+    }
+    default: {
+      throw new Error(
+        `NFSv3 MKNOD cannot ask for the type in mode 0o${mode.toString(8)}: ` +
+          "`mknoddata3` has an arm for a block device, a character device, a socket " +
+          "and a FIFO, and nothing else carries the type",
+      );
+    }
+  }
+}
+
 /** How many symlinks a resolution may traverse before it is a loop. */
 const MAX_SYMLINKS = 40;
 
@@ -851,8 +906,45 @@ export function nfsDriver(client: NfsClient, root: Uint8Array): FsDriver {
   return {
     // NFSv3 is stateless, so an open file has no server-side existence and
     // cannot survive `unlink`. `rename` is a single server operation, so it is
-    // atomic in the sense the capability means.
+    // atomic in the sense the capability means. `extensions` is inferred from
+    // the keys of `mountx` below, so it is not here.
     capabilities: { handles: false, atomicRename: true },
+
+    mountx: {
+      /**
+       * MKNOD, which is the one place this adapter offers a `mountx.*` member
+       * by name.
+       *
+       * It is not the extension crossing the wire — it is the wire operation
+       * that already exists wearing the name the driver interface has for it.
+       * What NFSv3 carries is a *type* and a *mode*, in separate fields: the
+       * type in `ftype3` (see {@link ftype3Of}), the permission bits in
+       * `sattr3.mode`, and `NfsSession.#mknod` puts the two back together for
+       * the driver. So the four device-ish types route faithfully and nothing
+       * else does, which is what `carries` in `./conformance.test.ts` says.
+       *
+       * `dev` comes apart the way `NfsSession.#mknod` puts it back together —
+       * one 8-bit split across the project — which is what makes the round trip
+       * through `specdata3`'s `major`/`minor` and back out of `fattr3.rdev`
+       * worth testing at all. Every refusal the cases assert is the far side's,
+       * arriving as an `nfsstat3`: nothing is decided here.
+       */
+      async mknod(path, mode, dev) {
+        const type = ftype3Of(mode);
+        const { dir, name } = await parentOf(path, "mknod");
+        check(
+          await client.mknod(
+            dir,
+            name,
+            type,
+            { mode: mode & 0o7777 },
+            { major: dev >>> 8, minor: dev & 0xff },
+          ),
+          "mknod",
+          path,
+        );
+      },
+    },
 
     async stat(path) {
       return statsOf((await walk(path, true)).attr);

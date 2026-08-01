@@ -446,14 +446,16 @@ function main(): void {
       "reachable, including the five that do not need it. A `mountx.*` requirement is left out " +
       "of this table entirely: the suite calls an extension by name through `fs.mountx`, so a " +
       "skip is a fact about whether that column's client offers the name, not about what the " +
-      "transport carries. Two columns do offer it — the loopback one directly, and the 9P one " +
-      "because `Tmknod` carries the whole `mode` and `p9Driver` can hand it over unchanged. The " +
-      "rest skip for reasons of their own: FUSE drives a real mount with `node:fs` as the " +
-      "client, and `node:fs` cannot `mknod(2)`; NFSv3 and NFSv4.1 carry the file type in " +
-      "`ftype3`/`nfs_ftype4` rather than in the mode, so a client there could not offer the " +
-      "whole extension without deciding part of it itself; S3 has no way to name a FIFO at all. " +
-      "All four sessions do carry `mknod` — see the per-case rows below, and the FUSE column's " +
-      "own `mkfifo`/`mknod`/`bind` case over a real mount.",
+      "transport carries. Four columns do offer it — the loopback one directly, the 9P one " +
+      "because `Tmknod` carries the whole `mode` and `p9Driver` can hand it over unchanged, and " +
+      "both NFS ones because MKNOD and CREATE are operations their clients can call by name. " +
+      "The NFS pair offers it in part: `ftype3`/`nfs_ftype4` carries the file type and the mode " +
+      "carries only permission bits, so the two cases needing a mode to name a type are gated on " +
+      "`mknod.anyType` and skip there rather than let a client decide them itself. The remaining " +
+      "columns skip for reasons of their own: FUSE drives a real mount with `node:fs` as the " +
+      "client, and `node:fs` cannot `mknod(2)`; S3 has no way to name a FIFO at all. All four " +
+      "sessions do carry `mknod` — see the per-case rows below, and the FUSE column's own " +
+      "`mkfifo`/`mknod`/`bind` case over a real mount.",
   );
   push();
   push(
@@ -476,8 +478,8 @@ function main(): void {
     // `root` is an environment fact, reported in its own cell. A `mountx.*`
     // requirement is neither a capability nor a loss: the suite reaches an
     // extension by name through `fs.mountx`, and whether a column's client
-    // offers that name is a fact about the client. The loopback and 9P columns
-    // do; the others skip for reasons that are theirs rather than the
+    // offers that name is a fact about the client. The loopback, 9P and two NFS
+    // columns do; the others skip for reasons that are theirs rather than the
     // session's (see the preamble above). A skip says nothing about whether the
     // transport carries the *operation* (all four sessions carry `mknod`), so
     // calling it a loss would be a claim the run cannot make in either

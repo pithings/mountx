@@ -53,15 +53,24 @@ through its Tier-1 JS client, and FUSE contributes a real-mount column.
   the same capabilities now that `unstorage` runs beside `memory`. A `mountx.*`
   requirement is dropped from the "capabilities lost" table (not from the per-case
   rows): the suite reaches an extension by name through `fs.mountx`, and whether a
-  column's client offers that name is a fact about the client. Two do — the loopback
-  column directly, and the 9P one because `Tmknod` carries the whole `mode` and
-  `p9Driver.mountx.mknod` hands it over unchanged, so the special-files cases run
-  there against the memory targets. The rest skip for their own reasons: FUSE's
+  column's client offers that name is a fact about the client. Four do — the loopback
+  column directly, the 9P one because `Tmknod` carries the whole `mode` and
+  `p9Driver.mountx.mknod` hands it over unchanged, and both NFS ones because MKNOD
+  (§3.3.11) and CREATE (§18.4) are operations their clients can call by name — so the
+  special-files cases run there against the memory targets. The two that do not: FUSE's
   client is `node:fs`, which cannot `mknod(2)` (its column covers special files by
-  its own case and by pjdfstest instead); NFSv3 and NFSv4.1 put the file type in
-  `ftype3`/`nfs_ftype4` rather than in the mode, so a client there cannot offer the
-  whole extension without deciding part of it itself; S3 cannot name a FIFO. All
-  four sessions carry `mknod` either way.
+  its own case and by pjdfstest instead), and S3 cannot name a FIFO at all. All four
+  sessions carry `mknod` either way.
+- A column may carry _part_ of an extension, which `capabilities.extensions` cannot
+  express: `ConformanceTarget.carries` is that, and `Carried` has one member,
+  `mknod.anyType`. NFSv3 and NFSv4.1 put the file type in `ftype3`/`nfs_ftype4` and
+  leave the mode carrying permission bits only, so a mode naming a regular file, a
+  directory or no type at all is a question neither wire can ask — and answering it in
+  the client would be the client inventing an errno the driver should have produced
+  (invariant 5). The two cases needing it are gated on `mknod.anyType`, both NFS targets
+  declare `carries: []`, and the adapters throw a plain, deliberately non-errno-shaped
+  `Error` for those types so that un-gating a case fails loudly instead of passing for
+  the wrong reason. Unset means carried whole, so nothing else had to change.
 
 ## Per area
 
