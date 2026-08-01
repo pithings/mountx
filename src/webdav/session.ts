@@ -164,7 +164,7 @@ import {
 } from "../http.ts";
 import { basename, dirname, isPathInside, joinPath } from "../path.ts";
 import type { FileHandleLike, FsDriver, StatsLike } from "../types.ts";
-import type { XmlNode } from "../s3/xml.ts";
+import type { XmlNode } from "../xml.ts";
 import {
   ALLOW_HEADER,
   COLLECTION_CONTENT_TYPE,

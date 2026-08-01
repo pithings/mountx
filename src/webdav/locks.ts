@@ -82,7 +82,7 @@
 
 import { randomUUID } from "node:crypto";
 import { isPathInside } from "../path.ts";
-import type { XmlNode } from "../s3/xml.ts";
+import type { XmlNode } from "../xml.ts";
 import {
   DEFAULT_LOCK_TIMEOUT_SECONDS,
   LOCK_TOKEN_PREFIX,

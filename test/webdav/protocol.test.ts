@@ -49,7 +49,7 @@ import {
   submittedTokens,
   supportedLockNode,
 } from "../../src/webdav/protocol.ts";
-import { xmlDocument } from "../../src/s3/xml.ts";
+import { xmlDocument } from "../../src/xml.ts";
 
 /** The status a call refused with, or `undefined` if it did not refuse. */
 function refusedWith(fn: () => unknown): number | undefined {

@@ -25,7 +25,7 @@
  * and the default form is what the shared encoder produces without a second
  * spelling of every element name.
  *
- * Coming in, the XML parser this module borrows (`src/s3/xml.ts`) reports an
+ * Coming in, the XML parser this module borrows (`src/xml.ts`) reports an
  * element's **local name** and drops its prefix, which is exactly right for the
  * grammar — `<D:propfind>` and `<a:propfind>` are one element — and lossy for
  * one thing: a requested property in some *other* namespace, which Finder and
@@ -37,7 +37,7 @@
  */
 
 import { normalizePath, splitPath } from "../path.ts";
-import { parseXml, XmlError, xmlDocument, type XmlNode } from "../s3/xml.ts";
+import { parseXml, XmlError, xmlDocument, type XmlNode } from "../xml.ts";
 import { DAV_NS, MAX_XML_BYTES, statusLine, statusOf, XML_CONTENT_TYPE } from "./constants.ts";
 import { DavLockTable, type DavLock } from "./locks.ts";
 
