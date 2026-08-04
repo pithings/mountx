@@ -1374,6 +1374,20 @@ describe("version negotiation over the wire", () => {
     expectHealthy(session);
   });
 
+  it("serves a kernel whose minor is below our own", async () => {
+    // Regression: the `INIT` reply was encoded with no protocol context, which
+    // `encodeReplyBody` reads as 7.41, and `encodeInitOut` refuses a context
+    // that disagrees with the `minor` in the value — so *every* handshake that
+    // settled below 7.41 came back `-EIO` and the mount never started.
+    const { session, kernel } = makeSession();
+    const reply = await kernel.init({ minor: 34 });
+    expect(reply.minor).toBe(34);
+    expect(session.protocol?.minor).toBe(34);
+    const entry = await kernel.mkdir(FUSE_ROOT_ID, "d");
+    expect(entry.nodeid).not.toBe(0n);
+    expectHealthy(session);
+  });
+
   it("refuses a kernel older than 7.0", async () => {
     const { session, kernel } = makeSession();
     const reply = await kernel.raw(FUSE_INIT, {

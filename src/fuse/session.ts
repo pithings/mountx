@@ -920,10 +920,20 @@ export class FuseSession {
     if (negotiation.status === "ok") {
       this.#negotiated = negotiation.session;
     }
-    // A `retry` reply is deliberately encoded with no context: the session has
-    // not agreed on a version yet, and `encodeInitOut` sizes itself from the
-    // `minor` it carries.
-    return encodeReplyFor(unique, FUSE_INIT, negotiation.reply);
+    // `fuse_init_out` is the one struct that carries the version it is laid out
+    // at, so it is encoded at **its own** `minor` — including a `retry`, where
+    // the session has agreed on nothing yet.
+    //
+    // Handing that over explicitly rather than as `undefined` is what makes an
+    // older kernel work at all: `encodeReplyBody` substitutes
+    // `DEFAULT_PROTOCOL` (7.41) for a missing context, and `encodeInitOut`
+    // refuses a context that disagrees with the value — so every negotiation
+    // that settled below 7.41 threw, and became an `-EIO` on the handshake.
+    // `setxattrExt` is irrelevant to this struct and false in the retry case.
+    return encodeReplyFor(unique, FUSE_INIT, negotiation.reply, {
+      minor: negotiation.reply.minor,
+      setxattrExt: negotiation.status === "ok" && negotiation.session.setxattrExt,
+    });
   }
 
   // -------------------------------------------------------------------------
