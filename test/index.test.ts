@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, stat as nodeStat } from "node:fs/promises";
+import { mkdtemp, readFile, rename as nodeRename, rm, stat as nodeStat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -21,7 +21,7 @@ import {
   resolvePath,
   splitPath,
 } from "../src/index.ts";
-import type { ErrnoCode, FsDriver, StatsLike } from "../src/index.ts";
+import type { ErrnoCode, FsDriver, FsError, StatsLike } from "../src/index.ts";
 import { claimNewEntry, newEntryOwnership } from "../src/ownership.ts";
 
 describe("every entry point runs under node's type stripping", () => {
@@ -319,6 +319,80 @@ describe("errors", () => {
     expect(ours.code).toBe((real as NodeJS.ErrnoException).code);
     expect(ours.errno).toBe((real as NodeJS.ErrnoException).errno);
     expect(ours.message).toBe((real as Error).message);
+  });
+
+  /**
+   * The sibling rule to invariant 4: an `FsError` has to be
+   * indistinguishable from what `node:fs` throws, field by field — not just
+   * on the three fields the test above compares. This is the one that pins
+   * the shape `fsError()` builds a stackless error into, since dropping the
+   * frames is the only place it deliberately differs from `node:fs`.
+   */
+  it("is indistinguishable from a node:fs error, property by property", async () => {
+    const path = "/definitely/not/here";
+    const dest = "/nope/x";
+    const real = (await nodeRename(path, dest).catch((error: unknown) => error)) as FsError;
+    const ours = fsError("ENOENT", { syscall: "rename", path, dest });
+
+    // Same prototype, same class, same name — through every predicate that
+    // asks: `instanceof`, `Object.prototype.toString`, and the `name` that is
+    // inherited rather than owned.
+    expect(ours).toBeInstanceOf(Error);
+    expect(Object.getPrototypeOf(ours)).toBe(Object.getPrototypeOf(real));
+    expect(Object.prototype.toString.call(ours)).toBe(Object.prototype.toString.call(real));
+    expect(ours.name).toBe(real.name);
+    expect(Object.hasOwn(ours, "name")).toBe(Object.hasOwn(real, "name"));
+
+    // Same own properties, in the same order, with the same descriptors —
+    // which is what a spread, `Object.keys()` and `JSON.stringify()` read.
+    expect(Object.getOwnPropertyNames(ours)).toEqual(Object.getOwnPropertyNames(real));
+    expect(Object.keys(ours)).toEqual(Object.keys(real));
+    expect({ ...ours }).toEqual({ ...real });
+    for (const key of Object.getOwnPropertyNames(real)) {
+      const mine = Object.getOwnPropertyDescriptor(ours, key)!;
+      const theirs = Object.getOwnPropertyDescriptor(real, key)!;
+      expect(typeof mine.get, key).toBe(typeof theirs.get);
+      expect(typeof mine.set, key).toBe(typeof theirs.set);
+      expect(mine.enumerable, key).toBe(theirs.enumerable);
+      expect(mine.configurable, key).toBe(theirs.configurable);
+      expect(mine.writable, key).toBe(theirs.writable);
+    }
+    for (const key of ["message", "code", "errno", "syscall", "path", "dest"] as const) {
+      expect(ours[key], key).toBe(real[key]);
+    }
+  });
+
+  /**
+   * `fsError()` skips the frame capture for the codes a mount answers as a
+   * matter of course, so `.stack` on one of those is the `Error:` line alone.
+   * It is still a string, still starts with the same line `node:fs` would
+   * print, and every other code still names the throw site.
+   */
+  it("keeps a readable stack, with frames wherever a fault is possible", () => {
+    const expected = fsError("ENOENT", { syscall: "stat", path: "/missing" });
+    expect(typeof expected.stack).toBe("string");
+    expect(expected.stack).toBe("Error: ENOENT: no such file or directory, stat '/missing'");
+
+    const fault = fsError("EIO", { syscall: "read", path: "/disk" });
+    expect(fault.stack?.startsWith("Error: EIO: i/o error, read '/disk'\n    at ")).toBe(true);
+    // The frames name this file, not `src/errors.ts`'s internals only.
+    expect(fault.stack).toContain("index.test.ts");
+
+    // A writable `stack`, as node's is — some loggers replace it.
+    expected.stack = "replaced";
+    expect(expected.stack).toBe("replaced");
+  });
+
+  it("leaves Error.stackTraceLimit alone", () => {
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 3;
+    try {
+      fsError("ENOENT");
+      expect(Error.stackTraceLimit).toBe(3);
+      expect(new Error("after").stack?.split("\n").length).toBe(4);
+    } finally {
+      Error.stackTraceLimit = limit;
+    }
   });
 
   it("builds messages the way node does", () => {

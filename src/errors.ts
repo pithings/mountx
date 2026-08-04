@@ -117,12 +117,41 @@ export interface FsErrorOptions {
 }
 
 /**
+ * The codes that are an *answer* rather than a fault, and so are built without
+ * a stack trace.
+ *
+ * Collecting the frames is almost the whole cost of an error object — V8 walks
+ * the stack eagerly in the `Error` constructor and only formats it lazily — and
+ * on a mount the overwhelming majority of errors are these three, thrown at a
+ * client that asked a question whose answer is "no": a `LOOKUP` probing a name
+ * before creating it (`ENOENT`), or a capability this server does not have
+ * (`ENOTSUP`/`ENOSYS`, invariant 5's answer). Nothing reads their stacks,
+ * because there is no bug for a stack to point at.
+ *
+ * Every other code keeps a full stack, which is the point of the list being
+ * short: an `EIO` or an `EINVAL` *is* a fault, and that is where the frames
+ * earn what they cost.
+ *
+ * The object stays a real `Error` either way — same prototype, same own
+ * properties in the same order, same lazily-formatted own `stack` accessor V8
+ * installs. `stack` reads as the `Error: <message>` line with no frames under
+ * it, exactly as it would with a caller's `Error.stackTraceLimit = 0`.
+ */
+const STACKLESS_CODES: ReadonlySet<string> = new Set<ErrnoCode>(["ENOENT", "ENOTSUP", "ENOSYS"]);
+
+/**
  * Create an error indistinguishable from the one `node:fs` throws.
  *
  * ```ts
  * throw fsError("ENOENT", { syscall: "stat", path: "/missing" });
  * // ENOENT: no such file or directory, stat '/missing'
  * ```
+ *
+ * The fields are assigned in `node:fs`'s own order — `errno` before `code` —
+ * because own-property order is observable through `Object.keys()`, a spread
+ * and `JSON.stringify()`, and "indistinguishable" has to survive those too.
+ * See {@link STACKLESS_CODES} for the one thing that is deliberately cheaper
+ * here than in `node:fs`.
  */
 export function fsError(code: ErrnoCode, options: FsErrorOptions = {}): FsError {
   let message = options.message;
@@ -138,12 +167,24 @@ export function fsError(code: ErrnoCode, options: FsErrorOptions = {}): FsError 
       message += ` -> '${options.dest}'`;
     }
   }
-  const error = new Error(
-    message,
-    options.cause === undefined ? undefined : { cause: options.cause },
-  ) as FsError;
-  error.code = code;
+  const cause = options.cause === undefined ? undefined : { cause: options.cause };
+  let error: FsError;
+  if (STACKLESS_CODES.has(code)) {
+    // Restored in `finally` rather than after the call: leaving the limit at
+    // zero would silently strip the stack off every error in the process, and
+    // that is too big a failure to hang on this never throwing.
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    try {
+      error = new Error(message, cause) as FsError;
+    } finally {
+      Error.stackTraceLimit = limit;
+    }
+  } else {
+    error = new Error(message, cause) as FsError;
+  }
   error.errno = -ERRNO_CODES[code];
+  error.code = code;
   if (options.syscall !== undefined) {
     error.syscall = options.syscall;
   }
