@@ -114,6 +114,7 @@ import("node:fs/promises")` must compile with no cast.
 | `pnpm mountx`                                  | the CLI from source; `--help` for flags                                  | no        |
 | `pnpm matrix`                                  | regenerate `.agents/conformance-matrix.md`                               | no        |
 | `pnpm bench` / `:root` / `:9p`                 | loopback + NFS columns / the FUSE column / the 9P column                 | no / sudo |
+| `pnpm bench:bun`                               | `bun install` on every mounting transport + a CPU profile per column     | sudo      |
 | `pnpm fmt` / `pnpm lint` / `pnpm build`        | `automd`+`oxlint`+`oxfmt` / check / `obuild`                             | no        |
 
 Every Tier-2 file skips itself when the host cannot mount (`nfsClientProbe()`,

@@ -91,6 +91,26 @@ not match proto= option`, exit 32, 4 failed. Reproduced with
   on its own — a loaded module without the userland helper is a state it does not
   distinguish — and `pnpm test:root` is red on this host until one of the two is
   addressed.
+- **What that refusal actually is, and the one option that fixes it (verified
+  2026-08-03).** `mount(8)` hands an NFS mount to the `mount.nfs` helper when
+  there is one, and the helper is what resolves `host:/path` into the `addr=`
+  option the kernel wants. With no helper installed, util-linux goes straight to
+  `fsconfig()` with the options as written, the kernel has no server address to
+  match `proto=tcp` against, and refuses with exactly the message above.
+  **Adding `addr=127.0.0.1` to `-o` is the whole fix on this host**, and both
+  versions then mount, list and write against `mountx/nfs`:
+
+  ```sh
+  mount -i -t nfs -o vers=3,proto=tcp,port=$P,mountport=$P,nolock,soft,addr=127.0.0.1 127.0.0.1:/ $MNT
+  mount -i -t nfs -o vers=4.1,proto=tcp,port=$P,soft,addr=127.0.0.1 127.0.0.1:/ $MNT   # lands as type nfs4
+  ```
+
+  `bench/bun-install.ts` passes it through `mountOptions` — and only when no
+  `mount.nfs` exists on the usual paths, since a host that has the helper builds
+  its own `addr=`. Whether `src/nfs/mount.ts` should emit it itself in the
+  helper-less case is an open question, not a decision this note makes: it is
+  the kind of thing that wants a Tier-2 run on a host that _does_ have
+  `nfs-common` before it ships.
 
 ## 9P mounting (verified 2026-07-29, this Linux host)
 
