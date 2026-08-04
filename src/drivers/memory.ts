@@ -7,7 +7,7 @@
  */
 
 import { fsError } from "../errors.ts";
-import { isPathInside, joinPath, normalizePath, resolvePath, splitPath } from "../path.ts";
+import { isPathInside, joinPath, normalizePath, splitPath } from "../path.ts";
 import type { OpenFlags } from "./handle.ts";
 import { parseOpenFlags, resizeBytes, validatePosition, validateRange } from "./handle.ts";
 import type {
@@ -203,12 +203,43 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
 
   // --- path resolution ---
 
+  /**
+   * Resolve a path to the directory holding its final component.
+   *
+   * The scan is over the *string*, one `indexOf` at a time, rather than over
+   * `resolvePath`'s segment array — same components in the same order, and the
+   * array is what it costs. Installs resolve six-to-nine-component paths from
+   * the root on every operation, so that array was allocated (with a substring
+   * per component to fill it) millions of times and read exactly once each:
+   * `resolvePath` was 2.3–2.5% of the FUSE column's non-idle CPU and 33% of the
+   * loopback ceiling's `stat walk`, all of it allocation. Dropping it measured
+   * +34% on `stat walk`, +21% on `stat` and +33% on `stat ×64` (`pnpm bench`,
+   * five runs each).
+   *
+   * A cache keyed on the parent directory's path was written and measured on
+   * top of this, and is deliberately *not* here: over the scan it added +0.5%
+   * to +3% on the same scenarios — inside the run-to-run spread — and cost the
+   * FUSE column CPU rather than saving any. What it bought instead was a stale
+   * entry whenever a directory left the tree, and with both of its invalidation
+   * points deleted the whole repository still passed. The tests that would have
+   * caught it are in `test/memory.test.ts` under "path resolution".
+   */
   function walk(path: string, follow: boolean, syscall: string, depth = 0): Entry {
-    const { path: normalized, segments } = resolvePath(path);
+    const normalized = normalizePath(path);
+    if (normalized === "/") {
+      return { parent: root, name: "", node: root, path: "/" };
+    }
+    // `normalized` is absolute with no empty, `.` or `..` segment, so every
+    // component is the text between one `/` and the next or the end.
     let directory = root;
-    for (let index = 0; index < segments.length; index++) {
-      const name = segments[index]!;
-      const last = index === segments.length - 1;
+    let start = 1;
+    for (;;) {
+      let end = normalized.indexOf("/", start);
+      const last = end === -1;
+      if (last) {
+        end = normalized.length;
+      }
+      const name = normalized.slice(start, end);
       if (!isDirectory(directory)) {
         throw fsError("ENOTDIR", { syscall, path: normalized });
       }
@@ -231,17 +262,20 @@ export function createMemoryDriver(options: MemoryDriverOptions = {}): MemoryDri
           // make the link a live alias for the directory it sits in.
           throw fsError("ENOENT", { syscall, path: normalized });
         }
+        // Everything before this component, then the target, then everything
+        // after it — `walk` normalizes what it is handed, which is what clamps
+        // a `..` in the target at the root.
         const base = target.startsWith("/")
           ? target
-          : `/${segments.slice(0, index).join("/")}/${target}`;
-        return walk(joinPath(base, ...segments.slice(index + 1)), follow, syscall, depth + 1);
+          : `${normalized.slice(0, start - 1)}/${target}`;
+        return walk(base + normalized.slice(end), follow, syscall, depth + 1);
       }
       if (last) {
         return { parent: directory, name, node, path: normalized };
       }
       directory = node;
+      start = end + 1;
     }
-    return { parent: root, name: "", node: root, path: "/" };
   }
 
   function resolve(path: string, follow: boolean, syscall: string): MemNode {

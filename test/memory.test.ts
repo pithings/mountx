@@ -118,6 +118,222 @@ describe("memory driver", () => {
     }
   });
 
+  // --- path resolution ---
+  //
+  // All of these ask one question: can a path resolve to something the tree no
+  // longer says it names? They exist because `walk` is where every optimization
+  // of this driver has wanted to go — it scans the path string rather than
+  // splitting it, and a *cache* keyed on the parent directory was written and
+  // measured on top of that (see `walk`'s comment for why it did not stay).
+  //
+  // What made them necessary is worth recording: with that cache in place and
+  // both of its invalidation points deleted outright, the entire repository
+  // stayed green — this file, `test/conformance.ts` and every transport suite,
+  // 3,270 tests. Nothing here reached a path whose prefix had moved. So these
+  // are not redundant with the suites above them, and a future attempt at the
+  // same optimization should be run against them first.
+
+  it("does not resolve a renamed directory under its old name, however deep", async () => {
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/a/b/c/d", { recursive: true });
+    await fs.writeFile("/a/b/c/d/f", "one");
+    // Resolve it once first: anything that remembers a prefix remembers it here.
+    expect(new TextDecoder().decode(await fs.readFile("/a/b/c/d/f"))).toBe("one");
+
+    await fs.rename("/a/b", "/a/z");
+    // The old name resolves to nothing at all — not to the subtree it used to
+    // reach — and the new one reaches every level of it.
+    await expect(fs.stat("/a/b/c/d/f")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat("/a/b/c/d")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(new TextDecoder().decode(await fs.readFile("/a/z/c/d/f"))).toBe("one");
+
+    // ...and a write through the old name must not land in the detached node.
+    await expect(fs.writeFile("/a/b/c/d/g", "x")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not resolve a directory that was removed and made again", async () => {
+    // The nastiest shape this can take: the replacement is a *different* node
+    // at the same path, so resolving the old one does not fail — it writes into
+    // a directory nothing can reach any more.
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/d/sub", { recursive: true });
+    await fs.writeFile("/d/sub/f", "one");
+    await fs.unlink("/d/sub/f");
+    await fs.rmdir("/d/sub");
+    await fs.mkdir("/d/sub");
+
+    await fs.writeFile("/d/sub/f", "two");
+    expect((await fs.readdir("/d/sub", { withFileTypes: true })).map((e) => e.name)).toEqual(["f"]);
+    expect(new TextDecoder().decode(await fs.readFile("/d/sub/f"))).toBe("two");
+  });
+
+  it("says ENOTDIR through a directory that a file has replaced", async () => {
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/d/sub", { recursive: true });
+    await fs.writeFile("/d/sub/f", "one");
+    await fs.unlink("/d/sub/f");
+    await fs.rmdir("/d/sub");
+    await fs.writeFile("/d/sub", "now a file");
+    // `ENOTDIR`, not the `ENOENT` a remembered directory node would answer.
+    await expect(fs.stat("/d/sub/f")).rejects.toMatchObject({ code: "ENOTDIR" });
+  });
+
+  it("does not resolve a path through a symlink that has been repointed", async () => {
+    // `walk` restarts on a rewritten path the moment a prefix component is a
+    // symlink, so the second half of a path is re-resolved from the target
+    // every time. This is the arithmetic that splices the two halves together.
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/one/deep", { recursive: true });
+    await fs.mkdir("/two/deep", { recursive: true });
+    await fs.writeFile("/one/deep/f", "one");
+    await fs.writeFile("/two/deep/f", "two");
+    await fs.symlink("/one", "/link");
+    expect(new TextDecoder().decode(await fs.readFile("/link/deep/f"))).toBe("one");
+
+    await fs.unlink("/link");
+    await fs.symlink("/two", "/link");
+    expect(new TextDecoder().decode(await fs.readFile("/link/deep/f"))).toBe("two");
+
+    // ...and the same when the *target* directory moves out from under it.
+    await fs.rename("/two/deep", "/two/moved");
+    await expect(fs.stat("/link/deep/f")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(new TextDecoder().decode(await fs.readFile("/link/moved/f"))).toBe("two");
+  });
+
+  it("keeps hard links to one node reachable under every name after a rename", async () => {
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/a/b", { recursive: true });
+    await fs.writeFile("/a/b/f", "one");
+    await fs.link("/a/b/f", "/a/b/g");
+    await fs.link("/a/b/f", "/elsewhere");
+    const ino = (await fs.stat("/a/b/f")).ino;
+
+    await fs.rename("/a/b", "/a/c");
+    expect((await fs.stat("/a/c/f")).ino).toBe(ino);
+    expect((await fs.stat("/a/c/g")).ino).toBe(ino);
+    expect((await fs.stat("/elsewhere")).ino).toBe(ino);
+    expect((await fs.stat("/elsewhere")).nlink).toBe(3);
+    await expect(fs.stat("/a/b/g")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("tells two directories apart by case, and clamps `..` at the root", async () => {
+    const fs = createLoopback(createMemoryDriver());
+    await fs.mkdir("/Dir");
+    await fs.mkdir("/dir");
+    await fs.writeFile("/Dir/f", "upper");
+    await fs.writeFile("/dir/f", "lower");
+    expect(new TextDecoder().decode(await fs.readFile("/Dir/f"))).toBe("upper");
+    expect(new TextDecoder().decode(await fs.readFile("/dir/f"))).toBe("lower");
+
+    // A `..` path is not in normalized form, so it takes the walk — and both
+    // routes have to agree, including where `..` runs out of tree.
+    expect(new TextDecoder().decode(await fs.readFile("/dir/../Dir/f"))).toBe("upper");
+    expect((await fs.stat("/Dir/../../../dir")).ino).toBe((await fs.stat("/dir")).ino);
+    expect((await fs.stat("/dir/..")).ino).toBe((await fs.stat("/")).ino);
+  });
+
+  it("resolves the earliest of thousands of directories after all the rest", async () => {
+    // A wide root rather than a deep one: whatever `walk` remembers between
+    // calls, this asks for the earliest paths again after thousands of others
+    // have been resolved in between.
+    const fs = createLoopback(createMemoryDriver());
+    const count = 5000;
+    for (let index = 0; index < count; index += 1) {
+      await fs.mkdir(`/d-${index}`);
+      await fs.writeFile(`/d-${index}/f`, String(index));
+    }
+    for (const index of [0, 1, 2, count - 2, count - 1]) {
+      expect(new TextDecoder().decode(await fs.readFile(`/d-${index}/f`))).toBe(String(index));
+    }
+  });
+
+  it("resolves a path the same way whichever form it arrives in", async () => {
+    // Random mutations with a check after each, in the shape of the `nlink`
+    // test above. Every path is asked for twice: once already normalized, which
+    // is the form `walk` scans straight through, and once written so that it is
+    // not (`//./a/./b`) and has to be normalized first. The two must agree on
+    // the node *and* on the errno, after every step.
+    //
+    // Two details are what give it teeth, and both were found by breaking the
+    // driver on purpose and watching an earlier version of this pass anyway:
+    //
+    // - It drives the **driver**, not `createLoopback`. The harness normalizes
+    //   every path before the driver sees one, so through it the long way round
+    //   arrives as the short way round and both routes are the same route.
+    // - The two passes are separate loops, not one interleaved loop. Anything
+    //   `walk` might remember, the second pass would refresh — so all the
+    //   short-form answers are taken before any long-form one is.
+    //
+    // Against the parent cache `walk` was measured with and did not keep, this
+    // found a stale entry within ~140 steps on every seed tried.
+    const driver = createMemoryDriver();
+    const rng = new Rng(0x70_61_72_65);
+    const names = ["a", "b", "c", "z"];
+    const paths = ["/a", "/z", "/a/b", "/a/b/c", "/z/c", "/a/c/b", "/z/a/c/b"];
+    const pick = <T>(from: readonly T[]): T => from[rng.int(from.length)]!;
+    const outcome = async (path: string): Promise<string> => {
+      try {
+        const stats = await driver.lstat(path);
+        return `ino ${stats.ino} mode ${stats.mode.toString(8)}`;
+      } catch (error) {
+        return `error ${(error as { code?: string }).code}`;
+      }
+    };
+    // `//./a/./b` normalizes to `/a/b`, and `isNormalizedPath` refuses it — so
+    // it is the same path, obliged to take the walk.
+    const theLongWay = (path: string): string => `/${path.replaceAll("/", "/./")}`;
+
+    for (let step = 0; step < 500; step += 1) {
+      const path = pick(paths);
+      // Sometimes a top-level destination, so that a *non-empty* directory gets
+      // renamed out from under a remembered path — the one shape that leaves a
+      // stale entry holding children rather than merely holding nothing.
+      const other = rng.int(2) === 0 ? `/${pick(names)}` : `${pick(paths)}/${pick(names)}`;
+      try {
+        switch (rng.int(7)) {
+          case 0: {
+            await driver.mkdir(path, { recursive: true });
+            break;
+          }
+          case 1: {
+            await driver.rmdir(path);
+            break;
+          }
+          case 2: {
+            await (await driver.open(path, "w", 0o666)).close();
+            break;
+          }
+          case 3: {
+            await driver.unlink(path);
+            break;
+          }
+          case 4: {
+            await driver.symlink(pick(paths), path);
+            break;
+          }
+          case 5: {
+            await driver.link(path, other);
+            break;
+          }
+          default: {
+            await driver.rename(path, other);
+          }
+        }
+      } catch {
+        // Most steps fail, and a failed one must not move the map either.
+      }
+      const cached: string[] = [];
+      for (const candidate of paths) {
+        cached.push(await outcome(candidate));
+      }
+      const walked: string[] = [];
+      for (const candidate of paths) {
+        walked.push(await outcome(theLongWay(candidate)));
+      }
+      expect([step, ...cached]).toEqual([step, ...walked]);
+    }
+  });
+
   it("accounts for used blocks in statfs", async () => {
     const fs = createLoopback(createMemoryDriver());
     const before = await fs.statfs("/");
