@@ -64,6 +64,7 @@
   "scripts": {
     "bench": "node bench/index.ts",
     "bench:9p": "sudo env UV_THREADPOOL_SIZE=32 \"$(command -v node)\" bench/9p.ts",
+    "bench:bun": "sudo env UV_THREADPOOL_SIZE=32 MOUNTX_BENCH_BUN=\"$(command -v bun)\" MOUNTX_BENCH_HOME=\"$HOME\" \"$(command -v node)\" bench/bun-install.ts",
     "bench:root": "sudo env UV_THREADPOOL_SIZE=32 \"$(command -v node)\" bench/fuse.ts",
     "build": "obuild",
     "build:native": "node native/build.ts",

@@ -29,7 +29,7 @@ import type { FuseSession } from "../src/fuse/session.ts";
 import { mount, type MountOptions, unmountAll } from "../src/fuse/mount.ts";
 import { createLoopback } from "../src/harness.ts";
 import { drive } from "./drive.ts";
-import { report, type Measurement } from "./harness.ts";
+import { report, sampleRate, type Measurement, type RateSample } from "./harness.ts";
 import { CORE, FULL_FUSE, populateCold } from "./scenarios.ts";
 
 interface Variant {
@@ -122,32 +122,8 @@ const VARIANTS: Variant[] = [
  * caches are warm. Sampling the counter is the only way to say what the
  * transport itself sustained.
  */
-function trackRequests(session: FuseSession): { stop: () => { peak: number; total: number } } {
-  const window = 250;
-  const start = session.stats.requests;
-  let last = start;
-  // The *measured* interval, not the requested one: a timer that fires late
-  // — and one competing with a read/reply loop will — would otherwise have its
-  // extra requests divided by a window it did not actually take.
-  let since = process.hrtime.bigint();
-  let peak = 0;
-  const timer = setInterval(() => {
-    const now = session.stats.requests;
-    const at = process.hrtime.bigint();
-    const elapsedMs = Number(at - since) / 1e6;
-    if (elapsedMs > 0) {
-      peak = Math.max(peak, ((now - last) * 1000) / elapsedMs);
-    }
-    last = now;
-    since = at;
-  }, window);
-  timer.unref();
-  return {
-    stop: () => {
-      clearInterval(timer);
-      return { peak: Math.round(peak), total: session.stats.requests - start };
-    },
-  };
+function trackRequests(session: FuseSession): { stop: () => RateSample } {
+  return sampleRate(() => session.stats.requests);
 }
 
 async function main(): Promise<void> {

@@ -15,6 +15,11 @@ tsconfig.tsbuildinfo
 *.log*
 *.env*
 
+# `pnpm bench:bun` writes one of these per run, next to the summary it prints.
+# It is a recording of one machine on one afternoon, and it is a third of a
+# megabyte; what is worth keeping from a profiling run is the conclusion.
+*.cpuprofile
+
 # pjdfstest: the suite is cloned and built on demand (test/pjdfstest/run.sh),
 # pinned to a commit there. Only the analysis is committed.
 test/pjdfstest/pjdfstest

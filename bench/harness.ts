@@ -139,7 +139,53 @@ export async function measure(spec: BenchSpec): Promise<Measurement> {
   return measurement;
 }
 
-interface HostInfo {
+/**
+ * Peak and total of a counter that only ever goes up, sampled on a timer.
+ *
+ * The counters worth watching during a benchmark — a session's request count,
+ * most of all — say nothing about *rate* on their own, and a rate is what a
+ * transport is judged on. Sampling one is the only way to say what it sustained
+ * while something else was driving it.
+ */
+export interface RateSample {
+  /** Highest per-second rate seen in any one window. */
+  peak: number;
+  /** How far the counter moved in total. */
+  total: number;
+}
+
+/**
+ * Watch `read()` on a timer until `stop()`.
+ *
+ * The window is the **measured** interval, not the requested one: a timer that
+ * fires late — and one competing with a read/reply loop will — would otherwise
+ * have its extra counts divided by a window it did not actually take.
+ */
+export function sampleRate(read: () => number, windowMs = 250): { stop: () => RateSample } {
+  const start = read();
+  let last = start;
+  let since = process.hrtime.bigint();
+  let peak = 0;
+  const timer = setInterval(() => {
+    const now = read();
+    const at = process.hrtime.bigint();
+    const elapsedMs = Number(at - since) / 1e6;
+    if (elapsedMs > 0) {
+      peak = Math.max(peak, ((now - last) * 1000) / elapsedMs);
+    }
+    last = now;
+    since = at;
+  }, windowMs);
+  timer.unref();
+  return {
+    stop: () => {
+      clearInterval(timer);
+      return { peak: Math.round(peak), total: read() - start };
+    },
+  };
+}
+
+export interface HostInfo {
   os: string;
   kernel: string;
   cpus: number;
@@ -155,7 +201,7 @@ interface HostInfo {
  * A benchmark without its host is a number without a unit, and the README will
  * be quoting these — so the host goes into the JSON *and* the markdown.
  */
-function hostInfo(): HostInfo {
+export function hostInfo(): HostInfo {
   const cores = cpus();
   return {
     os: type(),
@@ -168,35 +214,42 @@ function hostInfo(): HostInfo {
   };
 }
 
-function fixed(value: number, digits = 2): string {
+/** Thousands separated above 1000, `digits` decimals below it. */
+export function fixed(value: number, digits = 2): string {
   if (!Number.isFinite(value)) {
     return "—";
   }
   return value >= 1000 ? Math.round(value).toLocaleString("en-US") : value.toFixed(digits);
 }
 
-/** A human-readable table, one row per measurement. */
-function formatTable(results: readonly Measurement[]): string {
-  const header = ["scenario", "variant", "ops/sec", "rate", "p50 ms", "p99 ms", "n"];
-  const rows = results.map((result) => [
-    result.scenario,
-    result.variant,
-    fixed(result.opsPerSec),
-    result.rate === undefined ? "" : `${fixed(result.rate.value)} ${result.rate.unit}`,
-    fixed(result.p50Ms, 3),
-    fixed(result.p99Ms, 3),
-    String(result.iterations),
-  ]);
+/** Column-aligned plain text, one line per row, header underlined. */
+export function table(header: readonly string[], rows: readonly string[][]): string {
   const widths = header.map((cell, column) =>
-    Math.max(cell.length, ...rows.map((row) => row[column]!.length)),
+    Math.max(cell.length, ...rows.map((row) => (row[column] ?? "").length)),
   );
-  const line = (cells: string[]): string =>
+  const line = (cells: readonly string[]): string =>
     cells
       .map((cell, column) => cell.padEnd(widths[column]!))
       .join("  ")
       .trimEnd();
   return [line(header), line(widths.map((width) => "-".repeat(width))), ...rows.map(line)].join(
     "\n",
+  );
+}
+
+/** A human-readable table, one row per measurement. */
+function formatTable(results: readonly Measurement[]): string {
+  return table(
+    ["scenario", "variant", "ops/sec", "rate", "p50 ms", "p99 ms", "n"],
+    results.map((result) => [
+      result.scenario,
+      result.variant,
+      fixed(result.opsPerSec),
+      result.rate === undefined ? "" : `${fixed(result.rate.value)} ${result.rate.unit}`,
+      fixed(result.p50Ms, 3),
+      fixed(result.p99Ms, 3),
+      String(result.iterations),
+    ]),
   );
 }
 
@@ -208,7 +261,7 @@ interface BenchReport {
 }
 
 /** Where `--json <path>` pointed, if anywhere. */
-function jsonTarget(argv: readonly string[]): string | undefined {
+export function jsonTarget(argv: readonly string[]): string | undefined {
   const index = argv.indexOf("--json");
   return index === -1 ? undefined : argv[index + 1];
 }
