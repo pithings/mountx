@@ -113,8 +113,8 @@ export type TimeLike = number | Date;
  * Transports adapt or answer `ENOTSUP`; silently faking a capability is how a
  * filesystem passes `ls` and corrupts data under `git`. Unset means "infer it"
  * (see `resolveCapabilities`), not "false" — except for `handles`,
- * `atomicRename` and `readOnly`, which no shape of a driver establishes and
- * which therefore default to `false` until they are claimed.
+ * `atomicRename`, `readOnly` and `durableWrites`, which no shape of a driver
+ * establishes and which therefore default to `false` until they are claimed.
  */
 export interface FsCapabilities {
   /** `open()` returns real per-open state that survives `unlink`. */
@@ -137,6 +137,41 @@ export interface FsCapabilities {
   statfs?: boolean;
   /** Every mutating operation answers `EROFS`. Never inferred — say it. */
   readOnly?: boolean;
+  /**
+   * A write is **durable when its promise resolves**: nothing is buffered past
+   * the resolution of `write()`/`truncate()`, so there is no error left for the
+   * driver to discover at `close(2)` time.
+   *
+   * This is a statement about *when a failure can still be learned about*, not
+   * about hardware — a memory driver satisfies it, and so does any driver whose
+   * `write()` resolves only once the bytes are wherever it keeps them. A driver
+   * that batches, queues or uploads in the background does **not**, however
+   * quickly it resolves.
+   *
+   * **Never inferred — declare it.** No shape of a driver establishes it: every
+   * driver has `write()` whether or not it defers the work behind it, and
+   * `sync`/`datasync` being present says the opposite of nothing (a driver with
+   * nothing to flush may still offer them as no-ops, as the memory driver
+   * does). Unclaimed means no, and the default behaviour is unchanged.
+   *
+   * What claiming it buys, today, is one thing on one transport: `mountx/fuse`
+   * stops answering `FLUSH`, the request the kernel sends on every `close(2)`
+   * of an open file. It is 12.8% of the requests in a `bun install` workload
+   * and the third-largest opcode by count. The trade is exactly the durability
+   * statement above: a `FLUSH` reply is a driver's one chance to report a
+   * deferred write failure to the process that closed the file, and a driver
+   * that has nothing deferred has nothing to report there. Claim it falsely and
+   * a write error is lost silently.
+   *
+   * Two things worth knowing before claiming it. The kernel ignores
+   * `FOPEN_NOFLUSH` — one of the two mechanisms for declining `FLUSH` — when
+   * `writeback_cache` was negotiated, so on a mount that turns that on the
+   * saving may simply not appear (mountx leaves it off by default). And the
+   * **semantics here are argued, not tested**: pjdfstest has no coverage for
+   * deferred `close(2)` errors, so no suite in this repository will catch a
+   * driver that claims this and should not have.
+   */
+  durableWrites?: boolean;
   /** Optional `mountx.*` extensions the driver implements. */
   extensions?: readonly (keyof MountxExtensions)[];
 }

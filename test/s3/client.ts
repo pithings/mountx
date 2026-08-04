@@ -830,6 +830,11 @@ export const S3_CAPABILITIES = {
   caseSensitive: true,
   statfs: false,
   readOnly: false,
+  // The one driver in this repository for which the answer is interesting:
+  // writes land in an open buffer and reach the bucket in the `PutObject` that
+  // `close()` sends, so a failure is discovered exactly at `close(2)` time.
+  // This is the shape of driver the FUSE session keeps answering `FLUSH` for.
+  durableWrites: false,
 } as const;
 
 export interface S3DriverOptions {

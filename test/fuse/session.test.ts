@@ -14,11 +14,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMemoryDriver } from "../../src/drivers/memory.ts";
 import { createNodeFsDriver } from "../../src/drivers/node-fs.ts";
 import { ERRNO_CODES } from "../../src/errors.ts";
+import { createLoopback } from "../../src/harness.ts";
 import {
   FATTR_ATIME,
   FATTR_MODE,
   FATTR_MTIME,
   FATTR_SIZE,
+  FOPEN_KEEP_CACHE,
+  FOPEN_NOFLUSH,
+  FUSE_FLUSH,
   FUSE_GETATTR,
   FUSE_INIT,
   FUSE_LOOKUP,
@@ -43,10 +47,15 @@ import {
   type FuseEntryOut,
   type FuseInitOut,
 } from "../../src/fuse/protocol.ts";
-import { createFuseSession, FuseSession, type FuseSessionOptions } from "../../src/fuse/session.ts";
+import {
+  createFuseSession,
+  DEFAULT_FLUSH_MECHANISM,
+  FuseSession,
+  type FuseSessionOptions,
+} from "../../src/fuse/session.ts";
 import { S_IFDIR, S_IFMT, S_IFREG, type FsDriver, type StatsLike } from "../../src/types.ts";
 import { withoutExtensions } from "../no-extensions.ts";
-import { KernelError, SyntheticKernel } from "./synthetic-kernel.ts";
+import { KernelError, SyntheticKernel, type RawReply } from "./synthetic-kernel.ts";
 
 /**
  * Flags handed to `kernel` are the **wire's** — `constants.ts`'s transcribed
@@ -1353,6 +1362,131 @@ describe("driver quirks", () => {
     const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
     expect(file.open.openFlags).toBe(0);
     expectHealthy(session);
+  });
+});
+
+/**
+ * `FLUSH`, and the two ways a driver that declares `durableWrites` can decline
+ * to be asked about it.
+ *
+ * The point of every case here is the *exactly*: neither mechanism may appear
+ * for a driver that has not claimed the capability, and neither may appear for
+ * the wrong mechanism — a mount that asked for `FOPEN_NOFLUSH` and got a
+ * `-ENOSYS` instead would be a different promise about `close(2)` than the one
+ * it made. Both are checked in both directions.
+ */
+describe("declining FLUSH", () => {
+  /** The memory driver, with the one claim this file is about added. */
+  function durableDriver(): FsDriver {
+    const base = createMemoryDriver();
+    return { ...base, capabilities: { ...base.capabilities, durableWrites: true } };
+  }
+
+  function flush(kernel: SyntheticKernel, nodeid: bigint, fh: bigint): Promise<RawReply> {
+    return kernel.raw(FUSE_FLUSH, { nodeid, body: { fh, lockOwner: 0n } });
+  }
+
+  it("answers FLUSH, with no FOPEN_NOFLUSH, when the capability is absent", async () => {
+    // Both mechanisms named explicitly: the option is not the opt-in, and on
+    // its own it must change nothing at all.
+    for (const flushMechanism of [undefined, "enosys", "noflush"] as const) {
+      const { session, kernel } = await mount(undefined, { flushMechanism });
+      const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+      expect(file.open.openFlags).toBe(FOPEN_KEEP_CACHE);
+      const reply = await flush(kernel, file.entry.nodeid, file.open.fh);
+      expect(reply.error).toBe(0);
+      expectHealthy(session);
+    }
+  });
+
+  it("answers -ENOSYS once the driver claims durableWrites", async () => {
+    const { session, kernel } = await mount(durableDriver(), { flushMechanism: "enosys" });
+    const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    // The other mechanism is not also applied: one lever, not two.
+    expect(file.open.openFlags).toBe(FOPEN_KEEP_CACHE);
+    const reply = await flush(kernel, file.entry.nodeid, file.open.fh);
+    expect(reply.error).toBe(-ERRNO_CODES.ENOSYS);
+    // Still a working file afterwards: this says nothing about the fh.
+    expect(await kernel.write(file.entry.nodeid, file.open.fh, 0, "still open")).toBe(10);
+    await kernel.release(file.entry.nodeid, file.open.fh);
+    expectHealthy(session);
+  });
+
+  it("is the default mechanism", async () => {
+    expect(DEFAULT_FLUSH_MECHANISM).toBe("enosys");
+    const { session, kernel } = await mount(durableDriver());
+    const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    expect(file.open.openFlags).toBe(FOPEN_KEEP_CACHE);
+    expect((await flush(kernel, file.entry.nodeid, file.open.fh)).error).toBe(-ERRNO_CODES.ENOSYS);
+    expectHealthy(session);
+  });
+
+  it("answers -ENOSYS for an unknown fh, where success would answer -EBADF", async () => {
+    // `-ENOSYS` is about the opcode, so it cannot be conditional on the fh:
+    // an `EBADF` here is not "unimplemented", and the kernel would go on
+    // sending `FLUSH` for the life of the mount.
+    const declined = await mount(durableDriver(), { flushMechanism: "enosys" });
+    expect((await flush(declined.kernel, FUSE_ROOT_ID, 4242n)).error).toBe(-ERRNO_CODES.ENOSYS);
+    expectHealthy(declined.session);
+
+    const answered = await mount();
+    expect((await flush(answered.kernel, FUSE_ROOT_ID, 4242n)).error).toBe(-ERRNO_CODES.EBADF);
+    expectHealthy(answered.session);
+  });
+
+  it("sets FOPEN_NOFLUSH on OPEN and CREATE, and on neither a directory nor FLUSH itself", async () => {
+    const { session, kernel } = await mount(durableDriver(), { flushMechanism: "noflush" });
+    const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    expect(file.open.openFlags).toBe(FOPEN_KEEP_CACHE | FOPEN_NOFLUSH);
+    await kernel.release(file.entry.nodeid, file.open.fh);
+
+    const opened = await kernel.open(file.entry.nodeid, O_RDWR);
+    expect(opened.openFlags).toBe(FOPEN_KEEP_CACHE | FOPEN_NOFLUSH);
+    // The kernel decides on its own not to send `FLUSH`; if one arrives anyway
+    // — an older kernel, or `writeback_cache` — it is still answered.
+    expect((await flush(kernel, file.entry.nodeid, opened.fh)).error).toBe(0);
+    await kernel.release(file.entry.nodeid, opened.fh);
+
+    const dir = await kernel.mkdir(FUSE_ROOT_ID, "d");
+    const handle = await kernel.opendir(dir.nodeid);
+    expect(handle.openFlags).toBe(0);
+    await kernel.releasedir(dir.nodeid, handle.fh);
+    expectHealthy(session);
+  });
+
+  it("keeps FOPEN_NOFLUSH off a kernel older than 7.35", async () => {
+    for (const [minor, expected] of [
+      [34, FOPEN_KEEP_CACHE],
+      [35, FOPEN_KEEP_CACHE | FOPEN_NOFLUSH],
+    ] as const) {
+      const { session, kernel } = makeSession(durableDriver(), { flushMechanism: "noflush" });
+      await kernel.init({ minor });
+      const file = await kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+      expect(file.open.openFlags).toBe(expected);
+      expectHealthy(session);
+    }
+  });
+
+  it("leaves keepCache: false alone in either mechanism", async () => {
+    const noflush = await mount(durableDriver(), {
+      flushMechanism: "noflush",
+      keepCache: false,
+    });
+    const one = await noflush.kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    expect(one.open.openFlags).toBe(FOPEN_NOFLUSH);
+
+    const enosys = await mount(durableDriver(), { flushMechanism: "enosys", keepCache: false });
+    const two = await enosys.kernel.create(FUSE_ROOT_ID, "f", O_CREAT_RDWR, 0o644);
+    expect(two.open.openFlags).toBe(0);
+    expectHealthy(noflush.session);
+    expectHealthy(enosys.session);
+  });
+
+  it("resolves the capability as declared-only", () => {
+    // Nothing about a driver's shape may switch this on: the memory driver has
+    // `sync` and `datasync` on every handle and still resolves `false`.
+    expect(createLoopback(createMemoryDriver()).capabilities.durableWrites).toBe(false);
+    expect(createLoopback(durableDriver()).capabilities.durableWrites).toBe(true);
   });
 });
 

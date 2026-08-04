@@ -80,6 +80,9 @@ const THROUGH_NFS4: ResolvedCapabilities = {
   caseSensitive: true,
   statfs: true,
   readOnly: false,
+  // Not a wire property at all: it is a claim about the driver behind the
+  // mount, and every driver these suites use leaves it unclaimed.
+  durableWrites: false,
   extensions: ["mknod"],
 };
 

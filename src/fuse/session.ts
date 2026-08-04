@@ -59,6 +59,7 @@ import {
   FATTR_SIZE,
   FATTR_UID,
   FOPEN_KEEP_CACHE,
+  FOPEN_NOFLUSH,
   FUSE_BATCH_FORGET,
   FUSE_CREATE,
   FUSE_DEFAULT_MAX_PAGES_PER_REQ,
@@ -166,6 +167,26 @@ export const DEFAULT_ENTRY_TIMEOUT = 10;
 /** `RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT` — none supported. */
 const RENAME_FLAGS_UNSUPPORTED = 0b111;
 
+/**
+ * The two ways to stop the kernel sending `FLUSH`, for a driver that declares
+ * `FsCapabilities.durableWrites`. See {@link FuseSessionOptions.flushMechanism}.
+ */
+export type FlushMechanism = "enosys" | "noflush";
+
+/** Default {@link FuseSessionOptions.flushMechanism}. */
+export const DEFAULT_FLUSH_MECHANISM: FlushMechanism = "enosys";
+
+/**
+ * Protocol minor `FOPEN_NOFLUSH` appeared in.
+ *
+ * `fuse.h`'s own changelog, verbatim: "7.35 — add FOPEN_NOFLUSH". Every other
+ * flag in this file is gated on the negotiated minor the same way; a kernel
+ * older than this does not know the bit and would keep sending `FLUSH`, so
+ * setting it there would be a claim with no effect rather than a compatible
+ * one.
+ */
+const FOPEN_NOFLUSH_MINOR = 35;
+
 export interface FuseSessionOptions {
   /** Passed to `negotiateInit` when the kernel's `FUSE_INIT` arrives. */
   init?: InitPreferences;
@@ -185,6 +206,29 @@ export interface FuseSessionOptions {
    * of band stays invisible for the whole timeout. Opt in per mount.
    */
   negativeTimeout?: number;
+  /**
+   * *How* this session declines `FLUSH` for a driver that declares
+   * `FsCapabilities.durableWrites`. Default {@link DEFAULT_FLUSH_MECHANISM}.
+   *
+   * **This is not the opt-in** — the opt-in is the driver's capability, because
+   * "is there anything left to report at `close(2)`" is a property of the
+   * driver and not of the mount. A driver that has not declared
+   * `durableWrites` gets today's behaviour whatever this says, and setting it
+   * on its own changes nothing.
+   *
+   * - `"enosys"` — answer the first `FLUSH` `-ENOSYS`. Connection-wide (the
+   *   kernel sets `no_flush` on the `fuse_conn` and never sends another), needs
+   *   no protocol version, costs exactly one request per mount, and leaves the
+   *   kernel's own `close(2)` work — `write_inode_now()`, so pages dirtied
+   *   through a shared `mmap` are still pushed out — in place.
+   * - `"noflush"` — set `FOPEN_NOFLUSH` in the `OPEN`/`CREATE` reply. Per open
+   *   file, so it needs no request at all, but it is gated on protocol 7.35
+   *   (the `fuse.h` changelog entry that adds the flag) and silently ignored by
+   *   the kernel when `writeback_cache` was negotiated. It also returns from
+   *   `fuse_flush()` *before* `write_inode_now()`, which is a second difference
+   *   from `"enosys"` and not only a faster one.
+   */
+  flushMechanism?: FlushMechanism;
   /** Identify files by the driver's `(dev, ino)`, so hardlinks share a nodeid. Default `true`. */
   useDriverIno?: boolean;
   /** Run the reply-exactly-once assertions. Default on outside production. */
@@ -406,6 +450,16 @@ export class FuseSession {
   readonly #inflight = new Set<bigint>();
   readonly #lock = new PathLock();
   readonly #debug: boolean;
+  /**
+   * Answer `FLUSH` with `-ENOSYS` instead of success.
+   *
+   * Decided once, at construction: both halves of it — the driver's declared
+   * `durableWrites` and the chosen mechanism — are fixed for the life of the
+   * session, and this is read on the `close(2)` path of every open file.
+   */
+  readonly #flushEnosys: boolean;
+  /** `FOPEN_KEEP_CACHE` and possibly `FOPEN_NOFLUSH`; the latter needs `INIT` first. */
+  #fileOpenFlags: number;
   #negotiated: NegotiatedSession | undefined;
   #destroyed = false;
   #nextFh = 1n;
@@ -415,6 +469,9 @@ export class FuseSession {
     this.options = options;
     this.#inodes = new InodeTable({ useDriverIno: options.useDriverIno });
     this.#debug = options.debug ?? process.env.NODE_ENV !== "production";
+    const mechanism = options.flushMechanism ?? DEFAULT_FLUSH_MECHANISM;
+    this.#flushEnosys = this.driver.capabilities.durableWrites && mechanism === "enosys";
+    this.#fileOpenFlags = (options.keepCache ?? true) ? FOPEN_KEEP_CACHE : 0;
   }
 
   /** What `FUSE_INIT` agreed on, or `undefined` before the handshake. */
@@ -668,7 +725,20 @@ export class FuseSession {
       case FUSE_FLUSH: {
         // Nothing to do: `flush` is not `fsync`, and a driver's write is
         // already durable by the time it resolves. Answering success (rather
-        // than `ENOSYS`) keeps `close(2)` error reporting available later.
+        // than `ENOSYS`) keeps `close(2)` error reporting available for a
+        // driver that *does* defer work — which is a driver-shaped question,
+        // so a driver that declares `durableWrites` gets the other answer.
+        if (this.#flushEnosys) {
+          // Deliberately without `#requireFile`. `-ENOSYS` is a statement about
+          // the opcode, not about this fh: the kernel sets `no_flush` on the
+          // connection and never asks again, so a validation here would fire at
+          // most once per mount and would, on the one request it applied to,
+          // answer `EBADF` — which is *not* the "unimplemented" answer, so the
+          // kernel would keep sending `FLUSH` for the life of the mount. There
+          // is nothing to validate for either: this arm reads no state and
+          // touches no handle.
+          return encodeErrorReply(unique, "ENOSYS");
+        }
         this.#requireFile((request.body as FuseFlushIn).fh, false);
         return encodeReply(unique);
       }
@@ -919,6 +989,19 @@ export class FuseSession {
     }
     if (negotiation.status === "ok") {
       this.#negotiated = negotiation.session;
+      // The one open flag that is not known before the handshake: it is a
+      // driver claim (`durableWrites`) gated on a kernel that knows the bit.
+      // `writeback_cache` is deliberately *not* part of the condition — the
+      // kernel ignores the flag there, which costs the saving and nothing else,
+      // and hiding that behind a silent fallback to `-ENOSYS` would make the
+      // mechanism this session was asked for a lie.
+      if (
+        (this.options.flushMechanism ?? DEFAULT_FLUSH_MECHANISM) === "noflush" &&
+        this.driver.capabilities.durableWrites &&
+        negotiation.session.minor >= FOPEN_NOFLUSH_MINOR
+      ) {
+        this.#fileOpenFlags |= FOPEN_NOFLUSH;
+      }
     }
     // `fuse_init_out` is the one struct that carries the version it is laid out
     // at, so it is encoded at **its own** `minor` — including a `retry`, where
@@ -1360,8 +1443,14 @@ export class FuseSession {
     }
   }
 
+  /**
+   * `fuse_open_out.open_flags` for a regular file.
+   *
+   * Files only: `OPENDIR` replies `0`, since neither flag in here means
+   * anything for a directory handle.
+   */
   #openFlags(): number {
-    return (this.options.keepCache ?? true) ? FOPEN_KEEP_CACHE : 0;
+    return this.#fileOpenFlags;
   }
 
   async #open(request: FuseRequest): Promise<Uint8Array> {

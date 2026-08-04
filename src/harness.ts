@@ -21,9 +21,14 @@ export function resolveCapabilities(driver: FsDriver): ResolvedCapabilities {
   const declared = driver.capabilities ?? {};
   const has = (name: FsDriverMethod): boolean => typeof driver[name] === "function";
   return {
-    // None of these three can be inferred from the shape of a driver.
+    // None of these four can be inferred from the shape of a driver.
     // `open()` exists on every driver whether or not it returns real per-open
     // state, and `rename()` exists whether or not it is atomic.
+    //
+    // `durableWrites` is the same kind of claim about `write()`: every driver
+    // has one, and whether it defers anything behind the promise it resolves is
+    // invisible from out here. `sync`/`datasync` do not establish it either —
+    // the memory driver, which has nothing to flush, offers both as no-ops.
     //
     // `readOnly` means what its own doc says — *every* mutating operation
     // answers `EROFS` — and no absence of methods establishes that: a driver
@@ -34,6 +39,7 @@ export function resolveCapabilities(driver: FsDriver): ResolvedCapabilities {
     handles: declared.handles ?? false,
     atomicRename: declared.atomicRename ?? false,
     readOnly: declared.readOnly ?? false,
+    durableWrites: declared.durableWrites ?? false,
     hardlinks: declared.hardlinks ?? has("link"),
     symlinks: declared.symlinks ?? (has("symlink") && has("readlink") && has("lstat")),
     permissions: declared.permissions ?? has("chmod"),
