@@ -121,6 +121,27 @@ the one `trans=unix`/`tcp`/`fd` live in, and it is pinned by
   `connection.session.msize` agreed to both (131096 and 16384). Same rule
   elsewhere in that line: `uname=nobody` is omitted because it _is_ `V9FS_DEFUSER`,
   while `aname=/` is printed because `V9FS_DEFANAME` is the empty string.
+- **`cache=` is worse than invisible — it is unreadable (verified 2026-08-04).**
+  Same suppression rule as `msize`, plus a second twist: when v9fs does print the
+  option it prints the _bitmask_, never the mode name that was passed. Mounting
+  the memory driver at each of the five modes in turn and reading the mount's own
+  line out of `/proc/self/mounts` immediately after:
+
+  ```
+  cache=none      -> 9p rw,relatime,aname=/,access=client,trans=unix
+  cache=readahead -> 9p rw,relatime,aname=/,cache=0x1,access=client,trans=unix
+  cache=mmap      -> 9p rw,relatime,aname=/,cache=0x5,access=client,trans=unix
+  cache=loose     -> 9p rw,relatime,aname=/,cache=0xf,access=client,trans=unix
+  cache=fscache   -> 9p rw,relatime,aname=/,cache=0x8f,access=client,trans=unix
+  ```
+
+  All five mount and unmount cleanly. The practical consequence is the one worth
+  keeping: **the mount table cannot tell you what cache mode a 9P mount is
+  running**, and the mode is the single largest lever on its message count (a
+  `bun install` sends ~1.5× the messages at `none` as at `loose` — `PERF.md`
+  item 3). Debugging a slow 9P mount means reading the code that mounted it, not
+  `/proc/self/mounts`. `cache=0xf` is the string to grep a bug report for.
+
 - **There is no `dmesg` on this host.** `kernel.dmesg_restrict=1`, the container's
   `CapBnd` has no `CAP_SYSLOG`, and there is no `/dev/kmsg`; `sudo dmesg` answers
   `Operation not permitted`. So the usual "read what v9fs logged" route does not

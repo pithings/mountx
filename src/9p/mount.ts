@@ -223,6 +223,41 @@ export interface MountP9Options extends P9ServerOptions {
    * `"fscache"` are the modes v6.12 accepts (`get_cache_mode()` in
    * `fs/9p/v9fs.c`).
    *
+   * **What that bet costs, so it is priced rather than merely argued.**
+   * `cache=none` turns off the dentry cache as well as the page cache, so every
+   * path component is walked again on every syscall that names it — and walking
+   * and clunking is this transport's whole hot path. On `bench/bun-install.ts`'s
+   * install workload the default sends **about 1.5× the messages** of
+   * `cache=loose`: 237,580 against 155,314, identical across three runs of each,
+   * with `Tclunk` 56,849 → 15,292, `Twalk` 75,268 → 49,906 and `Tgetattr`
+   * 41,560 → 27,490. It is the single largest cost in the 9P column. Those are
+   * ranking numbers off one host (`PERF.md` item 3), not published ones:
+   * invariant 24 keeps `.agents/benchmarks.md` the only source for those, and it
+   * has no `cache=` column.
+   *
+   * **When `"loose"` is the right answer** — a narrow when, and the condition is
+   * the whole of it: every change to what the driver serves, bytes and
+   * attributes and the set of names alike, arrives *through this mount*, for as
+   * long as the mount is up. The serving process writing to its own driver after
+   * mounting breaks that, and so does a second mount of the same server, which
+   * is a second cache neither side can invalidate. It does not weaken to "mostly
+   * through the mount": one write behind the client's back is one silent stale
+   * read, with no expiry to wait out the way FUSE's `attrTimeout` has one and
+   * no `notifyInvalInode()` to walk it back — 9P has no such call, which is the
+   * same fact as the first paragraph. A build or install target, a scratch tree,
+   * a tree served read-only to a VM guest: those qualify. A driver the serving
+   * process keeps updating does not, and that is the shape this library is in
+   * often enough that the safe mode, not the fast one, is the default.
+   *
+   * **Whatever it is set to, the mount table will not tell you.** v9fs prints
+   * `cache=` only when it differs from the kernel's own default — the same rule
+   * that hides {@link MountP9Options.mountMsize} at its default — and prints it
+   * as a hex bitmask rather than as the name that was passed: `none` is absent
+   * from `/proc/self/mounts` entirely, and `loose` appears as `cache=0xf`. So
+   * the option that explains a 9P mount's message count is precisely the one
+   * that cannot be read back off the mount. `.agents/environment.md` has the
+   * mode-to-bitmask table, observed on v6.12.
+   *
    * One consequence of the default worth knowing: `cache=none` supports only
    * read-only `mmap`, so executing a binary from the mount works and a
    * shared writable mapping does not.
