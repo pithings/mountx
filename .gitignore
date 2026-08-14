@@ -20,6 +20,13 @@ tsconfig.tsbuildinfo
 # megabyte; what is worth keeping from a profiling run is the conclusion.
 *.cpuprofile
 
+# test/integrations/celld.test.ts serves a fleet bucket and two celld nodes out
+# of here: the gateway's driver root, each node's local SQLite state, and the
+# Worker it deploys. Kept next to the test rather than under `tmpdir()`, and
+# left in place after the run — the suite sweeps it on the way in, not on the
+# way out, so a failed race can still be read where it happened.
+test/integrations/.tmp
+
 # pjdfstest: the suite is cloned and built on demand (test/pjdfstest/run.sh),
 # pinned to a commit there. Only the analysis is committed.
 test/pjdfstest/pjdfstest
