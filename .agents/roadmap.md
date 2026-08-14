@@ -241,6 +241,23 @@ area whose code it changes, not the area that motivated it.
   attribute's "deliberately absent, it is the OPEN step's call" note predates
   the OPEN step making that call.
 
+## S3
+
+- **The multipart pair takes no conditionals.** `PutObject` evaluates
+  `If-None-Match`, `If-Match` and `If-Unmodified-Since` and answers `412`/`404`
+  (issue #19); `CreateMultipartUpload` and `CompleteMultipartUpload` still
+  ignore them, so a client that assembles an object in parts cannot express the
+  same compare-and-swap. The condition belongs on `Complete` — the moment the
+  key changes — and the key lock `#putObject` takes is already the right
+  granularity for it. No client observed needs it, which is why it is here
+  rather than done.
+- **A conditional `PUT` is a compare-and-swap within one process.**
+  `If-None-Match: *` is the driver's own (`O_CREAT|O_EXCL`, atomic against any
+  writer anywhere), but `If-Match` compares and then writes under a per-key
+  promise chain, so an _unconditional_ `PUT` — which takes no lock — can still
+  land between the two. Closing that needs every writer of a key on the same
+  chain, which is a cost on the ordinary path for a race no client has hit.
+
 ## WebDAV
 
 - **No dead properties.** `PROPPATCH` writes `getlastmodified` (through

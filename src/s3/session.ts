@@ -41,17 +41,30 @@
  *   {@link objectETag}). The multipart-shaped suffix is the signal that it is
  *   not an MD5 of the bytes, which is what makes it honest rather than wrong.
  * - **`PUT` writes the object in place**, with no temporary file and no rename.
- *   The driver interface has no atomic-create primitive, `rename` is optional
- *   and only *declared* atomic (`FsCapabilities.atomicRename`), and a staging
- *   copy would have to live somewhere a listing can see. So: a reader arriving
- *   mid-`PUT` can see a partial object, and a `PUT` that fails mid-body leaves
- *   a partial object where a whole one used to be. What is guaranteed is the
- *   *first* byte: the destination is not opened — so an existing object is not
- *   truncated and a new one is not created — until the first payload byte has
- *   arrived and, for a signed `aws-chunked` body, verified. An upload rejected
- *   *at or before its first byte* therefore leaves the bucket exactly as it
- *   was; one rejected later leaves what had been written by then, which is what
- *   {@link S3Session} documents on `#writeObject` in full.
+ *   The driver interface has no atomic *replace* — `open(path, "wx")` creates
+ *   atomically and nothing swaps a whole object over another — `rename` is
+ *   optional and only *declared* atomic (`FsCapabilities.atomicRename`), and a
+ *   staging copy would have to live somewhere a listing can see. So: a reader
+ *   arriving mid-`PUT` can see a partial object, and a `PUT` that fails
+ *   mid-body leaves a partial object where a whole one used to be. What is
+ *   guaranteed is the *first* byte: the destination is not opened — so an
+ *   existing object is not truncated and a new one is not created — until the
+ *   first payload byte has arrived and, for a signed `aws-chunked` body,
+ *   verified. An upload rejected *at or before its first byte* therefore leaves
+ *   the bucket exactly as it was; one rejected later leaves what had been
+ *   written by then, which is what {@link S3Session} documents on
+ *   `#writeObject` in full.
+ * - **A conditional `PUT` is a compare-and-swap, not a decoration.**
+ *   `If-None-Match` and `If-Match` (and `If-Unmodified-Since` beside them) are
+ *   evaluated before a byte of the body is read: `If-None-Match: *` creates the
+ *   object with `O_CREAT|O_EXCL`, so the create is atomic in the driver and a
+ *   loser gets `412`; `If-Match` compares the ETag and writes with the key
+ *   serialized against every other conditional `PUT` to it. What that buys is
+ *   an honest CAS *within this process* — an unconditional `PUT` takes no lock
+ *   and can still land between a compare and its swap, which the create case,
+ *   being the driver's own, is immune to. Accepting the headers and ignoring
+ *   them, which is what this gateway did until issue #19, is the one thing a
+ *   store must not do: it turns a lock that works into a lock that never locks.
  * - **`If-Range` is implemented** (RFC 9110 §13.1.5): a matching validator
  *   keeps the `Range`, a non-matching one drops it and answers the whole object
  *   with `200`, which is what the RFC requires and what makes a resumed
@@ -209,6 +222,7 @@ import {
   parseObjectKey,
   parseRange,
   parseRequestTarget,
+  putCondition,
   routeRequest,
   s3Error,
   s3ErrorResponse,
@@ -216,6 +230,7 @@ import {
   sigv4RefusalError,
   XML_CONTENT_TYPE,
   xmlRefusalError,
+  type PutCondition,
   type S3ErrorName,
   type S3ErrorSpec,
   type S3ObjectTarget,
@@ -516,6 +531,42 @@ function isAbsent(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/**
+ * Run `fn` after everything else queued on `key`, and before anything queued
+ * after it.
+ *
+ * A promise chain per key, and **not** `PathLock` from `src/lock.ts`: that lock
+ * is one writer against every reader of a session's whole path map, which is
+ * what a `RENAME` needs and the opposite of what this needs — two keys have
+ * nothing to say to each other, and serializing them would make a gateway with
+ * ten clients behave like a gateway with one.
+ *
+ * The map entry is dropped by whoever put it there when nobody chained on it,
+ * so a key is not remembered after its last operation, and a map with no
+ * operation in flight is empty.
+ */
+async function serialize<T>(
+  locks: Map<string, Promise<unknown>>,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = locks.get(key) ?? Promise.resolve();
+  // Both callbacks are `fn`, so a failed operation does not wedge the next.
+  const running = previous.then(fn, fn);
+  const settled = running.then(
+    () => undefined,
+    () => undefined,
+  );
+  locks.set(key, settled);
+  try {
+    return await running;
+  } finally {
+    if (locks.get(key) === settled) {
+      locks.delete(key);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // errors carried out of a handler
 // ---------------------------------------------------------------------------
@@ -665,6 +716,13 @@ interface WriteOptions {
    * conjured back into existence by a write that raced its abort.
    */
   makeParents?: boolean;
+  /**
+   * Open the destination `wx` — `O_CREAT|O_EXCL` — so that creating it is
+   * atomic in the driver and an object that is already there is `EEXIST`
+   * (default `false`). `true` for `PUT` with `If-None-Match: *`, and nothing
+   * else: it is the only condition a driver can enforce without a lock.
+   */
+  exclusive?: boolean;
 }
 
 /** One entry of a listing, before it becomes a `Contents` or a `CommonPrefixes`. */
@@ -733,6 +791,11 @@ export class S3Session {
    * last operation on an id removes it.
    */
   readonly #uploadLocks = new Map<string, Promise<unknown>>();
+  /**
+   * One promise chain per `bucket/key` with a **conditional** `PUT` running on
+   * it — see `#putObject`. Empty in a session with nothing in flight.
+   */
+  readonly #objectLocks = new Map<string, Promise<unknown>>();
 
   constructor(buckets: Record<string, FsDriver>, options: S3SessionOptions = {}) {
     this.buckets = new Map(
@@ -1090,11 +1153,35 @@ export class S3Session {
    * - `a/b/` on a *file* — likewise, the other way round.
    */
   async #statObject(driver: Loopback, route: S3ObjectTarget): Promise<StatsLike> {
-    const stats = await driver.stat(route.path).catch((error: unknown) => {
-      throw isAbsent(error) ? refuse("NoSuchKey") : error;
-    });
-    if (route.directory ? !stats.isDirectory() : !stats.isFile()) {
+    const stats = await this.#statObjectOrAbsent(driver, route);
+    if (stats === undefined) {
       throw refuse("NoSuchKey");
+    }
+    return stats;
+  }
+
+  /**
+   * {@link S3Session.#statObject} for a caller that has something to say about
+   * a key that is not there — a conditional `PUT`, which may be asking for
+   * exactly that.
+   *
+   * The three ways to be absent are one answer here, because they are one
+   * answer to a client: nothing at the path, something of the wrong kind at the
+   * path, and a file part-way along it (`ENOTDIR`) all mean this key has no
+   * object.
+   */
+  async #statObjectOrAbsent(
+    driver: Loopback,
+    route: S3ObjectTarget,
+  ): Promise<StatsLike | undefined> {
+    const stats = await driver.stat(route.path).catch((error: unknown) => {
+      if (isAbsent(error)) {
+        return undefined;
+      }
+      throw error;
+    });
+    if (stats === undefined || (route.directory ? !stats.isDirectory() : !stats.isFile())) {
+      return undefined;
     }
     return stats;
   }
@@ -1142,6 +1229,77 @@ export class S3Session {
     verified: SigV4Verified | undefined,
     requestId: string,
   ): Promise<S3StreamResponse> {
+    const condition = putCondition(head.headers);
+    if (!condition.conditional) {
+      return await this.#storeObject(driver, route, head, body, verified, requestId, false);
+    }
+    return await serialize(this.#objectLocks, `${route.bucket}/${route.key}`, async () => {
+      const exclusive = await this.#checkPutCondition(driver, route, head, condition);
+      return await this.#storeObject(driver, route, head, body, verified, requestId, exclusive);
+    });
+  }
+
+  /**
+   * A `PUT`'s conditional headers, evaluated **before a byte of the body is
+   * read**, against a representation that may not be there.
+   *
+   * S3 supports `If-Match` and `If-None-Match` on `PutObject` and this gateway
+   * honours `If-Unmodified-Since` alongside them, because ignoring a condition
+   * is the one answer a client cannot recover from: a compare-and-swap that
+   * always succeeds is a lock that never locks (issue #19). `If-Modified-Since`
+   * is not evaluated — RFC 9110 §13.2.2 scopes it to `GET`/`HEAD`, and `PUT`
+   * has no `304` to answer.
+   *
+   * The absent case is the one `#getObject` never has to answer, and it is
+   * per-header:
+   *
+   * - `If-Match` on nothing is **`404`**, not `412`. RFC 9110 §13.1.1 would
+   *   say `412`; S3 answers `NoSuchKey`, and this gateway is an S3 gateway.
+   * - `If-None-Match` on nothing passes — this is where `If-None-Match: *`
+   *   succeeds, and it is the create half of the idiom.
+   * - `If-Unmodified-Since` on nothing is ignored: there is no last-modified
+   *   date to compare against (§13.1.4).
+   *
+   * Answers whether the write may use an exclusive create.
+   *
+   * @throws {S3ErrorThrown} `NoSuchKey` (404) or `PreconditionFailed` (412).
+   */
+  async #checkPutCondition(
+    driver: Loopback,
+    route: S3ObjectTarget,
+    head: S3RequestHead,
+    condition: PutCondition,
+  ): Promise<boolean> {
+    const stats = await this.#statObjectOrAbsent(driver, route);
+    if (stats === undefined) {
+      if (condition.requiresPresence) {
+        throw refuse("NoSuchKey");
+      }
+      return condition.createOnly;
+    }
+    const conditional = evaluateConditionals(
+      { etag: objectETag(stats), mtimeMs: stats.mtimeMs },
+      head.headers,
+      "PUT",
+    );
+    /* Never `304`: `evaluateConditionals` answers that only for a safe method,
+       and an `If-None-Match` that matches on a `PUT` is the `412` above. */
+    if (conditional.status !== 200) {
+      throw refuse("PreconditionFailed");
+    }
+    return false;
+  }
+
+  /** Store one object — the body of a `PUT`, once its conditions have held. */
+  async #storeObject(
+    driver: Loopback,
+    route: S3ObjectTarget,
+    head: S3RequestHead,
+    body: AsyncIterable<Uint8Array>,
+    verified: SigV4Verified | undefined,
+    requestId: string,
+    exclusive: boolean,
+  ): Promise<S3StreamResponse> {
     /* A `x-amz-meta-mtime` that is not a number is **ignored, not refused**
        (`parseMetaMtime` answers `undefined` and the object keeps the time it
        was written at). rclone and its lookalikes write this header from
@@ -1150,9 +1308,22 @@ export class S3Session {
        user metadata without ever reading it. Pinned by a test. */
     const mtime = parseMetaMtime(headerValue(head.headers, META_MTIME_HEADER));
     if (route.directory) {
+      /* A marker takes the same conditions and drops `exclusive`: `mkdir` has
+         no create-exclusive form that tells "the marker is already there" apart
+         from "a file is in the way", and collapsing those two into one `412`
+         would describe a conflict that did not happen. The key chain
+         `#putObject` holds is what serializes a marker's create. */
       return await this.#putDirectory(driver, route, body, mtime, requestId);
     }
-    await this.#receiveBody(driver, route.path, head, body, verified);
+    await this.#receiveBody(driver, route.path, head, body, verified, { exclusive }).catch(
+      (error: unknown) => {
+        /* The exclusive open lost the race the `stat` above had won: something
+           created the key between the two. That is the condition failing, not
+           a conflict — `EEXIST` is `OperationAborted` (409) everywhere else in
+           this gateway, and here it is the `412` the client asked for. */
+        throw exclusive && errorCode(error) === "EEXIST" ? refuse("PreconditionFailed") : error;
+      },
+    );
     await this.#applyMtime(driver, route.path, mtime);
     const stats = await driver.stat(route.path);
     return {
@@ -1265,10 +1436,11 @@ export class S3Session {
       (value): value is number => value !== undefined,
     );
     const cap = caps.length === 0 ? undefined : Math.min(...caps);
+    const flags = options.exclusive === true ? "wx" : "w";
     const open =
       options.makeParents === false
-        ? async (): Promise<FileHandleLike> => await driver.open(path, "w", 0o666)
-        : async (): Promise<FileHandleLike> => await this.#openForWrite(driver, path);
+        ? async (): Promise<FileHandleLike> => await driver.open(path, flags, 0o666)
+        : async (): Promise<FileHandleLike> => await this.#openForWrite(driver, path, flags);
     let handle: FileHandleLike | undefined;
     let written = 0;
     try {
@@ -1315,9 +1487,9 @@ export class S3Session {
    * which would answer `OperationAborted` (409) and describe a conflict that is
    * not what happened.
    */
-  async #openForWrite(driver: Loopback, path: string): Promise<FileHandleLike> {
+  async #openForWrite(driver: Loopback, path: string, flags = "w"): Promise<FileHandleLike> {
     try {
-      return await driver.open(path, "w", 0o666);
+      return await driver.open(path, flags, 0o666);
     } catch (error) {
       const parent = dirname(path);
       if (errorCode(error) !== "ENOENT" || parent === "/") {
@@ -1328,7 +1500,7 @@ export class S3Session {
           throw failure;
         }
       });
-      return await driver.open(path, "w", 0o666);
+      return await driver.open(path, flags, 0o666);
     }
   }
 
@@ -2215,34 +2387,12 @@ export class S3Session {
   /**
    * Run `fn` with this upload to itself.
    *
-   * A promise chain per upload id, and **not** `PathLock` from `src/lock.ts`:
-   * that lock is one writer against every reader of a session's whole path map,
-   * which is what a `RENAME` needs and the opposite of what this needs — two
-   * uploads have nothing to say to each other, and serializing them would make
-   * a gateway with ten clients behave like a gateway with one. What is
-   * serialized here is exactly `Complete` and `Abort` of the *same* upload,
+   * What is serialized is exactly `Complete` and `Abort` of the *same* upload,
    * plus `close()`'s sweep of it; `UploadPart` and `ListParts` run outside (see
    * the module docs on what the races guarantee).
-   *
-   * The map entry is dropped by whoever put it there when nobody chained on
-   * it, so an id is not remembered after its last operation.
    */
   async #withUpload<T>(uploadId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.#uploadLocks.get(uploadId) ?? Promise.resolve();
-    // Both callbacks are `fn`, so a failed operation does not wedge the next.
-    const running = previous.then(fn, fn);
-    const settled = running.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.#uploadLocks.set(uploadId, settled);
-    try {
-      return await running;
-    } finally {
-      if (this.#uploadLocks.get(uploadId) === settled) {
-        this.#uploadLocks.delete(uploadId);
-      }
-    }
+    return await serialize(this.#uploadLocks, uploadId, fn);
   }
 
   /**

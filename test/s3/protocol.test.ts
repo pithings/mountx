@@ -69,6 +69,7 @@ import {
   parseRequestTarget,
   parseUnsignedInteger,
   pathToKey,
+  putCondition,
   queryValue,
   routeRequest,
   S3_ERRORS,
@@ -1261,6 +1262,48 @@ describe("conditional requests", () => {
     expect(evaluateConditionals(target, headers, "GET")).toEqual({ status: 304 });
     expect(headerValue(headers, "if-none-match")).toBe(`"other"`);
     expect(headerList(headers, "if-match")).toBeUndefined();
+  });
+
+  it("reads what a PUT's conditions ask for, before anything is stat'ed", () => {
+    const none = putCondition(headersOf({}));
+    expect(none).toEqual({ conditional: false, createOnly: false, requiresPresence: false });
+
+    /* `If-Modified-Since` is not evaluated on a `PUT`, so it must not make one
+       conditional — that would buy a `stat` that changes no answer. */
+    expect(putCondition(headersOf({ "if-modified-since": BEFORE }))).toEqual(none);
+
+    expect(putCondition(headersOf({ "if-none-match": "*" }))).toEqual({
+      conditional: true,
+      createOnly: true,
+      requiresPresence: false,
+    });
+    /* Named tags are not the create-only idiom: there is a representation to
+       compare against, and nothing to create atomically. */
+    expect(putCondition(headersOf({ "if-none-match": `"${ETAG}"` }))).toEqual({
+      conditional: true,
+      createOnly: false,
+      requiresPresence: false,
+    });
+    expect(putCondition(headersOf({ "if-match": `"${ETAG}"` }))).toEqual({
+      conditional: true,
+      createOnly: false,
+      requiresPresence: true,
+    });
+    expect(putCondition(headersOf({ "if-unmodified-since": BEFORE }))).toEqual({
+      conditional: true,
+      createOnly: false,
+      requiresPresence: false,
+    });
+    /* `If-None-Match: *` beside a condition that needs the object there is no
+       longer a create: the two are evaluated against a representation. */
+    expect(putCondition(headersOf({ "if-none-match": "*", "if-match": `"${ETAG}"` }))).toEqual({
+      conditional: true,
+      createOnly: false,
+      requiresPresence: true,
+    });
+    expect(
+      putCondition(headersOf({ "if-none-match": "*", "if-unmodified-since": BEFORE })).createOnly,
+    ).toBe(false);
   });
 });
 

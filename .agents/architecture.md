@@ -113,15 +113,15 @@ The transport that is not a mount — it serves a driver to an S3 client (`rclon
 AWS CLI, an SDK, a presigned URL) over HTTP, path-style, one bucket per driver. There
 is no RFC; everything is transcribed from Amazon's docs and named where it is used.
 
-| File           | What                                                                                                                                                             |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sigv4.ts`     | SigV4 signed **and** verified, header and presigned forms. Pure and clockless — the time is always an argument. Goldens are the official `aws-sig-v4-test-suite` |
-| `chunked.ts`   | `aws-chunked` streaming decode with per-chunk signature verification                                                                                             |
-| `xml.ts`       | bounded encoder + the two request-body parsers; no entity expansion                                                                                              |
-| `constants.ts` | the errno → S3 error table, typed **total** over `ErrnoCode`, plus the protocol's numeric limits                                                                 |
-| `protocol.ts`  | URL → `(bucket, key)`, op discrimination, header parsing. An unimplemented op is `NotImplemented`, never a fall-through                                          |
-| `session.ts`   | one request in, one reply out, streaming **both ways**. Derived ETags, multipart staged under a reserved prefix                                                  |
-| `server.ts`    | loopback-only without credentials; ordered drain on `close()`                                                                                                    |
+| File           | What                                                                                                                                                                 |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sigv4.ts`     | SigV4 signed **and** verified, header and presigned forms. Pure and clockless — the time is always an argument. Goldens are the official `aws-sig-v4-test-suite`     |
+| `chunked.ts`   | `aws-chunked` streaming decode with per-chunk signature verification                                                                                                 |
+| `xml.ts`       | bounded encoder + the two request-body parsers; no entity expansion                                                                                                  |
+| `constants.ts` | the errno → S3 error table, typed **total** over `ErrnoCode`, plus the protocol's numeric limits                                                                     |
+| `protocol.ts`  | URL → `(bucket, key)`, op discrimination, header parsing. An unimplemented op is `NotImplemented`, never a fall-through                                              |
+| `session.ts`   | one request in, one reply out, streaming **both ways**. Derived ETags, a conditional `PUT` that is a real compare-and-swap, multipart staged under a reserved prefix |
+| `server.ts`    | loopback-only without credentials; ordered drain on `close()`                                                                                                        |
 
 ## WebDAV (`src/webdav/`, exported as `mountx/webdav`)
 

@@ -141,7 +141,7 @@
  *
  * `PUT` writes in place, with no temporary file and no rename, for the reasons
  * `src/s3/session.ts` sets out at length: the driver interface has no atomic
- * create, `rename` is optional and only *declared* atomic, and a staging copy
+ * *replace*, `rename` is optional and only *declared* atomic, and a staging copy
  * would be visible to every listing. The destination is opened at the **first
  * byte of the body**, so a `PUT` refused before then leaves the resource
  * exactly as it was; one that dies mid-body leaves what had been written. A

@@ -54,6 +54,7 @@ import {
   formatETag,
   formatHttpDate,
   MAX_TIMESTAMP_MS,
+  parseETagList,
   type ConditionalResult,
   type ConditionalTarget,
 } from "../http.ts";
@@ -1556,6 +1557,49 @@ export function evaluateConditionals(
     },
     method,
   );
+}
+
+/**
+ * What a `PUT`'s conditional headers ask for, before anything is stat'ed.
+ *
+ * `evaluateConditionals` needs a representation to compare against, and the
+ * whole point of a conditional `PUT` is that there may not be one — so the
+ * session has to decide whether to go looking *first*. That decision is here,
+ * as three facts about the headers alone:
+ *
+ * - `conditional` — is there anything to evaluate at all? `If-Modified-Since`
+ *   does not count: §13.2.2 evaluates it only for `GET`/`HEAD`, so on a `PUT`
+ *   it changes no answer and must not cost a `stat`.
+ * - `createOnly` — `If-None-Match: *`, and nothing else that needs the object
+ *   to be there. This is the "create only if absent" idiom, and the one case a
+ *   driver can make atomic on its own (`O_CREAT|O_EXCL`).
+ * - `requiresPresence` — there is an `If-Match`, whose subject must exist:
+ *   S3 answers a missing key `404`, not `412`.
+ */
+export interface PutCondition {
+  /** Is there a conditional header that applies to a `PUT`? */
+  conditional: boolean;
+  /** Is it exactly `If-None-Match: *`, with no condition needing the object? */
+  createOnly: boolean;
+  /** Is there an `If-Match`? */
+  requiresPresence: boolean;
+}
+
+/** {@link PutCondition}, read off the request headers. */
+export function putCondition(headers: readonly HeaderEntry[]): PutCondition {
+  const ifMatch = headerList(headers, "if-match");
+  const ifNoneMatch = headerList(headers, "if-none-match");
+  const ifUnmodifiedSince = headerValue(headers, "if-unmodified-since");
+  return {
+    conditional:
+      ifMatch !== undefined || ifNoneMatch !== undefined || ifUnmodifiedSince !== undefined,
+    createOnly:
+      ifMatch === undefined &&
+      ifUnmodifiedSince === undefined &&
+      ifNoneMatch !== undefined &&
+      parseETagList(ifNoneMatch).any,
+    requiresPresence: ifMatch !== undefined,
+  };
 }
 
 // ---------------------------------------------------------------------------

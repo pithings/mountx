@@ -979,6 +979,195 @@ describe("S3Session: conditionals and ranges", () => {
   });
 });
 
+describe("S3Session: conditional PUT", () => {
+  const KEY = `/${BUCKET}/owner.json`;
+
+  /** The current ETag of a key, or `undefined` when there is no object there. */
+  async function etagOf(target: string): Promise<string | undefined> {
+    const head = await call(session, { method: "HEAD", target });
+    return head.status === 200 ? (head.headers.etag as string) : undefined;
+  }
+
+  it("creates under If-None-Match: * exactly once", async () => {
+    const created = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-none-match": "*" },
+      body: "node-a",
+    });
+    expect(created.status).toBe(200);
+
+    const refused = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-none-match": "*" },
+      body: "node-b",
+    });
+    expect(refused.status).toBe(412);
+    expect(errorCodeOf(refused)).toBe("PreconditionFailed");
+    // The body of the losing PUT was never stored.
+    expect((await call(session, { target: KEY })).text).toBe("node-a");
+    healthy();
+  });
+
+  it("gives one winner when two creates race the same absent key", async () => {
+    const replies = await Promise.all(
+      ["first", "second"].map(
+        async (body) =>
+          await call(session, {
+            method: "PUT",
+            target: KEY,
+            headers: { "if-none-match": "*" },
+            body,
+          }),
+      ),
+    );
+    expect(replies.map((reply) => reply.status).sort((a, b) => a - b)).toEqual([200, 412]);
+    healthy();
+  });
+
+  it("swaps under If-Match only while the ETag still holds", async () => {
+    await call(session, { method: "PUT", target: KEY, body: "epoch-1" });
+    const etag = (await etagOf(KEY)) as string;
+
+    const stale = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-match": `"not-the-etag"` },
+      body: "epoch-2",
+    });
+    expect(stale.status).toBe(412);
+    expect(errorCodeOf(stale)).toBe("PreconditionFailed");
+    expect((await call(session, { target: KEY })).text).toBe("epoch-1");
+
+    const swapped = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-match": etag },
+      body: "epoch-2!",
+    });
+    expect(swapped.status).toBe(200);
+    expect((await call(session, { target: KEY })).text).toBe("epoch-2!");
+    healthy();
+  });
+
+  it("gives one winner when two swaps race on the same ETag", async () => {
+    await call(session, { method: "PUT", target: KEY, body: "epoch-1" });
+    const etag = (await etagOf(KEY)) as string;
+    const replies = await Promise.all(
+      /* Three distinct lengths — `epoch-1` is seven bytes — so whichever of
+         these wins moves the ETag off `etag` and the other must see it. */
+      ["ab", "cde"].map(
+        async (body) =>
+          await call(session, { method: "PUT", target: KEY, headers: { "if-match": etag }, body }),
+      ),
+    );
+    expect(replies.map((reply) => reply.status).sort((a, b) => a - b)).toEqual([200, 412]);
+    healthy();
+  });
+
+  it("answers 404 for If-Match on a key that is not there", async () => {
+    const reply = await call(session, {
+      method: "PUT",
+      target: `/${BUCKET}/ghost.json`,
+      headers: { "if-match": `"anything"` },
+      body: "x",
+    });
+    expect(reply.status).toBe(404);
+    expect(errorCodeOf(reply)).toBe("NoSuchKey");
+    expect((await call(session, { target: `/${BUCKET}/ghost.json` })).status).toBe(404);
+    healthy();
+  });
+
+  it("passes an If-None-Match that names tags on a key that is not there", async () => {
+    const reply = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-none-match": `"some-other-copy"` },
+      body: "made",
+    });
+    expect(reply.status).toBe(200);
+    healthy();
+  });
+
+  it("honours If-Unmodified-Since and ignores If-Modified-Since", async () => {
+    await call(session, { method: "PUT", target: KEY, body: "epoch-1" });
+    const refused = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-unmodified-since": formatHttpDate(0) },
+      body: "epoch-2",
+    });
+    expect(refused.status).toBe(412);
+    expect((await call(session, { target: KEY })).text).toBe("epoch-1");
+
+    /* RFC 9110 §13.2.2 evaluates `If-Modified-Since` for `GET`/`HEAD` alone, so
+       a `PUT` carrying one stores the object rather than answering 304. */
+    const stored = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-modified-since": formatHttpDate(0) },
+      body: "epoch-3",
+    });
+    expect(stored.status).toBe(200);
+    expect((await call(session, { target: KEY })).text).toBe("epoch-3");
+    healthy();
+  });
+
+  it("applies the conditions to a directory marker too", async () => {
+    const target = `/${BUCKET}/cells/`;
+    expect(
+      (await call(session, { method: "PUT", target, headers: { "if-none-match": "*" } })).status,
+    ).toBe(200);
+    const again = await call(session, {
+      method: "PUT",
+      target,
+      headers: { "if-none-match": "*" },
+    });
+    expect(again.status).toBe(412);
+    expect(errorCodeOf(again)).toBe("PreconditionFailed");
+    healthy();
+  });
+
+  it("loses a create to a writer no stat of this session could see", async () => {
+    /* The condition held when it was checked and stopped holding before the
+       first byte arrived — which is the window `O_CREAT|O_EXCL` closes and a
+       lock inside one process cannot. */
+    async function* racy(): AsyncGenerator<Uint8Array> {
+      await createLoopback(driver).writeFile("/owner.json", ascii("someone else"));
+      yield ascii("mine");
+    }
+    const reply = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-none-match": "*", "content-length": "4" },
+      body: racy(),
+    });
+    expect(reply.status).toBe(412);
+    expect(errorCodeOf(reply)).toBe("PreconditionFailed");
+    expect((await call(session, { target: KEY })).text).toBe("someone else");
+    healthy();
+  });
+
+  it("refuses a stale swap before it reads the body", async () => {
+    await call(session, { method: "PUT", target: KEY, body: "epoch-1" });
+    let read = 0;
+    async function* counted(): AsyncGenerator<Uint8Array> {
+      read += 1;
+      yield ascii("epoch-2");
+    }
+    const reply = await call(session, {
+      method: "PUT",
+      target: KEY,
+      headers: { "if-match": `"not-the-etag"`, "content-length": "7" },
+      body: counted(),
+    });
+    expect(reply.status).toBe(412);
+    expect(read).toBe(0);
+    healthy();
+  });
+});
+
 describe("S3Session: the mtime metadata header", () => {
   it("stores x-amz-meta-mtime on PUT and echoes it on GET and HEAD", async () => {
     const put = await call(session, {
