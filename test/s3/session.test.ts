@@ -188,6 +188,7 @@ async function* inPieces(bytes: Uint8Array, count: number): AsyncGenerator<Uint8
 }
 
 /** A body that dies before it yields anything, the way a reset connection does. */
+// oxlint-disable-next-line require-yield -- yielding nothing is the point
 async function* deadBody(): AsyncGenerator<Uint8Array> {
   throw new Error("the peer never spoke");
 }
