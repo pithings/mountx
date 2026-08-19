@@ -259,9 +259,11 @@ export type FullFsDriver = Required<Omit<FsDriver, "capabilities" | "mountx">> &
 
 /** Names of the optional `FsDriver` methods. */
 export type FsDriverMethod = keyof {
-  [K in keyof FsDriver as NonNullable<FsDriver[K]> extends (...args: never[]) => unknown
-    ? K
-    : never]: 1;
+  [
+    K in keyof FsDriver as NonNullable<FsDriver[K]> extends (...args: never[]) => unknown
+      ? K
+      : never
+  ]: 1;
 };
 
 // --- file type bits (POSIX `S_IF*`) ---
